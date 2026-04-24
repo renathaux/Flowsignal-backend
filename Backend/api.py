@@ -15,6 +15,14 @@ app = FastAPI()
 def start_background_task():
     print("Startup OK")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 class TradeRequest(BaseModel):
     symbol: str
     action: str
