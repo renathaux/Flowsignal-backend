@@ -13,17 +13,7 @@ import uuid
 app = FastAPI()
 @app.on_event("startup")
 def start_background_task():
-    thread = threading.Thread(target=background_fetch)
-    thread.daemon = True
-    thread.start()
-
-    app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    print("Startup OK")
 
 class TradeRequest(BaseModel):
     symbol: str
