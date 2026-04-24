@@ -13,8 +13,11 @@ import uuid
 app = FastAPI()
 @app.on_event("startup")
 def start_background_task():
-    print("Startup OK")
-
+    print("Startup OK - starting background fetch")
+    thread = threading.Thread(target=background_fetch)
+    thread.daemon = True
+    thread.start()
+    
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
