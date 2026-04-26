@@ -6,6 +6,21 @@ import copy
 import pandas as pd
 import requests
 from datetime import datetime, timezone
+
+def is_market_calendar_closed():
+    now = datetime.now(timezone.utc)
+    day = now.weekday()  # Monday=0, Sunday=6
+    hour = now.hour
+
+    if day == 4 and hour >= 22:
+        return True
+    if day == 5:
+        return True
+    if day == 6 and hour < 22:
+        return True
+
+    return False
+
 # =========================
 # 🧠 V5 HELPERS
 # =========================
@@ -1688,6 +1703,21 @@ def _is_feed_stale(df, max_age_minutes=20):
         return True
     return age > max_age_minutes
 
+def is_market_calendar_closed():
+    now = datetime.now(timezone.utc)
+    weekday = now.weekday()
+    hour = now.hour
+
+    if weekday == 5:  # Saturday
+        return True
+
+    if weekday == 6 and hour < 22:  # Sunday before 22:00 UTC
+        return True
+
+    if weekday == 4 and hour >= 22:  # Friday after 22:00 UTC
+        return True
+
+    return False
 
 def _make_closed_result(symbol, base_result=None, stale_minutes=None):
     result = copy.deepcopy(base_result) if isinstance(base_result, dict) else {}
@@ -1700,10 +1730,10 @@ def _make_closed_result(symbol, base_result=None, stale_minutes=None):
     result["market_closed"] = True
     result["stale_minutes"] = stale_minutes
 
-    # keep last good percentages/confidence if they exist
-    result["buy_pct"] = int(result.get("buy_pct", 0) or 0)
-    result["sell_pct"] = int(result.get("sell_pct", 0) or 0)
-    result["confidence"] = int(result.get("confidence", 0) or 0)
+     # market closed = no fake signal strength
+    result["buy_pct"] = 0
+    result["sell_pct"] = 0
+    result["confidence"] = 0
 
     result.setdefault("debug_reasons", [])
     result["debug_reasons"] = list(result["debug_reasons"]) + ["Market closed / stale feed"]
@@ -1718,8 +1748,14 @@ def get_panel_data():
     eurusd_stale_minutes = _minutes_since_last_candle(eurusd)
     gold_stale_minutes = _minutes_since_last_candle(gold)
 
-    eurusd_closed = _is_feed_stale(eurusd, max_age_minutes=20)
-    gold_closed = _is_feed_stale(gold, max_age_minutes=20)
+    calendar_closed = is_market_calendar_closed()
+
+    eurusd_closed = calendar_closed or _is_feed_stale(eurusd, max_age_minutes=20)
+    gold_closed = calendar_closed or _is_feed_stale(gold, max_age_minutes=20)
+
+    print("Calendar closed:", calendar_closed)
+    print("EURUSD closed:", eurusd_closed)
+    print("GOLD closed:", gold_closed)
 
     all_closed = eurusd_closed and gold_closed
 
