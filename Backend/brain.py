@@ -30,76 +30,63 @@ def detect_recent_pressure(data, symbol):
     high = data["High"]
     low = data["Low"]
 
-    if len(data) < 6:
+    if len(data) < 8:
         return "NEUTRAL", 0
 
+    recent = data.tail(8)
+
+    bull_count = 0
+    bear_count = 0
+
+    for _, candle in recent.iterrows():
+        if candle["Close"] > candle["Open"]:
+            bull_count += 1
+        elif candle["Close"] < candle["Open"]:
+            bear_count += 1
+
     c1 = close.iloc[-1].item()
-    c2 = close.iloc[-2].item()
-    c3 = close.iloc[-3].item()
-
     o1 = open_.iloc[-1].item()
-    o2 = open_.iloc[-2].item()
-    o3 = open_.iloc[-3].item()
-
     h1 = high.iloc[-1].item()
     l1 = low.iloc[-1].item()
 
     body1 = abs(c1 - o1)
-    body2 = abs(c2 - o2)
-    body3 = abs(c3 - o3)
-
-    avg_range = (high.iloc[-6:] - low.iloc[-6:]).mean().item()
+    candle_range = h1 - l1
 
     if symbol == "EURUSD":
         strong_body = 0.0004
     else:
         strong_body = 1.5
 
-    bull_1 = c1 > o1
-    bear_1 = c1 < o1
-    bull_2 = c2 > o2
-    bear_2 = c2 < o2
-    bull_3 = c3 > o3
-    bear_3 = c3 < o3
-
-    bull_count = sum([bull_1, bull_2, bull_3])
-    bear_count = sum([bear_1, bear_2, bear_3])
-
     pressure_score = 0
 
-    if bull_1:
+    if bull_count >= 5:
+        pressure_score += 3
+    elif bull_count >= 4:
         pressure_score += 2
-    elif bear_1:
+
+    if bear_count >= 5:
+        pressure_score -= 3
+    elif bear_count >= 4:
         pressure_score -= 2
 
-    if bull_2:
+    if c1 > o1:
         pressure_score += 1
-    elif bear_2:
-        pressure_score -= 1
-
-    if bull_3:
-        pressure_score += 1
-    elif bear_3:
+    elif c1 < o1:
         pressure_score -= 1
 
     if body1 > strong_body:
-        if bull_1:
+        if c1 > o1:
             pressure_score += 2
-        elif bear_1:
+        elif c1 < o1:
             pressure_score -= 2
 
-    candle_range = h1 - l1
     if candle_range > 0:
         close_position = (c1 - l1) / candle_range
+
         if close_position >= 0.7:
             pressure_score += 1
         elif close_position <= 0.3:
             pressure_score -= 1
-
-    if bull_count == 3 and avg_range > 0:
-        pressure_score += 1
-    elif bear_count == 3 and avg_range > 0:
-        pressure_score -= 1
 
     if pressure_score >= 3:
         return "BULLISH", pressure_score
@@ -107,7 +94,7 @@ def detect_recent_pressure(data, symbol):
         return "BEARISH", pressure_score
     else:
         return "NEUTRAL", pressure_score
-
+    
 def detect_momentum_strength(data, symbol):
     close = data["Close"]
     open_ = data["Open"]
@@ -397,7 +384,7 @@ def apply_fake_signal_killer(
         kill_trade = True
         reasons_fk.append("Fake killer: weak edge")
 
-    if market_condition in ["CHOPPY", "MIXED", "UNKNOWN"] and momentum_strength != "WEAK":
+    if market_condition in ["CHOPPY", "MIXED", "UNKNOWN"] and momentum_strength == "WEAK":
         kill_trade = True
         reasons_fk.append("Fake killer: messy market")
 
@@ -561,6 +548,7 @@ def detect_swing_liquidity(data):
     if len(data) < 10:
         return None, None
 
+    swing_points = []
     swing_highs = []
     swing_lows = []
 
@@ -581,13 +569,48 @@ def detect_swing_liquidity(data):
         if h > h1 and h > h2 and h > h3 and h > h4:
             swing_highs.append(h)
 
+            swing_points.append({
+                "type": "HIGH",
+                "price": float(h),
+                "index": int(i),
+                "time": int(pd.Timestamp(data.index[i]).timestamp())
+            })
         if l < l1 and l < l2 and l < l3 and l < l4:
             swing_lows.append(l)
+            swing_points.append({
+                "type": "LOW",
+                "price": float(l),
+                "index": int(i),
+                "time": int(pd.Timestamp(data.index[i]).timestamp())
+            })
+    last_swing_high = swing_highs[-1] if len(swing_highs) >= 1 else None
+    prev_swing_high = swing_highs[-2] if len(swing_highs) >= 2 else None
 
-    last_swing_high = swing_highs[-1] if swing_highs else None
-    last_swing_low = swing_lows[-1] if swing_lows else None
+    last_swing_low = swing_lows[-1] if len(swing_lows) >= 1 else None
+    prev_swing_low = swing_lows[-2] if len(swing_lows) >= 2 else None
 
-    return last_swing_high, last_swing_low
+    market_structure = "RANGE"
+
+    if (
+        last_swing_high is not None
+        and prev_swing_high is not None
+        and last_swing_low is not None
+        and prev_swing_low is not None
+    ):
+        if last_swing_high > prev_swing_high and last_swing_low > prev_swing_low:
+            market_structure = "BULLISH"
+
+        elif last_swing_high < prev_swing_high and last_swing_low < prev_swing_low:
+            market_structure = "BEARISH"
+
+    return (
+        last_swing_high,
+        last_swing_low,
+        prev_swing_high,
+        prev_swing_low,
+        market_structure,
+        swing_points[-12:]
+    )
 
 
 def detect_liquidity_trap(c1, o1, h1, l1, swing_high, swing_low, strong_body):
@@ -898,12 +921,7 @@ def calculate_confidence(
 # 📊 DATA FETCH (TWELVE DATA)
 # =========================
 import os
-
-
-import os
-
 TWELVE_DATA_API_KEY = "9bce0b4c48b1498d8e2afb8a5c186359"
-
 
 def _normalize_td_values(values):
     if not values:
@@ -994,6 +1012,7 @@ def fetch_market_data():
     global _FETCH_LOCK
 
     now = datetime.now(timezone.utc)
+    calendar_closed = is_market_calendar_closed()
 
     if not hasattr(fetch_market_data, "_cache"):
         fetch_market_data._cache = {
@@ -1046,31 +1065,34 @@ def fetch_market_data():
         or last_1h is None
         or (now - last_1h).total_seconds() >= 3600
     )
-    if need_5m:
-        print("===== REFRESHING 5M DATA =====")
-        cache["eurusd_5m"] = safe_download("EUR/USD", "5min", outputsize=120)
-        cache["gold_5m"] = safe_download("XAU/USD", "5min", outputsize=120)
-        cache["last_5m_update"] = now
-    else:
-        print("===== USING CACHED 5M DATA =====")
+    try:
+        if need_5m and (not calendar_closed or cache["eurusd_5m"].empty or cache["gold_5m"].empty):
+            print("===== REFRESHING 5M DATA =====")
+            cache["eurusd_5m"] = safe_download("EUR/USD", "5min", outputsize=5000)
+            cache["gold_5m"] = safe_download("XAU/USD", "5min", outputsize=5000)
+            cache["last_5m_update"] = now
+        else:
+            print("===== USING CACHED 5M DATA =====")
 
-    if need_15m:
-        print("===== REFRESHING 15M DATA =====")
-        cache["eurusd_15m"] = safe_download("EUR/USD", "15min", outputsize=120)
-        cache["gold_15m"] = safe_download("XAU/USD", "15min", outputsize=120)
-        cache["last_15m_update"] = now
-    else:
-        print("===== USING CACHED 15M DATA =====")
+        if need_15m and (not calendar_closed or cache["eurusd_15m"].empty or cache["gold_15m"].empty):
+            print("===== REFRESHING 15M DATA =====")
+            cache["eurusd_15m"] = safe_download("EUR/USD", "15min", outputsize=5000)
+            cache["gold_15m"] = safe_download("XAU/USD", "15min", outputsize=5000)
+            cache["last_15m_update"] = now
+        else:
+            print("===== USING CACHED 15M DATA =====")
 
-    if need_1h:
-        print("===== REFRESHING 1H DATA =====")
-        cache["eurusd_1h"] = safe_download("EUR/USD", "1h", outputsize=120)
-        cache["gold_1h"] = safe_download("XAU/USD", "1h", outputsize=120)
-        cache["last_1h_update"] = now
-    else:
-        print("===== USING CACHED 1H DATA =====")
+        if need_1h and (not calendar_closed or cache["eurusd_1h"].empty or cache["gold_1h"].empty):
+            print("===== REFRESHING 1H DATA =====")
+            cache["eurusd_1h"] = safe_download("EUR/USD", "1h", outputsize=5000)
+            cache["gold_1h"] = safe_download("XAU/USD", "1h", outputsize=5000)
+            cache["last_1h_update"] = now
+        else:
+            print("===== USING CACHED 1H DATA =====")
 
-    _FETCH_LOCK = False
+    finally:
+        _FETCH_LOCK = False
+
     eurusd = cache["eurusd_5m"]
     gold = cache["gold_5m"]
     eurusd_htf = cache["eurusd_15m"]
@@ -1101,31 +1123,94 @@ def fetch_market_data():
 
     return eurusd, gold, eurusd_htf, gold_htf, eurusd_1h, gold_1h
 
-def get_signal(data, htf_data, symbol):
-    if data.empty or htf_data.empty:
-        return {
-            "signal": "WAIT",
-            "signal_text": "WAIT ⚪ (no data)",
-            "buy_pct": 0,
-            "sell_pct": 0,
-            "confidence": 0,
-            "market_condition": "UNKNOWN",
-            "entry_quality": "WEAK",
-            "entry_timing": "NEUTRAL",
-            "fake_kill": False,
-            "debug_reasons": ["No data"]
+def detect_market_mode(
+    data,
+    htf_data,
+    ema9,
+    ema21,
+    ema50,
+    htf_structure,
+    recent_pressure,
+    momentum_strength,
+    symbol
+):
+    close = data["Close"]
+    high = data["High"]
+    low = data["Low"]
+
+    if len(data) < 12 or len(htf_data) < 8:
+        return "UNKNOWN"
+
+    c1 = close.iloc[-1].item()
+    c2 = close.iloc[-2].item()
+
+    recent_high = high.iloc[-8:-1].max().item()
+    recent_low = low.iloc[-8:-1].min().item()
+
+    bullish_ema = ema9 > ema21 > ema50
+    bearish_ema = ema9 < ema21 < ema50
+
+    bullish_breakout = c1 > recent_high and c1 > c2
+    bearish_breakout = c1 < recent_low and c1 < c2
+
+    ema_spread = abs(ema9 - ema21)
+
+    if symbol == "EURUSD":
+        flat_limit = 0.00018
+    else:
+        flat_limit = 1.2
+
+    if ema_spread < flat_limit and momentum_strength == "WEAK":
+        return "RANGE"
+
+    if htf_structure == "BULLISH" and bullish_ema:
+        if bullish_breakout and momentum_strength in ["MEDIUM", "STRONG"]:
+            return "BREAKOUT_BULL"
+        if recent_pressure in ["BULLISH", "NEUTRAL"]:
+            return "TREND_CONTINUATION_BULL"
+
+    if htf_structure == "BEARISH" and bearish_ema:
+        if bearish_breakout and momentum_strength in ["MEDIUM", "STRONG"]:
+            return "BREAKOUT_BEAR"
+        if recent_pressure in ["BEARISH", "NEUTRAL"]:
+            return "TREND_CONTINUATION_BEAR"
+
+    if htf_structure == "BULLISH" and recent_pressure == "BEARISH" and c1 < ema21:
+        return "SHIFT_BEAR"
+
+    if htf_structure == "BEARISH" and recent_pressure == "BULLISH" and c1 > ema21:
+        return "SHIFT_BULL"
+
+    return "MIXED"
+
+SMC_STATE = {
+    "EURUSD": {
+       "pending": None,
+        "stage": "WAIT",
+        "bos_level": None,
+        "sweep_level": None,
+        "last_idea": None
+        },
+    "GOLD": {
+        "pending": None,
+        "stage": "WAIT",
+        "bos_level": None,
+        "sweep_level": None,
+        "last_idea": None
+            }
         }
 
-    if len(data) < 20 or len(htf_data) < 10:
+def get_signal(data, htf_data, symbol):
+    if data.empty or htf_data.empty or len(data) < 30 or len(htf_data) < 10:
         return {
             "signal": "WAIT",
             "signal_text": "WAIT ⚪ (not enough data)",
             "buy_pct": 0,
             "sell_pct": 0,
             "confidence": 0,
-            "market_condition": "UNKNOWN",
-            "entry_quality": "WEAK",
-            "entry_timing": "NEUTRAL",
+            "market_condition": "STRUCTURE",
+            "entry_quality": "WAIT",
+            "entry_timing": "WAIT",
             "fake_kill": False,
             "debug_reasons": ["Not enough data"]
         }
@@ -1141,518 +1226,357 @@ def get_signal(data, htf_data, symbol):
     l1 = low.iloc[-1].item()
 
     if symbol == "EURUSD":
-        strong_body = 0.00035
+        decimals = 5
+        buffer = 0.00020
+        retest_buffer = 0.00030
     else:
-        strong_body = 1.2
+        decimals = 2
+        buffer = 1.20
+        retest_buffer = 2.50
 
     reasons = []
 
-    ema9 = close.ewm(span=9, adjust=False).mean().iloc[-1].item()
-    ema21 = close.ewm(span=21, adjust=False).mean().iloc[-1].item()
-    ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1].item()
+    (
+        swing_high,
+        swing_low,
+        prev_swing_high,
+        prev_swing_low,
+        swing_structure,
+        smc_swings
+    ) = detect_swing_liquidity(data)
 
-    recent_high = high.iloc[-6:-1].max().item()
-    recent_low = low.iloc[-6:-1].min().item()
+    recent_high = (
+        prev_swing_high
+        if prev_swing_high is not None
+        else high.iloc[-20:-1].max().item()
+    )
 
-    bullish_bos = c1 > recent_high
-    bearish_bos = c1 < recent_low
-
-    recent_pressure, pressure_score = detect_recent_pressure(data, symbol)
-    momentum_strength, momentum_score = detect_momentum_strength(data, symbol)
-    market_condition = detect_market_condition(data, ema9, ema21, ema50)
+    recent_low = (
+        prev_swing_low
+        if prev_swing_low is not None
+        else low.iloc[-20:-1].min().item()
+    )
 
     htf_structure = detect_htf_structure(htf_data)
-    choch_signal = detect_choch(data)
 
-    zone_position, zone_ratio, pd_high, pd_low, current_price = detect_pd_zone(data)
-    swing_high, swing_low = detect_swing_liquidity(data)
-    trap_signal = detect_liquidity_trap(c1, o1, h1, l1, swing_high, swing_low, strong_body)
-
-    market_state = detect_market_state(data, ema9, ema21, ema50, choch_signal)
-
-    entry_timing = detect_entry_timing(
-        c1,
-        o1,
-        h1,
-        l1,
-        ema9,
-        ema21,
-        zone_position,
-        pd_high,
-        pd_low,
-        symbol,
-        bullish_bos,
-        bearish_bos,
-        htf_structure,
-        choch_signal,
-        recent_pressure,
-        momentum_strength,
-        market_state,
-        trap_signal
+    bullish_sweep = (
+        swing_low is not None
+        and l1 < swing_low
+        and c1 > swing_low
+        and c1 > o1
     )
-    avg_range = (high.iloc[-8:] - low.iloc[-8:]).mean().item()
-    low_volatility = (h1 - l1) < avg_range * 0.65
 
-    buy_score = 0
-    sell_score = 0
-
-    # EMA alignment = trend confirmation
-    if ema9 < ema21 < ema50:
-        sell_score += 12
-        reasons.append("EMA bearish alignment +12")
-    elif ema9 > ema21 > ema50:
-        buy_score += 12
-        reasons.append("EMA bullish alignment +12")
-
-    if ema9 < ema21 and c1 < ema21:
-        buy_score -= 8
-        reasons.append("Buy pressure reduced by bearish EMA context -8")
-
-    if ema9 > ema21 and c1 > ema21:
-        sell_score -= 8
-        reasons.append("Sell pressure reduced by bullish EMA context -8")
-        # -------------------------
-    # HTF / STRUCTURE BIAS
-    # -------------------------
-    if htf_structure == "BULLISH":
-        buy_score += 30
-        reasons.append("HTF bullish +30")
-    elif htf_structure == "BEARISH":
-        sell_score += 30
-        reasons.append("HTF bearish +30")
-
-    if htf_structure == "BEARISH":
-        buy_score -= 12
-        reasons.append("Buy reduced by bearish HTF -12")
-    elif htf_structure == "BULLISH":
-        sell_score -= 12
-        reasons.append("Sell reduced by bullish HTF -12")
-
-    if htf_structure == "BEARISH" and ema9 < ema21:
-        bullish_reversal_ready = (
-            choch_signal == "BULLISH"
-            and recent_pressure == "BULLISH"
-            and momentum_strength in ["MEDIUM", "STRONG"]
-            and c1 > ema9
-        )
-
-        if not bullish_reversal_ready:
-            buy_score = 0
-
-    elif htf_structure == "BULLISH" and ema9 > ema21:
-        bearish_reversal_ready = (
-            choch_signal == "BEARISH"
-            and recent_pressure == "BEARISH"
-            and momentum_strength in ["MEDIUM", "STRONG"]
-            and c1 < ema9
-        )
-
-        if not bearish_reversal_ready:
-            sell_score = 0
-
-    # TREND CONTINUATION BOOST
-    if htf_structure == "BEARISH" and ema9 < ema21:
-        sell_score += 12
-        reasons.append("Bear trend continuation +12")
-
-    elif htf_structure == "BULLISH" and ema9 > ema21:
-        buy_score += 12
-        reasons.append("Bull trend continuation +12")
-
-            # STRONG TREND BOOST (UPGRADED)
-    if htf_structure == "BEARISH" and ema9 < ema21:
-        if momentum_strength == "STRONG":
-            sell_score += 20
-            reasons.append("Strong bearish trend +20")
-        elif momentum_strength == "MEDIUM":
-            sell_score += 10
-            reasons.append("Medium bearish trend +10")
-
-    elif htf_structure == "BULLISH" and ema9 > ema21:
-        if momentum_strength == "STRONG":
-            buy_score += 20
-            reasons.append("Strong bullish trend +20")
-        elif momentum_strength == "MEDIUM":
-            buy_score += 10
-            reasons.append("Medium bullish trend +10")
-
-    if htf_structure == "BEARISH" and buy_score > sell_score:
-        buy_score -= 10
-        reasons.append("Buy trimmed against bearish HTF -10")
-
-    if htf_structure == "BULLISH" and sell_score > buy_score:
-        sell_score -= 10
-        reasons.append("Sell trimmed against bullish HTF -10")
-
-    if choch_signal == "BULLISH":
-        buy_score += 14
-        reasons.append("CHOCH bullish +14")
-    elif choch_signal == "BEARISH":
-        sell_score += 14
-        reasons.append("CHOCH bearish +14")
-
-        # EARLY REVERSAL UNLOCK
-    if htf_structure == "BEARISH":
-        bullish_reversal_ready = (
-            choch_signal == "BULLISH"
-            and recent_pressure == "BULLISH"
-            and momentum_strength in ["MEDIUM", "STRONG"]
-            and c1 > ema9
-        )
-
-        if bullish_reversal_ready:
-            buy_score += 18
-            reasons.append("Early bullish reversal unlock +18")
-
-    if htf_structure == "BULLISH":
-        bearish_reversal_ready = (
-            choch_signal == "BEARISH"
-            and recent_pressure == "BEARISH"
-            and momentum_strength in ["MEDIUM", "STRONG"]
-            and c1 < ema9
-        )
-
-        if bearish_reversal_ready:
-            sell_score += 18
-            reasons.append("Early bearish reversal unlock +18")
-
-    if market_state in ["BULL_PULLBACK", "BULL_REVERSAL", "BULL_EXPANSION"]:
-        buy_score += 14
-        reasons.append(f"{market_state} +14")
-    elif market_state in ["BEAR_PULLBACK", "BEAR_REVERSAL", "BEAR_EXPANSION"]:
-        sell_score += 14
-        reasons.append(f"{market_state} +14")
-
-    if recent_pressure == "BULLISH":
-        buy_score += 12
-        reasons.append(f"Pressure bullish +12 ({pressure_score})")
-    elif recent_pressure == "BEARISH":
-        sell_score += 12
-        reasons.append(f"Pressure bearish +12 ({pressure_score})")
-
-    if momentum_strength == "STRONG":
-        if recent_pressure == "BULLISH":
-            buy_score += 16
-            reasons.append(f"Strong bullish momentum +12 ({momentum_score})")
-        elif recent_pressure == "BEARISH":
-            sell_score += 16
-            reasons.append(f"Strong bearish momentum +12 ({momentum_score})")
-    elif momentum_strength == "MEDIUM":
-        if recent_pressure == "BULLISH":
-            buy_score += 10
-            reasons.append(f"Medium bullish momentum +7 ({momentum_score})")
-        elif recent_pressure == "BEARISH":
-            sell_score += 10
-            reasons.append(f"Medium bearish momentum +7 ({momentum_score})")
-
-    # -------------------------
-    # PRICE DELIVERY / ZONE
-    # -------------------------
-    trap_signal = detect_liquidity_grab(data)
-    if zone_position == "DISCOUNT" and htf_structure == "BULLISH":
-        buy_score += 10
-        reasons.append("Discount zone +10")
-    elif zone_position == "PREMIUM" and htf_structure == "BEARISH":
-        sell_score += 10
-        reasons.append("Premium zone +10")
-
-    if trap_signal == "BULLISH":
-        buy_score += 10
-        reasons.append("Bullish liquidity trap +10")
-
-        if recent_pressure == "BULLISH":
-            buy_score += 8
-            reasons.append("Bullish trap + bullish pressure +8")
-
-        if choch_signal == "BULLISH":
-            buy_score += 8
-            reasons.append("Bullish trap + bullish CHOCH +8")
-
-        if zone_position == "DISCOUNT":
-            buy_score += 6
-            reasons.append("Bullish trap in discount zone +6")
-
-        if htf_structure == "BULLISH":
-            buy_score += 6
-            reasons.append("Bullish trap with bullish HTF +6")
-
-    elif trap_signal == "BEARISH":
-        sell_score += 10
-        reasons.append("Bearish liquidity trap +10")
-
-        if recent_pressure == "BEARISH":
-            sell_score += 8
-            reasons.append("Bearish trap + bearish pressure +8")
-
-        if choch_signal == "BEARISH":
-            sell_score += 8
-            reasons.append("Bearish trap + bearish CHOCH +8")
-
-        if zone_position == "PREMIUM":
-            sell_score += 6
-            reasons.append("Bearish trap in premium zone +6")
-
-        if htf_structure == "BEARISH":
-            sell_score += 6
-            reasons.append("Bearish trap with bearish HTF +6")
-    # -------------------------
-    # ENTRY TIMING
-    # -------------------------
-    if entry_timing == "GOOD_BUY":
-        buy_score += 12
-        reasons.append("Good buy timing +12")
-    elif entry_timing == "GOOD_SELL":
-        sell_score += 12
-        reasons.append("Good sell timing +12")
-    elif entry_timing == "WAIT_PULLBACK_BUY":
-        if htf_structure == "BEARISH":
-            buy_score -= 10
-            reasons.append("Blocked pullback buy in bearish trend -10")
-        else:
-            buy_score -= 4
-            reasons.append("Wait pullback buy -4")
-    elif entry_timing == "WAIT_PULLBACK_SELL":
-        if htf_structure == "BULLISH":
-            sell_score -= 10
-            reasons.append("Blocked pullback sell in bullish trend -10")
-        else:
-            sell_score -= 4
-            reasons.append("Wait pullback sell -4")
-    elif entry_timing == "LATE_BUY":
-        buy_score -= 8
-        reasons.append("Late buy -8")
-    elif entry_timing == "LATE_SELL":
-        sell_score -= 8
-        reasons.append("Late sell -8")
-
-    # -------------------------
-    # MARKET CONDITION PENALTIES
-    # -------------------------
-    if market_condition == "CHOPPY":
-        buy_score -= 4
-        sell_score -= 4
-        reasons.append("Choppy market -8/-8")
-    elif market_condition == "MIXED":
-        buy_score -= 4
-        sell_score -= 4
-        reasons.append("Mixed market -4/-4")
-
-    # slight fallback so neutral trend can still trade if momentum is real
-    if htf_structure == "NEUTRAL":
-        if recent_pressure == "BULLISH" and momentum_strength in ["MEDIUM", "STRONG"]:
-            buy_score += 8
-            reasons.append("Neutral HTF bullish fallback +8")
-        elif recent_pressure == "BEARISH" and momentum_strength in ["MEDIUM", "STRONG"]:
-            sell_score += 8
-            reasons.append("Neutral HTF bearish fallback +8")
-
-    # ==============================
-    # 🔥 SYMBOL-SPECIFIC CONTROL
-    # ==============================
-
-    if symbol == "EURUSD":
-        WAIT_PULLBACK_CAP = 68
-        LATE_CAP = 58
-        CHOPPY_FACTOR = 0.78
-        WEAK_FACTOR = 0.88
-
-    elif symbol == "XAUUSD":
-        WAIT_PULLBACK_CAP = 74
-        LATE_CAP = 64
-        CHOPPY_FACTOR = 0.82
-        WEAK_FACTOR = 0.92
-
-    else:
-        # fallback (safety)
-        WAIT_PULLBACK_CAP = 70
-        LATE_CAP = 60
-        CHOPPY_FACTOR = 0.70
-        WEAK_FACTOR = 0.85
-
-    if symbol == "XAUUSD":
-        if buy_score == 0 and sell_score == 0:
-            # detect last candle direction
-            if data["close"].iloc[-1] > data["open"].iloc[-1]:
-                buy_score += 10
-            else:
-                sell_score += 10
-
-    # ==============================
-    # 🔥 MARKET CONDITION FILTER
-    # ==============================
-
-    if market_condition == "CHOPPY":
-    # only reduce if NO strong direction
-     if abs(buy_score - sell_score) < 15:
-        buy_score *= 0.6
-        sell_score *= 0.6
-
-    elif market_condition == "WEAK":
-        buy_score *= WEAK_FACTOR
-        sell_score *= WEAK_FACTOR
-
-
-    # ==============================
-    # 🔥 ENTRY TIMING CAPS
-    # ==============================
-
-    if entry_timing == "WAIT_PULLBACK_BUY":
-        buy_score = min(buy_score, WAIT_PULLBACK_CAP)
-
-    if entry_timing == "WAIT_PULLBACK_SELL":
-        sell_score = min(sell_score, WAIT_PULLBACK_CAP)
-
-    if entry_timing == "LATE_BUY":
-        buy_score = min(buy_score, LATE_CAP)
-
-    if entry_timing == "LATE_SELL":
-        sell_score = min(sell_score, LATE_CAP)
-
-
-    # ==============================
-    # 🔥 FINAL NORMALIZATION
-    # ==============================
-
-    buy_score = max(0, min(int(buy_score), 92))
-    sell_score = max(0, min(int(sell_score), 92))
-
-
-    # ==============================
-    # 🔥 GAP CALCULATION
-    # ==============================
-
-    score_gap = abs(buy_score - sell_score)
-
-    no_trade, nt_reasons = apply_no_trade_logic(
-        buy_score,
-        sell_score,
-        market_condition,
-        low_volatility,
-        zone_position,
-        htf_structure,
-        choch_signal,
-        momentum_strength,
-        recent_pressure
+    bearish_sweep = (
+        swing_high is not None
+        and h1 > swing_high
+        and c1 < swing_high
+        and c1 < o1
     )
-    reasons.extend(nt_reasons)
 
-    fake_kill, fk_reasons = apply_fake_signal_killer(
-        symbol,
-        buy_score,
-        sell_score,
-        score_gap,
-        market_condition,
-        market_state,
-        entry_timing,
-        htf_structure,
-        choch_signal,
-        recent_pressure,
-        momentum_strength,
-        zone_position,
-        c1,
-        ema9,
-        ema21,
-        recent_high,
-        recent_low
+    bullish_choch = (
+        htf_structure in ["BEARISH", "NEUTRAL"]
+        and h1 > recent_high
+        and c1 > o1
     )
-    reasons.extend(fk_reasons)
+
+    bearish_choch = (
+        htf_structure in ["BULLISH", "NEUTRAL"]
+        and l1 < recent_low
+        and c1 < o1
+    )
+
+    bullish_bos = (
+        htf_structure == "BULLISH"
+        and h1 > recent_high
+        and c1 > o1
+    )
+
+    bearish_bos = (
+        htf_structure == "BEARISH"
+        and l1 < recent_low
+        and c1 < o1
+    )
+
+        # =========================
+    # RECENT BOS MEMORY AFTER RESTART
+    # =========================
+    recent_lookback = data.tail(8)
+
+    recent_bull_break = False
+    recent_bear_break = False
+
+    for _, candle in recent_lookback.iterrows():
+        if candle["High"] > recent_high and candle["Close"] > candle["Open"]:
+            recent_bull_break = True
+
+        if candle["Low"] < recent_low and candle["Close"] < candle["Open"]:
+            recent_bear_break = True
+
+    # Do NOT force BOS from tiny recent candles.
+# BOS must come from real protected swing break only.
+    if recent_bull_break and h1 > recent_high and c1 > recent_high:
+        bullish_bos = True
+        bullish_choch = True
+
+    if recent_bear_break and l1 < recent_low and c1 < recent_low:
+        bearish_bos = True
+        bearish_choch = True
+
+    buy_retest = (
+        swing_low is not None
+        and l1 <= swing_low + retest_buffer
+        and c1 > swing_low
+        and c1 > o1
+    )
+
+    sell_retest = (
+        swing_high is not None
+        and h1 >= swing_high - retest_buffer
+        and c1 < swing_high
+        and c1 < o1
+    )
 
     final_signal = "WAIT"
+    buy_score = 0
+    sell_score = 0
+    confidence = 0
+    entry_quality = "WAIT"
+    entry_timing = "WAIT"
+    plan_type = "WAIT FOR BOS"
+    plan_side = "WAIT"
 
-    if not no_trade and not fake_kill:
-        strong_buy_context = (
-            buy_score >= 80
-            and buy_score > sell_score
-            and score_gap >= 18
-            and htf_structure == "BULLISH"
-            and momentum_strength == "STRONG"
-            and recent_pressure == "BULLISH"
-            and market_state in ["BULL_EXPANSION", "BULL_REVERSAL"]
+    if bullish_sweep:
+        reasons.append("Bullish liquidity sweep detected")
+
+    if bearish_sweep:
+        reasons.append("Bearish liquidity sweep detected")
+
+    state = SMC_STATE[symbol]
+
+    # SAVE BOS / CHOCH FIRST
+    # SAVE BOS / CHOCH FIRST
+    if state["pending"] is None:
+
+        if bullish_choch or bullish_bos:
+            state["pending"] = "BUY"
+            state["bos_level"] = recent_high
+            state["sweep_level"] = swing_low
+            reasons.append("Bullish CHOCH/BOS saved")
+
+        elif bearish_choch or bearish_bos:
+            state["pending"] = "SELL"
+            state["bos_level"] = recent_low
+            state["sweep_level"] = swing_high
+            reasons.append("Bearish CHOCH/BOS saved")
+
+        # =========================
+    # ENTRY TIMING ENGINE
+    # =========================
+
+    if state["pending"] == "BUY" and state["bos_level"] is not None:
+        in_buy_retest_zone = (
+            l1 <= state["bos_level"] + retest_buffer
+            and h1 >= state["bos_level"] - retest_buffer
         )
 
-        strong_sell_context = (
-            sell_score >= 80
-            and sell_score > buy_score
-            and score_gap >= 18
-            and htf_structure == "BEARISH"
-            and momentum_strength == "STRONG"
-            and recent_pressure == "BEARISH"
-            and market_state in ["BEAR_EXPANSION", "BEAR_REVERSAL"]
+        buy_displacement = (
+            c1 > o1
+            and state["bos_level"] is not None
+            and h1 > state["bos_level"]
+            and c1 > state["bos_level"]
         )
 
-        if buy_score >= 55 and buy_score > sell_score and score_gap >= 10:
-            if entry_timing == "GOOD_BUY":
-                final_signal = "BUY"
-            elif entry_timing == "WAIT_PULLBACK_BUY":
-                final_signal = "WAIT"
-            elif entry_timing == "LATE_BUY":
-                final_signal = "WAIT"
-            elif strong_buy_context and entry_timing == "NEUTRAL":
-                final_signal = "BUY"
+        if in_buy_retest_zone and not buy_displacement:
+            state["stage"] = "BUY_READY"
+            plan_type = "BUY READY"
+            plan_side = "WAIT"
+            entry_timing = "BUY READY"
+            buy_score = 65
+            sell_score = 10
+            confidence = 55
 
-        elif sell_score >= 55 and sell_score > buy_score and score_gap >= 10:
-            if entry_timing == "GOOD_SELL":
-                final_signal = "SELL"
-            elif entry_timing == "WAIT_PULLBACK_SELL":
-                final_signal = "WAIT"
-            elif entry_timing == "LATE_SELL":
-                final_signal = "WAIT"
-            elif strong_sell_context and entry_timing == "NEUTRAL":
-                final_signal = "SELL"
+        elif in_buy_retest_zone and buy_displacement:
+            final_signal = "BUY"
+            buy_score = 92
+            sell_score = 8
+            confidence = 92
+            entry_quality = "BOS"
+            entry_timing = "BOS BUY ENTRY"
+            plan_type = "BOS BUY"
+            plan_side = "BUY"
+            state["pending"] = None
+            state["stage"] = "BUY_ACTIVE"
+            state["last_idea"] = "BUY"
 
-    entry_quality = get_entry_quality(
-        buy_score,
-        sell_score,
-        score_gap,
-        market_condition,
-        zone_position,
-        htf_structure,
-        choch_signal
-    )
+        else:
+            plan_type = "WAIT BUY RETEST"
+            plan_side = "WAIT"
+            entry_timing = "WAIT BUY RETEST"
+            buy_score = 45
+            sell_score = 15
+            confidence = 35
 
-    confidence = calculate_confidence(
-        buy_score,
-        sell_score,
-        htf_structure,
-        choch_signal,
-        zone_position,
-        trap_signal,
-        market_state,
-        entry_timing,
-        market_condition
-    )
+    elif state["pending"] == "SELL" and state["bos_level"] is not None:
+        in_sell_retest_zone = (
+            h1 >= state["bos_level"] - retest_buffer
+            and l1 <= state["bos_level"] + retest_buffer
+        )
 
-    display_entry_timing = entry_timing
+        sell_displacement = (
+            c1 < o1
+            and state["bos_level"] is not None
+            and l1 < state["bos_level"]
+            and c1 < state["bos_level"]
+        )
 
-    top_side = "BUY" if buy_score > sell_score else "SELL" if sell_score > buy_score else "NONE"
+        if in_sell_retest_zone and not sell_displacement:
+            state["stage"] = "SELL_READY"
+            plan_type = "SELL READY"
+            plan_side = "WAIT"
+            entry_timing = "SELL READY"
+            buy_score = 10
+            sell_score = 65
+            confidence = 55
 
-    if top_side == "SELL" and entry_timing in ["GOOD_BUY", "WAIT_PULLBACK_BUY", "LATE_BUY"]:
-        display_entry_timing = "NEUTRAL"
+        elif in_sell_retest_zone and sell_displacement:
+            final_signal = "SELL"
+            buy_score = 8
+            sell_score = 92
+            confidence = 92
+            entry_quality = "BOS"
+            entry_timing = "BOS SELL ENTRY"
+            plan_type = "BOS SELL"
+            plan_side = "SELL"
+            state["pending"] = None
+            state["stage"] = "SELL_ACTIVE"
+            state["last_idea"] = "SELL"
 
-    elif top_side == "BUY" and entry_timing in ["GOOD_SELL", "WAIT_PULLBACK_SELL", "LATE_SELL"]:
-        display_entry_timing = "NEUTRAL"
+        else:
+            plan_type = "WAIT SELL RETEST"
+            plan_side = "WAIT"
+            entry_timing = "WAIT SELL RETEST"
+            buy_score = 15
+            sell_score = 45
+            confidence = 35
+
+    else:
+        if c1 > recent_low and c1 < recent_high:
+            if c1 < ((recent_high + recent_low) / 2):
+                plan_type = "WAIT SELL BREAK"
+                entry_timing = "WAIT SELL BREAK"
+                sell_score = 45
+                buy_score = 15
+                confidence = 35
+                entry_quality = "WAIT"
+                reasons.append("Price near support, waiting bearish BOS")
+            else:
+                plan_type = "WAIT BUY BREAK"
+                entry_timing = "WAIT BUY BREAK"
+                buy_score = 45
+                sell_score = 15
+                confidence = 35
+                entry_quality = "WAIT"
+                reasons.append("Price near resistance, waiting bullish BOS")
+        else:
+            plan_type = "WAIT FOR BOS"
+            entry_timing = "WAIT"
+
+        plan_side = "WAIT"
+
+    # =========================
+    # EXIT IDEA LOGIC
+    # =========================
+    if state.get("last_idea") == "SELL" and (bullish_choch or bullish_bos):
+        final_signal = "EXIT SELL"
+        buy_score = 70
+        sell_score = 20
+        confidence = 85
+        entry_quality = "EXIT"
+        entry_timing = "EXIT SELL"
+        plan_type = "EXIT SELL"
+        plan_side = "EXIT"
+        state["last_idea"] = None
+
+    elif state.get("last_idea") == "BUY" and (bearish_choch or bearish_bos):
+        final_signal = "EXIT BUY"
+        buy_score = 20
+        sell_score = 70
+        confidence = 85
+        entry_quality = "EXIT"
+        entry_timing = "EXIT BUY"
+        plan_type = "EXIT BUY"
+        plan_side = "EXIT"
+        state["last_idea"] = None
+
+    if final_signal == "BUY" and swing_low:
+        entry_price = round(c1, decimals)
+        stop_loss = round(swing_low - buffer, decimals)
+        risk = entry_price - stop_loss
+        tp1 = round(entry_price + risk * 1.5, decimals)
+        tp2 = round(entry_price + risk * 2.5, decimals)
+        invalidation = "Exit if bearish CHOCH or break below SL"
+        plan_reason = "BUY after CHOCH/BOS confirmation + retest"
+
+    elif final_signal == "SELL" and swing_high:
+        entry_price = round(c1, decimals)
+        stop_loss = round(swing_high + buffer, decimals)
+        risk = stop_loss - entry_price
+        tp1 = round(entry_price - risk * 1.5, decimals)
+        tp2 = round(entry_price - risk * 2.5, decimals)
+        invalidation = "Exit if bullish CHOCH or break above SL"
+        plan_reason = "SELL after CHOCH/BOS confirmation + retest"
+
+    else:
+        entry_price = "--"
+        stop_loss = "--"
+        tp1 = "--"
+        tp2 = "--"
+        invalidation = "Wait for CHOCH/BOS + retest"
+        plan_reason = "No entry until structure confirms"
 
     if final_signal == "BUY":
-        signal_text = f"BUY 🟢 ({int(buy_score)}% | {entry_quality} | {display_entry_timing})"
+        signal_text = f"BUY 🟢 ({confidence}% | {entry_timing})"
     elif final_signal == "SELL":
-        signal_text = f"SELL 🔴 ({int(sell_score)}% | {entry_quality} | {display_entry_timing})"
+        signal_text = f"SELL 🔴 ({confidence}% | {entry_timing})"
     else:
-        signal_text = f"WAIT ⚪ ({market_condition} | {entry_quality} | {display_entry_timing})"
+        signal_text = f"WAIT ⚪ ({entry_timing})"
+
+    structure_type = (
+        "CHOCH BUY" if bullish_choch
+        else "CHOCH SELL" if bearish_choch
+        else "BOS BUY" if bullish_bos
+        else "BOS SELL" if bearish_bos
+        else "NEUTRAL"
+    )
 
     return {
         "signal": final_signal,
         "signal_text": signal_text,
-        "buy_pct": int(max(0, min(buy_score, 100))),
-        "sell_pct": int(max(0, min(sell_score, 100))),
-        "confidence": int(confidence),
-        "market_condition": market_condition,
+        "buy_pct": buy_score,
+        "sell_pct": sell_score,
+        "confidence": confidence,
+        "market_condition": "STRUCTURE",
         "entry_quality": entry_quality,
-        "entry_timing": display_entry_timing,
-        "fake_kill": bool(fake_kill),
+        "entry_timing": entry_timing,
+        "fake_kill": False,
         "debug_reasons": reasons[-14:],
-        "price": c1
+        "price": round(c1, decimals),
+        "plan_type": plan_type,
+        "plan_bias": plan_side,
+        "entry_price": entry_price,
+        "stop_loss": stop_loss,
+        "tp1": tp1,
+        "tp2": tp2,
+        "risk_reward": "1:1.5" if final_signal in ["BUY", "SELL"] else "--",
+        "invalidation": invalidation,
+        "plan_reason": plan_reason,
+        "structure_trend": htf_structure,
+        "structure_type": structure_type,
+        "structure_next": plan_type,
+        "structure_resistance": round(recent_high, decimals),
+        "structure_support": round(recent_low, decimals),
+        "smc_swings": smc_swings,
     }
-
 
 # =========================
 # 🔗 PANEL DATA
@@ -1703,22 +1627,6 @@ def _is_feed_stale(df, max_age_minutes=20):
         return True
     return age > max_age_minutes
 
-def is_market_calendar_closed():
-    now = datetime.now(timezone.utc)
-    weekday = now.weekday()
-    hour = now.hour
-
-    if weekday == 5:  # Saturday
-        return True
-
-    if weekday == 6 and hour < 22:  # Sunday before 22:00 UTC
-        return True
-
-    if weekday == 4 and hour >= 22:  # Friday after 22:00 UTC
-        return True
-
-    return False
-
 def _make_closed_result(symbol, base_result=None, stale_minutes=None):
     result = copy.deepcopy(base_result) if isinstance(base_result, dict) else {}
 
@@ -1750,8 +1658,8 @@ def get_panel_data():
 
     calendar_closed = is_market_calendar_closed()
 
-    eurusd_closed = calendar_closed or _is_feed_stale(eurusd, max_age_minutes=20)
-    gold_closed = calendar_closed or _is_feed_stale(gold, max_age_minutes=20)
+    eurusd_closed = calendar_closed or _is_feed_stale(eurusd, max_age_minutes=90)
+    gold_closed = calendar_closed or _is_feed_stale(gold, max_age_minutes=90)
 
     print("Calendar closed:", calendar_closed)
     print("EURUSD closed:", eurusd_closed)
@@ -1830,14 +1738,14 @@ def get_panel_data():
         "GOLD": gold_result,
         "candles": {
             "EURUSD": {
-                "5m": _df_to_candles(eurusd, limit=120),
-                "15m": _df_to_candles(eurusd_htf, limit=120),
-                "1h": _df_to_candles(eurusd_1h, limit=120),
+                "5m": _df_to_candles(eurusd, limit=5000),
+                "15m": _df_to_candles(eurusd_htf, limit=5000),
+                "1h": _df_to_candles(eurusd_1h, limit=5000),
             },
             "GOLD": {
-                "5m": _df_to_candles(gold, limit=120),
-                "15m": _df_to_candles(gold_htf, limit=120),
-                "1h": _df_to_candles(gold_1h, limit=120),
+                "5m": _df_to_candles(gold, limit=5000),
+                "15m": _df_to_candles(gold_htf, limit=5000),
+                "1h": _df_to_candles(gold_1h, limit=5000),
             }
         },
         "history": SIGNAL_HISTORY[-20:],

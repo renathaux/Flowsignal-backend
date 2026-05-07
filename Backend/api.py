@@ -78,7 +78,7 @@ PANEL_CACHE = {
     "last_update": 0
 }
 
-CACHE_SECONDS = 60
+CACHE_SECONDS = 300
 ADMIN_TOKEN = "N2415"
 FEEDBACK_EMAIL = "flowsignal.contact@gmail.com"
 FEEDBACK_APP_PASSWORD = "wwro vjjg grzt vpcp"
