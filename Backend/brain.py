@@ -921,7 +921,7 @@ def calculate_confidence(
 # 📊 DATA FETCH (TWELVE DATA)
 # =========================
 import os
-TWELVE_DATA_API_KEY = "9bce0b4c48b1498d8e2afb8a5c186359"
+TWELVE_DATA_API_KEY = "6cdda0e63fd34eb586552edf157a188b"
 
 def _normalize_td_values(values):
     if not values:
@@ -1229,10 +1229,14 @@ def get_signal(data, htf_data, symbol):
         decimals = 5
         buffer = 0.00020
         retest_buffer = 0.00030
+        late_entry_distance = 0.00120
+        no_retest_max_distance = 0.00075
     else:
         decimals = 2
         buffer = 1.20
         retest_buffer = 2.50
+        late_entry_distance = 6.00
+        no_retest_max_distance = 3.50
 
     reasons = []
 
@@ -1258,6 +1262,22 @@ def get_signal(data, htf_data, symbol):
     )
 
     htf_structure = detect_htf_structure(htf_data)
+        # =========================
+    # 15M TREND FILTER
+    # =========================
+    htf_close = htf_data["Close"]
+
+    htf_ema9 = htf_close.ewm(span=9).mean().iloc[-1].item()
+    htf_ema21 = htf_close.ewm(span=21).mean().iloc[-1].item()
+    htf_ema50 = htf_close.ewm(span=50).mean().iloc[-1].item()
+
+    htf_bullish = (
+        htf_ema9 > htf_ema21 > htf_ema50
+    )
+
+    htf_bearish = (
+        htf_ema9 < htf_ema21 < htf_ema50
+    )
 
     bullish_sweep = (
         swing_low is not None
@@ -1375,15 +1395,19 @@ def get_signal(data, htf_data, symbol):
 
     if state["pending"] == "BUY" and state["bos_level"] is not None:
         in_buy_retest_zone = (
-            l1 <= state["bos_level"] + retest_buffer
-            and h1 >= state["bos_level"] - retest_buffer
-        )
-
+    c1 > state["bos_level"] - retest_buffer
+)
         buy_displacement = (
+                c1 > o1
+                and c1 > state["bos_level"] - (retest_buffer * 0.3)
+            )
+
+        buy_no_retest_momentum = (
             c1 > o1
-            and state["bos_level"] is not None
-            and h1 > state["bos_level"]
             and c1 > state["bos_level"]
+            and (c1 - state["bos_level"]) <= no_retest_max_distance
+            and (h1 - l1) > 0
+            and ((c1 - o1) / (h1 - l1)) >= 0.60
         )
 
         if in_buy_retest_zone and not buy_displacement:
@@ -1395,38 +1419,86 @@ def get_signal(data, htf_data, symbol):
             sell_score = 10
             confidence = 55
 
-        elif in_buy_retest_zone and buy_displacement:
-            final_signal = "BUY"
-            buy_score = 92
-            sell_score = 8
-            confidence = 92
-            entry_quality = "BOS"
-            entry_timing = "BOS BUY ENTRY"
-            plan_type = "BOS BUY"
-            plan_side = "BUY"
-            state["pending"] = None
-            state["stage"] = "BUY_ACTIVE"
-            state["last_idea"] = "BUY"
+        elif (
+            (in_buy_retest_zone and buy_displacement)
+            or buy_no_retest_momentum
+            or
+            (
+                state["stage"] == "BUY_READY"
+                and c1 > state["bos_level"]
+                and c1 > state["bos_level"]
+            )
+        ):
+            distance_from_bos = c1 - state["bos_level"]
+            # =========================
+            # ANTI-FOMO FILTER
+            # =========================
+
+            recent_candle_range = h1 - l1
+            recent_body = abs(c1 - o1)
+
+            weak_breakout = (
+                recent_body < (recent_candle_range * 0.35)
+            )
+
+            too_extended = (
+                distance_from_bos > late_entry_distance
+            )
+
+            if too_extended or weak_breakout:
+                final_signal = "WAIT"
+                buy_score = 75
+                sell_score = 10
+                confidence = 70
+                entry_quality = "LATE"
+                entry_timing = "WAIT PULLBACK"
+                plan_type = "BUY HOLDING"
+                plan_side = "WAIT"
+                reasons.append("Bullish trend active but entry is late")
+            else:
+                final_signal = "BUY"
+                buy_score = 92
+                sell_score = 8
+                confidence = 92
+                entry_quality = "BOS"
+                entry_timing = "BOS BUY ENTRY"
+                plan_type = "BOS BUY"
+                plan_side = "BUY"
+                state["pending"] = None
+                state["stage"] = "BUY_ACTIVE"
+                state["last_idea"] = "BUY"
 
         else:
-            plan_type = "WAIT BUY RETEST"
-            plan_side = "WAIT"
-            entry_timing = "WAIT BUY RETEST"
-            buy_score = 45
-            sell_score = 15
-            confidence = 35
+            if state["stage"] in ["BUY_READY", "BUY_ACTIVE"] and c1 > state["bos_level"] - retest_buffer:
+                plan_type = "BUY HOLDING"
+                plan_side = "BUY"
+                entry_timing = "BUY HOLDING"
+                buy_score = 75
+                sell_score = 10
+                confidence = 70
+            else:
+                plan_type = "WAIT BUY RETEST"
+                plan_side = "WAIT"
+                entry_timing = "WAIT BUY RETEST"
+                buy_score = 45
+                sell_score = 15
+                confidence = 35
 
     elif state["pending"] == "SELL" and state["bos_level"] is not None:
         in_sell_retest_zone = (
-            h1 >= state["bos_level"] - retest_buffer
-            and l1 <= state["bos_level"] + retest_buffer
-        )
-
+    c1 < state["bos_level"] + retest_buffer
+)
         sell_displacement = (
             c1 < o1
-            and state["bos_level"] is not None
-            and l1 < state["bos_level"]
+            and c1 < state["bos_level"] + (retest_buffer * 0.3)
+        )
+
+        sell_no_retest_momentum = (
+            c1 < o1
             and c1 < state["bos_level"]
+            and (state["bos_level"] - c1) <= no_retest_max_distance
+            and (h1 - l1) > 0
+            and ((o1 - c1) / (h1 - l1)) >= 0.60
         )
 
         if in_sell_retest_zone and not sell_displacement:
@@ -1438,51 +1510,135 @@ def get_signal(data, htf_data, symbol):
             sell_score = 65
             confidence = 55
 
-        elif in_sell_retest_zone and sell_displacement:
-            final_signal = "SELL"
-            buy_score = 8
-            sell_score = 92
-            confidence = 92
-            entry_quality = "BOS"
-            entry_timing = "BOS SELL ENTRY"
-            plan_type = "BOS SELL"
-            plan_side = "SELL"
-            state["pending"] = None
-            state["stage"] = "SELL_ACTIVE"
-            state["last_idea"] = "SELL"
+        elif (
+            (in_sell_retest_zone and sell_displacement)
+             or sell_no_retest_momentum
+             or
+            (
+                state["stage"] == "SELL_READY"
+                and c1 < state["bos_level"]
+                and c1 < o1
+            )
+        ):
+            distance_from_bos = state["bos_level"] - c1
+
+            if distance_from_bos > late_entry_distance:
+                final_signal = "WAIT"
+                buy_score = 10
+                sell_score = 75
+                confidence = 70
+                entry_quality = "LATE"
+                entry_timing = "WAIT PULLBACK"
+                plan_type = "SELL HOLDING"
+                plan_side = "WAIT"
+                reasons.append("Bearish trend active but entry is late")
+            else:
+                final_signal = "SELL"
+                buy_score = 8
+                sell_score = 92
+                confidence = 92
+                entry_quality = "BOS"
+                entry_timing = "BOS SELL ENTRY"
+                plan_type = "BOS SELL"
+                plan_side = "SELL"
+                state["pending"] = None
+                state["stage"] = "SELL_ACTIVE"
+                state["last_idea"] = "SELL"
 
         else:
-            plan_type = "WAIT SELL RETEST"
-            plan_side = "WAIT"
-            entry_timing = "WAIT SELL RETEST"
-            buy_score = 15
-            sell_score = 45
-            confidence = 35
+            if state["stage"] in ["SELL_READY", "SELL_ACTIVE"] and c1 < state["bos_level"] + retest_buffer:
+                plan_type = "SELL HOLDING"
+                plan_side = "SELL"
+                entry_timing = "SELL HOLDING"
+                buy_score = 10
+                sell_score = 75
+                confidence = 70
+            else:
+                plan_type = "WAIT SELL RETEST"
+                plan_side = "WAIT"
+                entry_timing = "WAIT SELL RETEST"
+                buy_score = 15
+                sell_score = 45
+                confidence = 35
 
     else:
-        if c1 > recent_low and c1 < recent_high:
-            if c1 < ((recent_high + recent_low) / 2):
-                plan_type = "WAIT SELL BREAK"
-                entry_timing = "WAIT SELL BREAK"
-                sell_score = 45
-                buy_score = 15
-                confidence = 35
-                entry_quality = "WAIT"
-                reasons.append("Price near support, waiting bearish BOS")
-            else:
-                plan_type = "WAIT BUY BREAK"
-                entry_timing = "WAIT BUY BREAK"
-                buy_score = 45
-                sell_score = 15
-                confidence = 35
-                entry_quality = "WAIT"
-                reasons.append("Price near resistance, waiting bullish BOS")
+            # =========================
+        # KEEP ACTIVE TREND MEMORY
+        # =========================
+
+        if (
+            state["stage"] in ["BUY_READY", "BUY_ACTIVE"]
+            and state["bos_level"] is not None
+            and c1 > state["bos_level"] - retest_buffer
+        ):
+
+            final_signal = "WAIT"
+
+            buy_score = 75
+            sell_score = 10
+            confidence = 70
+
+            entry_quality = "HOLDING"
+            entry_timing = "BUY HOLDING"
+
+            plan_type = "BUY HOLDING"
+            plan_side = "WAIT"
+            reasons.append("Bullish trend still active")
+
+        elif (
+            state["stage"] in ["SELL_READY", "SELL_ACTIVE"]
+            and state["bos_level"] is not None
+            and c1 < state["bos_level"] + retest_buffer
+        ):
+            final_signal = "WAIT"
+
+            buy_score = 10
+            sell_score = 75
+            confidence = 70
+
+            entry_quality = "HOLDING"
+            entry_timing = "SELL HOLDING"
+
+            plan_type = "SELL HOLDING"
+            plan_side = "WAIT"
+            reasons.append("Bearish trend still active")
+
         else:
-            plan_type = "WAIT FOR BOS"
-            entry_timing = "WAIT"
 
-        plan_side = "WAIT"
+            if c1 > recent_low and c1 < recent_high:
 
+                if c1 < ((recent_high + recent_low) / 2):
+
+                    plan_type = "WAIT SELL BREAK"
+                    entry_timing = "WAIT SELL BREAK"
+
+                    sell_score = 45
+                    buy_score = 15
+                    confidence = 35
+
+                    entry_quality = "WAIT"
+
+                    reasons.append("Price near support, waiting bearish BOS")
+
+                else:
+
+                    plan_type = "WAIT BUY BREAK"
+                    entry_timing = "WAIT BUY BREAK"
+
+                    buy_score = 45
+                    sell_score = 15
+                    confidence = 35
+
+                    entry_quality = "WAIT"
+
+                    reasons.append("Price near resistance, waiting bullish BOS")
+
+            else:
+
+                plan_type = "WAIT FOR BOS"
+                entry_timing = "WAIT"
+
+            plan_side = "WAIT"
     # =========================
     # EXIT IDEA LOGIC
     # =========================
