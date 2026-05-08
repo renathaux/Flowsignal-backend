@@ -921,7 +921,7 @@ def calculate_confidence(
 # 📊 DATA FETCH (TWELVE DATA)
 # =========================
 import os
-TWELVE_DATA_API_KEY = "6cdda0e63fd34eb586552edf157a188b"
+TWELVE_DATA_API_KEY = "9bce0b4c48b1498d8e2afb8a5c186359"
 
 def _normalize_td_values(values):
     if not values:
