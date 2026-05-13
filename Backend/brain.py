@@ -2009,7 +2009,11 @@ def get_signal(data, htf_data, symbol):
                     and c1 < o1
                 )
             )
-            and htf_structure != "BULLISH"
+            and not (
+                htf_structure == "BULLISH"
+                and not bearish_bos
+                and not bearish_choch
+            )and htf_structure != "BULLISH"
         ):
             distance_from_bos = state["bos_level"] - c1
 
@@ -2040,7 +2044,7 @@ def get_signal(data, htf_data, symbol):
                     plan_side = "WAIT"
                     reasons.append("Sell blocked: fake bearish breakout")
 
-                elif mtf_bias == "BULLISH":
+                elif mtf_bias == "BULLISH" and not bearish_bos and not bearish_choch:
                     final_signal = "WAIT"
                     buy_score = 35
                     sell_score = 55
@@ -2050,7 +2054,7 @@ def get_signal(data, htf_data, symbol):
                     plan_type = "SELL CONFLICT WITH HTF"
                     plan_side = "WAIT"
                     reasons.append(f"SELL blocked by MTF bullish bias ({mtf_score})")
-                elif not bearish_displacement and confidence < 55:
+                elif not bearish_displacement and confidence < 55 and not bearish_bos and not bearish_choch:
                     final_signal = "WAIT"
                     buy_score = 8
                     sell_score = 70
