@@ -1037,7 +1037,7 @@ def calculate_confidence(
 # 📊 DATA FETCH (TWELVE DATA)
 # =========================
 import os
-TWELVE_DATA_API_KEY = "9bce0b4c48b1498d8e2afb8a5c186359"
+TWELVE_DATA_API_KEY = "6cdda0e63fd34eb586552edf157a188b"
 
 def _normalize_td_values(values):
     if not values:
@@ -1837,14 +1837,40 @@ def get_signal(data, htf_data, symbol):
             and ((c1 - o1) / (h1 - l1)) >= 0.60
         )
 
-        if in_buy_retest_zone and not buy_displacement:
-            state["stage"] = "BUY_READY"
-            plan_type = "BUY READY"
-            plan_side = "WAIT"
-            entry_timing = "BUY READY"
-            buy_score = 65
-            sell_score = 10
-            confidence = 55
+        if in_buy_retest_zone:
+
+            if (
+                bullish_choch
+                or bullish_bos
+                or buy_displacement
+                or recent_pressure == "BULLISH"
+            ):
+
+                final_signal = "BUY"
+
+                buy_score = 88
+                sell_score = 8
+                confidence = 82
+
+                entry_quality = "SMC"
+                entry_timing = "CHOCH/BOS RETEST"
+
+                plan_type = "SMC BUY"
+                plan_side = "BUY"
+
+                state["pending"] = None
+                state["stage"] = "BUY_ACTIVE"
+
+            else:
+                state["stage"] = "BUY_READY"
+
+                plan_type = "BUY READY"
+                plan_side = "WAIT"
+                entry_timing = "BUY READY"
+
+                buy_score = 65
+                sell_score = 10
+                confidence = 55
 
         elif (
             (
@@ -1857,8 +1883,14 @@ def get_signal(data, htf_data, symbol):
                     and c1 > state["bos_level"]
                 )
             )
-            and htf_structure != "BEARISH"
-        ):
+           and not (
+                    htf_structure == "BEARISH"
+                    and recent_pressure != "BULLISH"
+                    and momentum_strength == "WEAK"
+                    and not bullish_bos
+                    and not bullish_choch
+                )
+            ):
             distance_from_bos = c1 - state["bos_level"]
             # =========================
             # ANTI-FOMO FILTER
@@ -1989,32 +2021,58 @@ def get_signal(data, htf_data, symbol):
             and ((o1 - c1) / (h1 - l1)) >= 0.60
         )
 
-        if in_sell_retest_zone and not sell_displacement:
-            state["stage"] = "SELL_READY"
-            plan_type = "SELL READY"
-            plan_side = "WAIT"
-            entry_timing = "SELL READY"
-            buy_score = 10
-            sell_score = 65
-            confidence = 55
+        if in_sell_retest_zone:
 
+            if (
+                bearish_choch
+                or bearish_bos
+                or sell_displacement
+                or recent_pressure == "BEARISH"
+            ):
+
+                final_signal = "SELL"
+
+                buy_score = 8
+                sell_score = 88
+                confidence = 82
+
+                entry_quality = "SMC"
+                entry_timing = "CHOCH/BOS RETEST"
+
+                plan_type = "SMC SELL"
+                plan_side = "SELL"
+
+                state["pending"] = None
+                state["stage"] = "SELL_ACTIVE"
+
+            else:
+                state["stage"] = "SELL_READY"
+
+                plan_type = "SELL READY"
+                plan_side = "WAIT"
+                entry_timing = "SELL READY"
+
+                buy_score = 10
+                sell_score = 65
+                confidence = 55
         elif (
-            (
-                (in_sell_retest_zone and sell_displacement)
-                or sell_no_retest_momentum
-                or
                 (
-                    state["stage"] == "SELL_READY"
-                    and c1 < state["bos_level"]
-                    and c1 < o1
+                    (in_sell_retest_zone and sell_displacement)
+                    or sell_no_retest_momentum
+                    or (
+                        state["stage"] == "SELL_READY"
+                        and c1 < state["bos_level"]
+                        and c1 < o1
+                    )
                 )
-            )
-            and not (
-                htf_structure == "BULLISH"
-                and not bearish_bos
-                and not bearish_choch
-            )and htf_structure != "BULLISH"
-        ):
+                and not (
+                        htf_structure == "BULLISH"
+                        and recent_pressure != "BEARISH"
+                        and momentum_strength == "WEAK"
+                        and not bearish_bos
+                        and not bearish_choch
+                    )
+            ):
             distance_from_bos = state["bos_level"] - c1
 
             selling_into_liquidity = (
