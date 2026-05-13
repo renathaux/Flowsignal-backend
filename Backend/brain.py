@@ -463,6 +463,99 @@ def detect_htf_structure(htf_data):
 
     return "NEUTRAL"
 
+# =========================
+# 🧭 MULTI-TIMEFRAME CONFLUENCE
+# =========================
+def detect_mtf_confluence(data_5m, data_15m, symbol):
+    if data_5m.empty or data_15m.empty or len(data_15m) < 30:
+        return "NEUTRAL", 0
+
+    close_15 = data_15m["Close"]
+
+    ema9_15 = close_15.ewm(span=9).mean().iloc[-1].item()
+    ema21_15 = close_15.ewm(span=21).mean().iloc[-1].item()
+    ema50_15 = close_15.ewm(span=50).mean().iloc[-1].item()
+
+    htf_structure = detect_htf_structure(data_15m)
+
+    score = 0
+
+    if ema9_15 > ema21_15 > ema50_15:
+        score += 2
+        bias = "BULLISH"
+    elif ema9_15 < ema21_15 < ema50_15:
+        score -= 2
+        bias = "BEARISH"
+    else:
+        bias = "NEUTRAL"
+
+    if htf_structure == "BULLISH":
+        score += 2
+    elif htf_structure == "BEARISH":
+        score -= 2
+
+    if score >= 3:
+        return "BULLISH", abs(score)
+
+    if score <= -3:
+        return "BEARISH", abs(score)
+
+    return bias, abs(score)
+
+# =========================
+# 🧠 SMART CONFIDENCE ENGINE
+# =========================
+def calculate_smart_confidence(
+    session_active,
+    bullish_fvg,
+    bearish_fvg,
+    bullish_displacement,
+    bearish_displacement,
+    fake_breakout,
+    mtf_bias,
+    signal_side
+):
+    confidence = 50
+
+    # Session
+    if session_active:
+        confidence += 10
+    else:
+        confidence -= 8
+
+    # FVG
+    if signal_side == "BUY" and bullish_fvg:
+        confidence += 8
+
+    if signal_side == "SELL" and bearish_fvg:
+        confidence += 8
+
+    # Displacement
+    if signal_side == "BUY" and bullish_displacement:
+        confidence += 10
+
+    if signal_side == "SELL" and bearish_displacement:
+        confidence += 10
+
+    # Fake breakout penalty
+    if fake_breakout != "NONE":
+        confidence -= 18
+
+    # MTF alignment
+    if signal_side == "BUY":
+        if mtf_bias == "BULLISH":
+            confidence += 12
+        elif mtf_bias == "BEARISH":
+            confidence -= 12
+
+    if signal_side == "SELL":
+        if mtf_bias == "BEARISH":
+            confidence += 12
+        elif mtf_bias == "BULLISH":
+            confidence -= 12
+
+    return max(1, min(99, confidence))
+
 
 def detect_choch(data):
     close = data["Close"]
@@ -611,6 +704,29 @@ def detect_swing_liquidity(data):
         market_structure,
         swing_points[-12:]
     )
+
+def detect_equal_levels(data, tolerance):
+
+    highs = data["High"].tolist()
+    lows = data["Low"].tolist()
+
+    equal_highs = []
+    equal_lows = []
+
+    for i in range(len(highs) - 1):
+        for j in range(i + 1, len(highs)):
+            if abs(highs[i] - highs[j]) <= tolerance:
+                equal_highs.append(round((highs[i] + highs[j]) / 2, 5))
+
+    for i in range(len(lows) - 1):
+        for j in range(i + 1, len(lows)):
+            if abs(lows[i] - lows[j]) <= tolerance:
+                equal_lows.append(round((lows[i] + lows[j]) / 2, 5))
+
+    return {
+        "equal_highs": equal_highs[-5:],
+        "equal_lows": equal_lows[-5:]
+    }
 
 
 def detect_liquidity_trap(c1, o1, h1, l1, swing_high, swing_low, strong_body):
@@ -1200,6 +1316,246 @@ SMC_STATE = {
             }
         }
 
+# =========================
+# 🤖 PAPER AUTO-TRADER
+# =========================
+AUTO_TRADES = {
+    "EURUSD": None,
+    "GOLD": None,
+}
+
+PAPER_TRADE_HISTORY = []
+
+# =========================
+# 🧱 FVG + SESSION HELPERS
+# =========================
+def detect_fvg(data, symbol):
+    if len(data) < 5:
+        return None
+
+    candles = data.tail(8)
+
+    if symbol == "EURUSD":
+        min_gap = 0.00015
+    else:
+        min_gap = 0.80
+
+    fvgs = []
+
+    for i in range(2, len(candles)):
+        c0 = candles.iloc[i - 2]
+        c2 = candles.iloc[i]
+
+        # Bullish FVG: candle 3 low is above candle 1 high
+        if c2["Low"] > c0["High"]:
+            gap = c2["Low"] - c0["High"]
+            if gap >= min_gap:
+                fvgs.append({
+                    "type": "BULLISH",
+                    "low": float(c0["High"]),
+                    "high": float(c2["Low"]),
+                    "mid": float((c0["High"] + c2["Low"]) / 2)
+                })
+
+        # Bearish FVG: candle 3 high is below candle 1 low
+        if c2["High"] < c0["Low"]:
+            gap = c0["Low"] - c2["High"]
+            if gap >= min_gap:
+                fvgs.append({
+                    "type": "BEARISH",
+                    "low": float(c2["High"]),
+                    "high": float(c0["Low"]),
+                    "mid": float((c2["High"] + c0["Low"]) / 2)
+                })
+
+    return fvgs[-1] if fvgs else None
+
+
+def is_in_fvg_retest(price, fvg):
+    if not fvg:
+        return False
+
+    return fvg["low"] <= price <= fvg["high"]
+
+
+def get_session_state():
+    now = datetime.now(timezone.utc)
+    hour = now.hour
+
+    # Main forex activity windows UTC
+    london = 7 <= hour < 11
+    new_york = 13 <= hour < 17
+    overlap = 13 <= hour < 16
+
+    if overlap:
+        return "NY_LONDON_OVERLAP", True
+
+    if london:
+        return "LONDON", True
+
+    if new_york:
+        return "NEW_YORK", True
+
+    return "LOW_ACTIVITY", False
+
+# =========================
+# ⚡ DISPLACEMENT ENGINE
+# =========================
+def detect_displacement(data, symbol):
+    if len(data) < 8:
+        return "WEAK", 0
+
+    last = data.iloc[-1]
+    recent = data.tail(8)
+
+    body = abs(last["Close"] - last["Open"])
+    candle_range = last["High"] - last["Low"]
+
+    if candle_range <= 0:
+        return "WEAK", 0
+
+    avg_range = (recent["High"] - recent["Low"]).mean()
+    body_ratio = body / candle_range
+
+    if symbol == "EURUSD":
+        min_body = 0.00025
+    else:
+        min_body = 1.0
+
+    score = 0
+
+    if body >= min_body:
+        score += 2
+
+    if candle_range >= avg_range * 1.25:
+        score += 2
+
+    if body_ratio >= 0.65:
+        score += 3
+    elif body_ratio >= 0.50:
+        score += 2
+
+    if last["Close"] > last["Open"]:
+        direction = "BULLISH"
+    elif last["Close"] < last["Open"]:
+        direction = "BEARISH"
+    else:
+        direction = "NEUTRAL"
+
+    if score >= 6:
+        return f"STRONG_{direction}", score
+    elif score >= 4:
+        return f"MEDIUM_{direction}", score
+    else:
+        return f"WEAK_{direction}", score
+
+# =========================
+# 🧨 FAKE BREAKOUT KILLER
+# =========================
+def detect_fake_breakout(c1, o1, h1, l1, recent_high, recent_low, symbol):
+    body = abs(c1 - o1)
+    candle_range = h1 - l1
+
+    if candle_range <= 0:
+        return "NONE"
+
+    upper_wick = h1 - max(c1, o1)
+    lower_wick = min(c1, o1) - l1
+
+    if symbol == "EURUSD":
+        reclaim_buffer = 0.00015
+    else:
+        reclaim_buffer = 0.80
+
+    fake_bull_breakout = (
+        h1 > recent_high
+        and c1 < recent_high - reclaim_buffer
+        and upper_wick > body * 1.8
+    )
+
+    fake_bear_breakout = (
+        l1 < recent_low
+        and c1 > recent_low + reclaim_buffer
+        and lower_wick > body * 1.8
+    )
+
+    if fake_bull_breakout:
+        return "FAKE_BULL_BREAKOUT"
+
+    if fake_bear_breakout:
+        return "FAKE_BEAR_BREAKOUT"
+
+    return "NONE"
+
+def update_paper_trade(symbol, result, current_price):
+    global AUTO_TRADES
+
+    trade = AUTO_TRADES.get(symbol)
+
+    # No open trade: open one only on real BUY/SELL
+    if trade is None and result.get("signal") in ["BUY", "SELL"]:
+        entry = result.get("entry_price")
+        sl = result.get("stop_loss")
+        tp1 = result.get("tp1")
+        tp2 = result.get("tp2")
+
+        if entry == "--" or sl == "--" or tp1 == "--" or tp2 == "--":
+            return
+
+        AUTO_TRADES[symbol] = {
+            "symbol": symbol,
+            "side": result["signal"],
+            "entry": float(entry),
+            "sl": float(sl),
+            "tp1": float(tp1),
+            "tp2": float(tp2),
+            "opened_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "status": "OPEN",
+            "result": "RUNNING",
+        }
+        return
+
+    # Manage open trade
+    if trade is None:
+        return
+
+    side = trade["side"]
+    sl = trade["sl"]
+    tp1 = trade["tp1"]
+    tp2 = trade["tp2"]
+
+    if side == "BUY":
+        if current_price <= sl:
+            trade["status"] = "CLOSED"
+            trade["result"] = "LOSS"
+        elif current_price >= tp2:
+            trade["status"] = "CLOSED"
+            trade["result"] = "TP2"
+        elif current_price >= tp1:
+            trade["result"] = "TP1 HIT"
+
+    if side == "SELL":
+        if current_price >= sl:
+            trade["status"] = "CLOSED"
+            trade["result"] = "LOSS"
+        elif current_price <= tp2:
+            trade["status"] = "CLOSED"
+            trade["result"] = "TP2"
+        elif current_price <= tp1:
+            trade["result"] = "TP1 HIT"
+
+    if trade["status"] == "CLOSED":
+        trade["closed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        trade["closed_price"] = float(current_price)
+
+        PAPER_TRADE_HISTORY.append(trade.copy())
+
+        # Keep only latest 50 paper trades
+        if len(PAPER_TRADE_HISTORY) > 50:
+            PAPER_TRADE_HISTORY.pop(0)
+
+        AUTO_TRADES[symbol] = None
+
 def get_signal(data, htf_data, symbol):
     if data.empty or htf_data.empty or len(data) < 30 or len(htf_data) < 10:
         return {
@@ -1231,14 +1587,44 @@ def get_signal(data, htf_data, symbol):
         retest_buffer = 0.00030
         late_entry_distance = 0.00120
         no_retest_max_distance = 0.00075
+        equal_tolerance = 0.00015
     else:
         decimals = 2
         buffer = 1.20
         retest_buffer = 2.50
         late_entry_distance = 6.00
         no_retest_max_distance = 3.50
+        equal_tolerance = 1.0
 
     reasons = []
+    liquidity_levels = detect_equal_levels(
+    data.tail(30),
+    equal_tolerance
+)
+
+    fvg = detect_fvg(data, symbol)
+    session_name, session_active = get_session_state()
+
+    displacement, displacement_score = detect_displacement(data, symbol)
+
+    bullish_displacement = displacement in ["STRONG_BULLISH", "MEDIUM_BULLISH"]
+    bearish_displacement = displacement in ["STRONG_BEARISH", "MEDIUM_BEARISH"]
+
+    bullish_fvg = fvg is not None and fvg["type"] == "BULLISH"
+    bearish_fvg = fvg is not None and fvg["type"] == "BEARISH"
+
+    price_in_fvg = is_in_fvg_retest(c1, fvg)
+
+    buy_side_liquidity = liquidity_levels["equal_highs"]
+    sell_side_liquidity = liquidity_levels["equal_lows"]
+
+    nearest_buy_liquidity = (
+        min([lvl for lvl in buy_side_liquidity if lvl > c1], default=None)
+    )
+
+    nearest_sell_liquidity = (
+        max([lvl for lvl in sell_side_liquidity if lvl < c1], default=None)
+    )
 
     (
         swing_high,
@@ -1261,7 +1647,12 @@ def get_signal(data, htf_data, symbol):
         else low.iloc[-20:-1].min().item()
     )
 
+    fake_breakout = detect_fake_breakout(
+        c1, o1, h1, l1, recent_high, recent_low, symbol
+    )
+
     htf_structure = detect_htf_structure(htf_data)
+    mtf_bias, mtf_score = detect_mtf_confluence(data, htf_data, symbol)
         # =========================
     # 15M TREND FILTER
     # =========================
@@ -1280,18 +1671,35 @@ def get_signal(data, htf_data, symbol):
     )
 
     bullish_sweep = (
+    (
         swing_low is not None
         and l1 < swing_low
         and c1 > swing_low
         and c1 > o1
     )
-
+    or
+    (
+        nearest_sell_liquidity is not None
+        and l1 < nearest_sell_liquidity
+        and c1 > nearest_sell_liquidity
+        and c1 > o1
+    )
+)
     bearish_sweep = (
+    (
         swing_high is not None
         and h1 > swing_high
         and c1 < swing_high
         and c1 < o1
     )
+    or
+    (
+        nearest_buy_liquidity is not None
+        and h1 > nearest_buy_liquidity
+        and c1 < nearest_buy_liquidity
+        and c1 < o1
+    )
+)
 
     bullish_choch = (
         htf_structure in ["BEARISH", "NEUTRAL"]
@@ -1371,7 +1779,26 @@ def get_signal(data, htf_data, symbol):
     if bearish_sweep:
         reasons.append("Bearish liquidity sweep detected")
 
+    if fake_breakout != "NONE":
+      reasons.append(fake_breakout)
+
     state = SMC_STATE[symbol]
+        # =========================
+    # 🔄 STRUCTURE FLIP RESET
+    # =========================
+    if state["pending"] == "SELL" and (bullish_choch or bullish_bos):
+        state["pending"] = "BUY"
+        state["bos_level"] = recent_high
+        state["sweep_level"] = swing_low
+        state["stage"] = "BUY_READY"
+        reasons.append("State flipped from SELL to BUY")
+
+    if state["pending"] == "BUY" and (bearish_choch or bearish_bos):
+        state["pending"] = "SELL"
+        state["bos_level"] = recent_low
+        state["sweep_level"] = swing_high
+        state["stage"] = "SELL_READY"
+        reasons.append("State flipped from BUY to SELL")
 
     # SAVE BOS / CHOCH FIRST
     # SAVE BOS / CHOCH FIRST
@@ -1420,14 +1847,17 @@ def get_signal(data, htf_data, symbol):
             confidence = 55
 
         elif (
-            (in_buy_retest_zone and buy_displacement)
-            or buy_no_retest_momentum
-            or
             (
-                state["stage"] == "BUY_READY"
-                and c1 > state["bos_level"]
-                and c1 > state["bos_level"]
+                (in_buy_retest_zone and buy_displacement)
+                or buy_no_retest_momentum
+                or
+                (
+                    state["stage"] == "BUY_READY"
+                    and c1 > state["bos_level"]
+                    and c1 > state["bos_level"]
+                )
             )
+            and htf_structure != "BEARISH"
         ):
             distance_from_bos = c1 - state["bos_level"]
             # =========================
@@ -1445,7 +1875,12 @@ def get_signal(data, htf_data, symbol):
                 distance_from_bos > late_entry_distance
             )
 
-            if too_extended or weak_breakout:
+            buying_into_liquidity = (
+                nearest_buy_liquidity is not None
+                and abs(nearest_buy_liquidity - c1) <= retest_buffer
+            )
+
+            if too_extended or weak_breakout or buying_into_liquidity:
                 final_signal = "WAIT"
                 buy_score = 75
                 sell_score = 10
@@ -1456,18 +1891,71 @@ def get_signal(data, htf_data, symbol):
                 plan_side = "WAIT"
                 reasons.append("Bullish trend active but entry is late")
             else:
-                final_signal = "BUY"
-                buy_score = 92
-                sell_score = 8
-                confidence = 92
-                entry_quality = "BOS"
-                entry_timing = "BOS BUY ENTRY"
-                plan_type = "BOS BUY"
-                plan_side = "BUY"
-                state["pending"] = None
-                state["stage"] = "BUY_ACTIVE"
-                state["last_idea"] = "BUY"
+                if fake_breakout == "FAKE_BULL_BREAKOUT":
+                    final_signal = "WAIT"
+                    buy_score = 25
+                    sell_score = 65
+                    confidence = 72
+                    entry_quality = "FAKE"
+                    entry_timing = "FAKE BUY BREAKOUT"
+                    plan_type = "FAKE BUY BREAKOUT"
+                    plan_side = "WAIT"
+                    reasons.append("Buy blocked: fake bullish breakout")
 
+                elif mtf_bias == "BEARISH":
+                    final_signal = "WAIT"
+                    buy_score = 55
+                    sell_score = 35
+                    confidence = 58
+                    entry_quality = "CONFLICT"
+                    entry_timing = "WAIT MTF ALIGNMENT"
+                    plan_type = "BUY CONFLICT WITH HTF"
+                    plan_side = "WAIT"
+                    reasons.append(f"BUY blocked by MTF bearish bias ({mtf_score})")
+
+                elif not bullish_displacement and confidence < 55:
+                    final_signal = "WAIT"
+                    buy_score = 72
+                    sell_score = 8
+                    confidence = 66
+                    entry_quality = "WEAK"
+                    entry_timing = "WAIT DISPLACEMENT"
+                    plan_type = "WAIT BULLISH DISPLACEMENT"
+                    plan_side = "WAIT"
+                    reasons.append(f"Weak bullish displacement: {displacement}")
+
+                if not session_active:
+                    final_signal = "WAIT"
+                    buy_score = 70
+                    sell_score = 8
+                    confidence = 62
+                    entry_quality = "WAIT"
+                    entry_timing = "WAIT SESSION"
+                    plan_type = "WAIT SESSION"
+                    plan_side = "WAIT"
+                    reasons.append(f"Session inactive: {session_name}")
+
+                else:
+                    final_signal = "BUY"
+                    buy_score = 94 if bullish_fvg else 92
+                    sell_score = 8
+                    confidence = calculate_smart_confidence(
+                        session_active,
+                        bullish_fvg,
+                        bearish_fvg,
+                        bullish_displacement,
+                        bearish_displacement,
+                        fake_breakout,
+                        mtf_bias,
+                        "BUY"
+                    )
+                    entry_quality = "FVG" if bullish_fvg else "BOS"
+                    entry_timing = "FVG BUY ENTRY" if bullish_fvg else "BOS BUY ENTRY"
+                    plan_type = "FVG BUY" if bullish_fvg else "BOS BUY"
+                    plan_side = "BUY"
+                    state["pending"] = None
+                    state["stage"] = "BUY_ACTIVE"
+                    state["last_idea"] = "BUY"
         else:
             if state["stage"] in ["BUY_READY", "BUY_ACTIVE"] and c1 > state["bos_level"] - retest_buffer:
                 plan_type = "BUY HOLDING"
@@ -1511,18 +1999,26 @@ def get_signal(data, htf_data, symbol):
             confidence = 55
 
         elif (
-            (in_sell_retest_zone and sell_displacement)
-             or sell_no_retest_momentum
-             or
             (
-                state["stage"] == "SELL_READY"
-                and c1 < state["bos_level"]
-                and c1 < o1
+                (in_sell_retest_zone and sell_displacement)
+                or sell_no_retest_momentum
+                or
+                (
+                    state["stage"] == "SELL_READY"
+                    and c1 < state["bos_level"]
+                    and c1 < o1
+                )
             )
+            and htf_structure != "BULLISH"
         ):
             distance_from_bos = state["bos_level"] - c1
 
-            if distance_from_bos > late_entry_distance:
+            selling_into_liquidity = (
+                nearest_sell_liquidity is not None
+                and abs(c1 - nearest_sell_liquidity) <= retest_buffer
+            )
+
+            if distance_from_bos > late_entry_distance or selling_into_liquidity:
                 final_signal = "WAIT"
                 buy_score = 10
                 sell_score = 75
@@ -1533,18 +2029,58 @@ def get_signal(data, htf_data, symbol):
                 plan_side = "WAIT"
                 reasons.append("Bearish trend active but entry is late")
             else:
-                final_signal = "SELL"
-                buy_score = 8
-                sell_score = 92
-                confidence = 92
-                entry_quality = "BOS"
-                entry_timing = "BOS SELL ENTRY"
-                plan_type = "BOS SELL"
-                plan_side = "SELL"
-                state["pending"] = None
-                state["stage"] = "SELL_ACTIVE"
-                state["last_idea"] = "SELL"
+                if fake_breakout == "FAKE_BEAR_BREAKOUT":
+                    final_signal = "WAIT"
+                    buy_score = 65
+                    sell_score = 25
+                    confidence = 72
+                    entry_quality = "FAKE"
+                    entry_timing = "FAKE SELL BREAKOUT"
+                    plan_type = "FAKE SELL BREAKOUT"
+                    plan_side = "WAIT"
+                    reasons.append("Sell blocked: fake bearish breakout")
 
+                elif mtf_bias == "BULLISH":
+                    final_signal = "WAIT"
+                    buy_score = 35
+                    sell_score = 55
+                    confidence = 58
+                    entry_quality = "CONFLICT"
+                    entry_timing = "WAIT MTF ALIGNMENT"
+                    plan_type = "SELL CONFLICT WITH HTF"
+                    plan_side = "WAIT"
+                    reasons.append(f"SELL blocked by MTF bullish bias ({mtf_score})")
+                elif not bearish_displacement and confidence < 55:
+                    final_signal = "WAIT"
+                    buy_score = 8
+                    sell_score = 70
+                    confidence = 62
+                    entry_quality = "WAIT"
+                    entry_timing = "WAIT DISPLACEMENT"
+                    plan_type = "WAIT BEARISH DISPLACEMENT"
+                    plan_side = "WAIT"
+                    reasons.append(f"Weak bearish displacement: {displacement}")
+                else:
+                    final_signal = "SELL"
+                    buy_score = 8
+                    sell_score = 94 if bearish_fvg else 92
+                    confidence = calculate_smart_confidence(
+                        session_active,
+                        bullish_fvg,
+                        bearish_fvg,
+                        bullish_displacement,
+                        bearish_displacement,
+                        fake_breakout,
+                        mtf_bias,
+                        "SELL"
+                    )
+                    entry_quality = "FVG" if bearish_fvg else "BOS"
+                    entry_timing = "FVG SELL ENTRY" if bearish_fvg else "BOS SELL ENTRY"
+                    plan_type = "FVG SELL" if bearish_fvg else "BOS SELL"
+                    plan_side = "SELL"
+                    state["pending"] = None
+                    state["stage"] = "SELL_ACTIVE"
+                    state["last_idea"] = "SELL"
         else:
             if state["stage"] in ["SELL_READY", "SELL_ACTIVE"] and c1 < state["bos_level"] + retest_buffer:
                 plan_type = "SELL HOLDING"
@@ -1590,7 +2126,7 @@ def get_signal(data, htf_data, symbol):
             and state["bos_level"] is not None
             and c1 < state["bos_level"] + retest_buffer
         ):
-            final_signal = "WAIT"
+            final_signal = "SELL"
 
             buy_score = 10
             sell_score = 75
@@ -1616,7 +2152,7 @@ def get_signal(data, htf_data, symbol):
                     buy_score = 15
                     confidence = 35
 
-                    entry_quality = "WAIT"
+                    entry_quality = "BUY"
 
                     reasons.append("Price near support, waiting bearish BOS")
 
@@ -1668,8 +2204,8 @@ def get_signal(data, htf_data, symbol):
         entry_price = round(c1, decimals)
         stop_loss = round(swing_low - buffer, decimals)
         risk = entry_price - stop_loss
-        tp1 = round(entry_price + risk * 1.5, decimals)
-        tp2 = round(entry_price + risk * 2.5, decimals)
+        tp1 = round(entry_price + risk * 1.0, decimals)
+        tp2 = round(entry_price + risk * 1.25, decimals)
         invalidation = "Exit if bearish CHOCH or break below SL"
         plan_reason = "BUY after CHOCH/BOS confirmation + retest"
 
@@ -1677,8 +2213,8 @@ def get_signal(data, htf_data, symbol):
         entry_price = round(c1, decimals)
         stop_loss = round(swing_high + buffer, decimals)
         risk = stop_loss - entry_price
-        tp1 = round(entry_price - risk * 1.5, decimals)
-        tp2 = round(entry_price - risk * 2.5, decimals)
+        tp1 = round(entry_price - risk * 1.0, decimals)
+        tp2 = round(entry_price - risk * 1.25, decimals)
         invalidation = "Exit if bullish CHOCH or break above SL"
         plan_reason = "SELL after CHOCH/BOS confirmation + retest"
 
@@ -1689,6 +2225,44 @@ def get_signal(data, htf_data, symbol):
         tp2 = "--"
         invalidation = "Wait for CHOCH/BOS + retest"
         plan_reason = "No entry until structure confirms"
+
+    # =========================
+    # 🚫 FINAL TRADE GATE
+    # =========================
+    allow_trade = True
+
+    if confidence < 80:
+        allow_trade = False
+        reasons.append("Blocked: confidence below 80")
+
+    if fake_breakout != "NONE":
+        allow_trade = False
+        reasons.append("Blocked: fake breakout")
+
+    if final_signal == "BUY" and not bullish_displacement:
+        allow_trade = False
+        reasons.append("Blocked: weak bullish displacement")
+
+    if final_signal == "SELL" and not bearish_displacement:
+        allow_trade = False
+        reasons.append("Blocked: weak bearish displacement")
+
+    if not session_active:
+        allow_trade = False
+        reasons.append("Blocked: inactive session")
+
+    if final_signal == "BUY" and mtf_bias == "BEARISH":
+        allow_trade = False
+        reasons.append("Blocked: bearish MTF conflict")
+
+    if final_signal == "SELL" and mtf_bias == "BULLISH":
+        allow_trade = False
+        reasons.append("Blocked: bullish MTF conflict")
+
+    if not allow_trade and final_signal in ["BUY", "SELL"]:
+        final_signal = "WAIT"
+        plan_side = "WAIT"
+        entry_timing = "NO TRADE"
 
     if final_signal == "BUY":
         signal_text = f"BUY 🟢 ({confidence}% | {entry_timing})"
@@ -1723,7 +2297,7 @@ def get_signal(data, htf_data, symbol):
         "stop_loss": stop_loss,
         "tp1": tp1,
         "tp2": tp2,
-        "risk_reward": "1:1.5" if final_signal in ["BUY", "SELL"] else "--",
+       "risk_reward": "1:1.25" if final_signal in ["BUY", "SELL"] else "--",
         "invalidation": invalidation,
         "plan_reason": plan_reason,
         "structure_trend": htf_structure,
@@ -1732,6 +2306,16 @@ def get_signal(data, htf_data, symbol):
         "structure_resistance": round(recent_high, decimals),
         "structure_support": round(recent_low, decimals),
         "smc_swings": smc_swings,
+        "equal_highs": liquidity_levels["equal_highs"],
+        "equal_lows": liquidity_levels["equal_lows"],
+        "fvg": fvg,
+        "session": session_name,
+        "session_active": session_active,
+        "displacement": displacement,
+        "displacement_score": displacement_score,
+        "fake_breakout": fake_breakout,
+        "mtf_bias": mtf_bias,
+        "mtf_score": mtf_score,
     }
 
 # =========================
@@ -1860,6 +2444,12 @@ def get_panel_data():
     eurusd_result = get_signal(eurusd, eurusd_htf, "EURUSD")
     gold_result = get_signal(gold, gold_htf, "GOLD")
 
+    if not eurusd.empty:
+       update_paper_trade("EURUSD", eurusd_result, eurusd["Close"].iloc[-1].item())
+
+    if not gold.empty:
+        update_paper_trade("GOLD", gold_result, gold["Close"].iloc[-1].item())
+
     if eurusd_closed:
         eurusd_result = _make_closed_result(
             "EURUSD",
@@ -1905,6 +2495,8 @@ def get_panel_data():
             }
         },
         "history": SIGNAL_HISTORY[-20:],
+        "paper_trades": AUTO_TRADES,
+        "paper_trade_history": PAPER_TRADE_HISTORY[-20:],
         "market_closed": all_closed,
         "feed_status": {
             "EURUSD": {
