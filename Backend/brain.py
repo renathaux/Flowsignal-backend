@@ -1488,71 +1488,120 @@ def detect_fake_breakout(c1, o1, h1, l1, recent_high, recent_low, symbol):
     return "NONE"
 
 def update_paper_trade(symbol, result, current_price):
-    global AUTO_TRADES
+    global AUTO_TRADES, PAPER_TRADE_HISTORY
 
     trade = AUTO_TRADES.get(symbol)
 
-    # No open trade: open one only on real BUY/SELL
-    if trade is None and result.get("signal") in ["BUY", "SELL"]:
+    def calc_pips(symbol, side, entry, close_price):
+        if symbol == "EURUSD":
+            pip_value = 0.0001
+        else:
+            pip_value = 1.0
+
+        if side == "BUY":
+            return round((close_price - entry) / pip_value, 1)
+        else:
+            return round((entry - close_price) / pip_value, 1)
+
+    signal = result.get("signal")
+    plan_side = result.get("plan_side") or result.get("plan_bias")
+
+    is_buy_trade = signal == "BUY" or plan_side == "BUY"
+    is_sell_trade = signal == "SELL" or plan_side == "SELL"
+
+    # OPEN NEW TRADE
+    if trade is None and (is_buy_trade or is_sell_trade):
         entry = result.get("entry_price")
         sl = result.get("stop_loss")
         tp1 = result.get("tp1")
         tp2 = result.get("tp2")
 
         if entry == "--" or sl == "--" or tp1 == "--" or tp2 == "--":
+            print("PAPER BLOCKED:", symbol, signal, plan_side, entry, sl, tp1, tp2)
             return
 
-        AUTO_TRADES[symbol] = {
+        side = "BUY" if is_buy_trade else "SELL"
+
+        new_trade = {
             "symbol": symbol,
-            "side": result["signal"],
+            "side": side,
             "entry": float(entry),
             "sl": float(sl),
             "tp1": float(tp1),
             "tp2": float(tp2),
             "opened_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "closed_at": None,
+            "closed_price": None,
             "status": "OPEN",
             "result": "RUNNING",
+            "pips": 0,
+            "hit_tp1": False,
         }
+
+        AUTO_TRADES[symbol] = new_trade
+        PAPER_TRADE_HISTORY.append(new_trade.copy())
+
+        if len(PAPER_TRADE_HISTORY) > 50:
+            PAPER_TRADE_HISTORY.pop(0)
+
+        print("PAPER OPENED:", new_trade)
         return
 
-    # Manage open trade
     if trade is None:
         return
 
     side = trade["side"]
+    entry = trade["entry"]
     sl = trade["sl"]
     tp1 = trade["tp1"]
     tp2 = trade["tp2"]
 
+    current_price = float(current_price)
+
+    # UPDATE RUNNING PIPS
+    trade["pips"] = calc_pips(symbol, side, entry, current_price)
+
+    # MANAGE BUY
+    current_low = result.get("current_low", current_price)
+    current_high = result.get("current_high", current_price)
+
     if side == "BUY":
-        if current_price <= sl:
+        if current_low <= trade["sl"]:
             trade["status"] = "CLOSED"
             trade["result"] = "LOSS"
-        elif current_price >= tp2:
+        elif current_high >= trade["tp2"]:
             trade["status"] = "CLOSED"
-            trade["result"] = "TP2"
-        elif current_price >= tp1:
+            trade["result"] = "WIN"
+        elif current_high >= trade["tp1"]:
             trade["result"] = "TP1 HIT"
 
+    # MANAGE SELL
     if side == "SELL":
-        if current_price >= sl:
+        if current_high >= trade["sl"]:
             trade["status"] = "CLOSED"
             trade["result"] = "LOSS"
-        elif current_price <= tp2:
+        elif current_low <= trade["tp2"]:
             trade["status"] = "CLOSED"
-            trade["result"] = "TP2"
-        elif current_price <= tp1:
+            trade["result"] = "WIN"
+        elif current_low <= trade["tp1"]:
             trade["result"] = "TP1 HIT"
 
+    # UPDATE HISTORY WHILE RUNNING
+    if PAPER_TRADE_HISTORY:
+        PAPER_TRADE_HISTORY[-1] = trade.copy()
+
+    # CLOSE TRADE
     if trade["status"] == "CLOSED":
         trade["closed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        trade["closed_price"] = float(current_price)
+        trade["closed_price"] = current_price
+        trade["pips"] = calc_pips(symbol, side, entry, current_price)
 
-        PAPER_TRADE_HISTORY.append(trade.copy())
+        if PAPER_TRADE_HISTORY:
+            PAPER_TRADE_HISTORY[-1] = trade.copy()
+        else:
+            PAPER_TRADE_HISTORY.append(trade.copy())
 
-        # Keep only latest 50 paper trades
-        if len(PAPER_TRADE_HISTORY) > 50:
-            PAPER_TRADE_HISTORY.pop(0)
+        print("PAPER CLOSED:", trade)
 
         AUTO_TRADES[symbol] = None
 
@@ -2341,7 +2390,7 @@ def get_signal(data, htf_data, symbol):
         else "NEUTRAL"
     )
 
-    return {
+    result = {
         "signal": final_signal,
         "signal_text": signal_text,
         "buy_pct": buy_score,
@@ -2379,6 +2428,8 @@ def get_signal(data, htf_data, symbol):
         "mtf_bias": mtf_bias,
         "mtf_score": mtf_score,
     }
+
+    return result
 
 # =========================
 # 🔗 PANEL DATA
