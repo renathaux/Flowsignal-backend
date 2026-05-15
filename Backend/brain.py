@@ -1037,7 +1037,7 @@ def calculate_confidence(
 # 📊 DATA FETCH (TWELVE DATA)
 # =========================
 import os
-TWELVE_DATA_API_KEY = "9bce0b4c48b1498d8e2afb8a5c186359"
+TWELVE_DATA_API_KEY = "6cdda0e63fd34eb586552edf157a188b"
 
 def _normalize_td_values(values):
     if not values:
@@ -2338,37 +2338,54 @@ def get_signal(data, htf_data, symbol):
         plan_reason = "No entry until structure confirms"
 
     # =========================
-    # 🚫 FINAL TRADE GATE
+    # ✅ FINAL TRADE GATE — SOFTER SCALPER VERSION
     # =========================
     allow_trade = True
 
-    if confidence < 80:
+    # Confidence was too strict at 80. Scalper can start at 65.
+    if confidence < 65:
         allow_trade = False
-        reasons.append("Blocked: confidence below 80")
+        reasons.append("Blocked: confidence below 65")
 
+    # Fake breakout still blocks trade
     if fake_breakout != "NONE":
         allow_trade = False
         reasons.append("Blocked: fake breakout")
 
+    # Displacement should warn, not always block
     if final_signal == "BUY" and not bullish_displacement:
-        allow_trade = False
-        reasons.append("Blocked: weak bullish displacement")
+        if confidence < 75:
+            allow_trade = False
+            reasons.append("Blocked: weak bullish displacement under 75 confidence")
+        else:
+            reasons.append("Warning: weak bullish displacement allowed by confidence")
 
     if final_signal == "SELL" and not bearish_displacement:
-        allow_trade = False
-        reasons.append("Blocked: weak bearish displacement")
+        if confidence < 75:
+            allow_trade = False
+            reasons.append("Blocked: weak bearish displacement under 75 confidence")
+        else:
+            reasons.append("Warning: weak bearish displacement allowed by confidence")
 
+    # Inactive session should not fully kill SMC trades
     if not session_active:
-        allow_trade = False
-        reasons.append("Blocked: inactive session")
+        confidence = max(1, confidence - 8)
+        reasons.append(f"Session inactive: confidence reduced ({session_name})")
 
+    # MTF conflict should block only weak trades, not all trades
     if final_signal == "BUY" and mtf_bias == "BEARISH":
-        allow_trade = False
-        reasons.append("Blocked: bearish MTF conflict")
+        if confidence < 78 and not bullish_bos and not bullish_choch:
+            allow_trade = False
+            reasons.append("Blocked: bearish MTF conflict")
+        else:
+            reasons.append("MTF bearish conflict allowed by strong BUY structure")
 
     if final_signal == "SELL" and mtf_bias == "BULLISH":
-        allow_trade = False
-        reasons.append("Blocked: bullish MTF conflict")
+        if confidence < 78 and not bearish_bos and not bearish_choch:
+            allow_trade = False
+            reasons.append("Blocked: bullish MTF conflict")
+        else:
+            reasons.append("MTF bullish conflict allowed by strong SELL structure")
 
     if not allow_trade and final_signal in ["BUY", "SELL"]:
         final_signal = "WAIT"
