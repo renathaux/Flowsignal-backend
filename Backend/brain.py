@@ -1,6 +1,8 @@
 # =========================
 # 📦 IMPORTS
 # =========================
+import json
+import os
 import time
 import copy
 import pandas as pd
@@ -1037,7 +1039,7 @@ def calculate_confidence(
 # 📊 DATA FETCH (TWELVE DATA)
 # =========================
 import os
-TWELVE_DATA_API_KEY = "6cdda0e63fd34eb586552edf157a188b"
+TWELVE_DATA_API_KEY = "9bce0b4c48b1498d8e2afb8a5c186359"
 
 def _normalize_td_values(values):
     if not values:
@@ -1326,6 +1328,22 @@ AUTO_TRADES = {
 
 PAPER_TRADE_HISTORY = []
 
+if os.path.exists("paper_backup.json"):
+    try:
+        with open("paper_backup.json", "r") as f:
+            backup = json.load(f)
+
+        AUTO_TRADES = backup.get("paper_trades", AUTO_TRADES)
+        PAPER_TRADE_HISTORY = backup.get(
+            "paper_trade_history",
+            PAPER_TRADE_HISTORY
+        )
+
+        print("✅ Loaded paper backup")
+
+    except Exception as e:
+        print("❌ Failed loading paper backup:", e)
+
 # =========================
 # 🧱 FVG + SESSION HELPERS
 # =========================
@@ -1504,11 +1522,9 @@ def update_paper_trade(symbol, result, current_price):
             return round((entry - close_price) / pip_value, 1)
 
     signal = result.get("signal")
-    plan_side = result.get("plan_side") or result.get("plan_bias")
 
-    is_buy_trade = signal == "BUY" or plan_side == "BUY"
-    is_sell_trade = signal == "SELL" or plan_side == "SELL"
-
+    is_buy_trade = signal == "BUY"
+    is_sell_trade = signal == "SELL"
     # OPEN NEW TRADE
     if trade is None and (is_buy_trade or is_sell_trade):
         entry = result.get("entry_price")
@@ -1517,7 +1533,7 @@ def update_paper_trade(symbol, result, current_price):
         tp2 = result.get("tp2")
 
         if entry == "--" or sl == "--" or tp1 == "--" or tp2 == "--":
-            print("PAPER BLOCKED:", symbol, signal, plan_side, entry, sl, tp1, tp2)
+            print("PAPER BLOCKED:", symbol, signal, entry, sl, tp1, tp2)
             return
 
         side = "BUY" if is_buy_trade else "SELL"
@@ -1587,8 +1603,13 @@ def update_paper_trade(symbol, result, current_price):
             trade["result"] = "TP1 HIT"
 
     # UPDATE HISTORY WHILE RUNNING
-    if PAPER_TRADE_HISTORY:
-        PAPER_TRADE_HISTORY[-1] = trade.copy()
+    for i in range(len(PAPER_TRADE_HISTORY) - 1, -1, -1):
+        if (
+            PAPER_TRADE_HISTORY[i].get("symbol") == symbol
+            and PAPER_TRADE_HISTORY[i].get("status") == "OPEN"
+        ):
+            PAPER_TRADE_HISTORY[i] = trade.copy()
+            break
 
     # CLOSE TRADE
     if trade["status"] == "CLOSED":
@@ -1596,17 +1617,20 @@ def update_paper_trade(symbol, result, current_price):
         trade["closed_price"] = current_price
         trade["pips"] = calc_pips(symbol, side, entry, current_price)
 
-        if PAPER_TRADE_HISTORY:
-            PAPER_TRADE_HISTORY[-1] = trade.copy()
-        else:
-            PAPER_TRADE_HISTORY.append(trade.copy())
+        for i in range(len(PAPER_TRADE_HISTORY) - 1, -1, -1):
+            if (
+                PAPER_TRADE_HISTORY[i].get("symbol") == symbol
+                and PAPER_TRADE_HISTORY[i].get("status") == "OPEN"
+            ):
+                PAPER_TRADE_HISTORY[i] = trade.copy()
+                break
 
         print("PAPER CLOSED:", trade)
 
         AUTO_TRADES[symbol] = None
 
 def get_signal(data, htf_data, symbol):
-    if data.empty or htf_data.empty or len(data) < 30 or len(htf_data) < 10:
+    if data.empty or len(data) < 30:
         return {
             "signal": "WAIT",
             "signal_text": "WAIT ⚪ (not enough data)",
@@ -1619,6 +1643,9 @@ def get_signal(data, htf_data, symbol):
             "fake_kill": False,
             "debug_reasons": ["Not enough data"]
         }
+
+    if htf_data.empty or len(htf_data) < 10:
+        htf_data = data.copy()
 
     close = data["Close"]
     open_ = data["Open"]
@@ -2528,8 +2555,8 @@ def get_panel_data():
 
     calendar_closed = is_market_calendar_closed()
 
-    eurusd_closed = calendar_closed or _is_feed_stale(eurusd, max_age_minutes=90)
-    gold_closed = calendar_closed or _is_feed_stale(gold, max_age_minutes=90)
+    eurusd_closed = calendar_closed
+    gold_closed = calendar_closed
 
     print("Calendar closed:", calendar_closed)
     print("EURUSD closed:", eurusd_closed)
