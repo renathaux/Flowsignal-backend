@@ -377,3 +377,26 @@ def execute_trade(request: TradeRequest):
             "ok": False,
             "message": str(e)
         }
+    
+    AUTO_TRADE_ENABLED = {
+    "enabled": False
+}
+
+@app.post("/paper-auto-toggle")
+def paper_auto_toggle(payload: dict):
+
+    enabled = bool(
+        payload.get("enabled", False)
+    )
+
+    AUTO_TRADE_ENABLED["enabled"] = enabled
+
+    print(
+        "AUTO TRADE STATE:",
+        AUTO_TRADE_ENABLED["enabled"]
+    )
+
+    return {
+        "status": "ok",
+        "enabled": AUTO_TRADE_ENABLED["enabled"]
+    }
