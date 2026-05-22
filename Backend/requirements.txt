@@ -8,3 +8,6 @@ pydantic
 requests
 pandas
 numpy
+python-dotenv
+certifi
+websockets
