@@ -7,7 +7,7 @@ import time
 import copy
 import pandas as pd
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 def is_market_calendar_closed():
     now = datetime.now(timezone.utc)
@@ -1039,7 +1039,7 @@ def calculate_confidence(
 # 📊 DATA FETCH (TWELVE DATA)
 # =========================
 import os
-TWELVE_DATA_API_KEY = "9bce0b4c48b1498d8e2afb8a5c186359"
+TWELVE_DATA_API_KEY = "6cdda0e63fd34eb586552edf157a188b"
 
 def _normalize_td_values(values):
     if not values:
@@ -1327,10 +1327,43 @@ AUTO_TRADES = {
 }
 
 PAPER_TRADE_HISTORY = []
+PAPER_BACKUP_FILE = "paper_backup.json"
+PAPER_RESET_KEY = "last_paper_reset"
+PAPER_MAX_OPEN_SECONDS = 24 * 60 * 60
+LAST_PAPER_RESET = 0
+LIVE_TRADES = {
+    "EURUSD": None,
+    "GOLD": None,
+}
 
-if os.path.exists("paper_backup.json"):
+LIVE_TRADE_HISTORY = []
+
+def create_test_live_trade():
+    global LIVE_TRADES, LIVE_TRADE_HISTORY
+
+    if LIVE_TRADES["EURUSD"] is not None:
+        return
+
+    trade = {
+        "symbol": "EURUSD",
+        "side": "BUY",
+        "source": "live",
+        "entry": 1.16000,
+        "sl": 1.15800,
+        "tp1": 1.16200,
+        "tp2": 1.16400,
+        "opened_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "status": "OPEN",
+        "result": "RUNNING",
+        "pips": 0
+    }
+
+    LIVE_TRADES["EURUSD"] = trade
+    LIVE_TRADE_HISTORY.append(trade.copy())
+
+if os.path.exists(PAPER_BACKUP_FILE):
     try:
-        with open("paper_backup.json", "r") as f:
+        with open(PAPER_BACKUP_FILE, "r") as f:
             backup = json.load(f)
 
         AUTO_TRADES = backup.get("paper_trades", AUTO_TRADES)
@@ -1338,11 +1371,100 @@ if os.path.exists("paper_backup.json"):
             "paper_trade_history",
             PAPER_TRADE_HISTORY
         )
+        LAST_PAPER_RESET = float(backup.get(PAPER_RESET_KEY, 0) or 0)
 
         print("✅ Loaded paper backup")
 
     except Exception as e:
         print("❌ Failed loading paper backup:", e)
+
+def save_paper_backup():
+    try:
+        with open(PAPER_BACKUP_FILE, "w") as f:
+            json.dump({
+                "paper_trades": AUTO_TRADES,
+                "paper_trade_history": PAPER_TRADE_HISTORY,
+                PAPER_RESET_KEY: LAST_PAPER_RESET,
+            }, f, indent=2)
+    except Exception as e:
+        print("❌ Failed saving paper backup:", e)
+
+def get_last_saturday_5pm_local_ts():
+    now = datetime.now().astimezone()
+    reset = now.replace(hour=17, minute=0, second=0, microsecond=0)
+
+    days_since_saturday = (now.weekday() - 5) % 7
+    reset = reset - timedelta(days=days_since_saturday)
+
+    if now.weekday() == 5 and now < reset:
+        reset = reset - timedelta(days=7)
+
+    return reset.timestamp()
+
+def get_paper_trade_stats():
+    wins = 0
+    losses = 0
+    running = 0
+    cleanup = 0
+
+    for trade in PAPER_TRADE_HISTORY:
+        result = str(trade.get("result", "")).upper()
+        status = str(trade.get("status", "")).upper()
+
+        if "STALE" in result or "RESET" in result:
+            cleanup += 1
+        elif status == "CLOSED" and (
+            result == "WIN"
+            or "TP" in result
+            or "PROFIT" in result
+        ):
+            wins += 1
+        elif status == "CLOSED" and (
+            result == "LOSS"
+            or "SL" in result
+            or "STOP" in result
+        ):
+            losses += 1
+        elif status == "OPEN" or result in ["RUNNING", "TP1 HIT"]:
+            running += 1
+
+    return {
+        "wins": wins,
+        "losses": losses,
+        "running": running,
+        "cleanup": cleanup,
+        "total": wins + losses + running,
+    }
+
+def run_weekly_paper_reset():
+    global PAPER_TRADE_HISTORY, LAST_PAPER_RESET
+
+    reset_ts = get_last_saturday_5pm_local_ts()
+
+    if reset_ts <= LAST_PAPER_RESET:
+        return
+
+    before_count = len(PAPER_TRADE_HISTORY)
+
+    PAPER_TRADE_HISTORY = [
+        trade for trade in PAPER_TRADE_HISTORY
+        if str(trade.get("status", "")).upper() == "OPEN"
+        or str(trade.get("result", "")).upper() in ["RUNNING", "TP1 HIT"]
+    ]
+
+    LAST_PAPER_RESET = reset_ts
+    removed_count = before_count - len(PAPER_TRADE_HISTORY)
+
+    print(
+        "PAPER WEEKLY RESET:",
+        {
+            "reset_time": datetime.fromtimestamp(reset_ts).isoformat(),
+            "removed_closed_trades": removed_count,
+            "kept_open_trades": len(PAPER_TRADE_HISTORY),
+        }
+    )
+
+    save_paper_backup()
 
 # =========================
 # 🧱 FVG + SESSION HELPERS
@@ -1505,8 +1627,70 @@ def detect_fake_breakout(c1, o1, h1, l1, recent_high, recent_low, symbol):
 
     return "NONE"
 
-def update_paper_trade(symbol, result, current_price):
+def parse_paper_trade_time(value):
+    if not value:
+        return None
+
+    try:
+        cleaned = str(value).replace(" UTC", "+00:00")
+        parsed = datetime.fromisoformat(cleaned)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except Exception:
+        return None
+
+def update_open_paper_history(symbol, trade):
+    for i in range(len(PAPER_TRADE_HISTORY) - 1, -1, -1):
+        if (
+            PAPER_TRADE_HISTORY[i].get("symbol") == symbol
+            and PAPER_TRADE_HISTORY[i].get("status") == "OPEN"
+        ):
+            PAPER_TRADE_HISTORY[i] = trade.copy()
+            return True
+
+    return False
+
+def close_stale_paper_trade(symbol, trade, current_price, calc_pips):
+    opened_at = parse_paper_trade_time(trade.get("opened_at"))
+    if not opened_at:
+        return False
+
+    age_seconds = (
+        datetime.now(timezone.utc) - opened_at.astimezone(timezone.utc)
+    ).total_seconds()
+
+    if age_seconds < PAPER_MAX_OPEN_SECONDS:
+        return False
+
+    trade["status"] = "CLOSED"
+    trade["result"] = "STALE_CLOSED"
+    trade["closed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    trade["closed_price"] = current_price
+    trade["pips"] = calc_pips(
+        symbol,
+        trade["side"],
+        trade["entry"],
+        current_price
+    )
+
+    update_open_paper_history(symbol, trade)
+    AUTO_TRADES[symbol] = None
+    save_paper_backup()
+
+    print("PAPER STALE CLEARED:", trade)
+    return True
+
+def update_paper_trade(
+    symbol,
+    result,
+    current_price,
+    current_low=None,
+    current_high=None
+):
     global AUTO_TRADES, PAPER_TRADE_HISTORY
+
+    run_weekly_paper_reset()
 
     trade = AUTO_TRADES.get(symbol)
 
@@ -1541,6 +1725,7 @@ def update_paper_trade(symbol, result, current_price):
         new_trade = {
             "symbol": symbol,
             "side": side,
+            "source": "paper",
             "entry": float(entry),
             "sl": float(sl),
             "tp1": float(tp1),
@@ -1560,6 +1745,8 @@ def update_paper_trade(symbol, result, current_price):
         if len(PAPER_TRADE_HISTORY) > 50:
             PAPER_TRADE_HISTORY.pop(0)
 
+        save_paper_backup()
+
         print("PAPER OPENED:", new_trade)
         return
 
@@ -1574,12 +1761,23 @@ def update_paper_trade(symbol, result, current_price):
 
     current_price = float(current_price)
 
+    if close_stale_paper_trade(symbol, trade, current_price, calc_pips):
+        return
+
     # UPDATE RUNNING PIPS
     trade["pips"] = calc_pips(symbol, side, entry, current_price)
 
     # MANAGE BUY
-    current_low = result.get("current_low", current_price)
-    current_high = result.get("current_high", current_price)
+    current_low = float(
+        current_low
+        if current_low is not None
+        else result.get("current_low", current_price)
+    )
+    current_high = float(
+        current_high
+        if current_high is not None
+        else result.get("current_high", current_price)
+    )
 
     if side == "BUY":
         if current_low <= trade["sl"]:
@@ -1603,13 +1801,7 @@ def update_paper_trade(symbol, result, current_price):
             trade["result"] = "TP1 HIT"
 
     # UPDATE HISTORY WHILE RUNNING
-    for i in range(len(PAPER_TRADE_HISTORY) - 1, -1, -1):
-        if (
-            PAPER_TRADE_HISTORY[i].get("symbol") == symbol
-            and PAPER_TRADE_HISTORY[i].get("status") == "OPEN"
-        ):
-            PAPER_TRADE_HISTORY[i] = trade.copy()
-            break
+    update_open_paper_history(symbol, trade)
 
     # CLOSE TRADE
     if trade["status"] == "CLOSED":
@@ -1617,17 +1809,12 @@ def update_paper_trade(symbol, result, current_price):
         trade["closed_price"] = current_price
         trade["pips"] = calc_pips(symbol, side, entry, current_price)
 
-        for i in range(len(PAPER_TRADE_HISTORY) - 1, -1, -1):
-            if (
-                PAPER_TRADE_HISTORY[i].get("symbol") == symbol
-                and PAPER_TRADE_HISTORY[i].get("status") == "OPEN"
-            ):
-                PAPER_TRADE_HISTORY[i] = trade.copy()
-                break
+        update_open_paper_history(symbol, trade)
 
         print("PAPER CLOSED:", trade)
 
         AUTO_TRADES[symbol] = None
+        save_paper_backup()
 
 def get_signal(data, htf_data, symbol):
     if data.empty or len(data) < 30:
@@ -2546,6 +2733,8 @@ def _make_closed_result(symbol, base_result=None, stale_minutes=None):
     return result
 
 def get_panel_data():
+    run_weekly_paper_reset()
+
     eurusd, gold, eurusd_htf, gold_htf, eurusd_1h, gold_1h = fetch_market_data()
     if not hasattr(get_panel_data, "_last_open_payload"):
         get_panel_data._last_open_payload = None
@@ -2592,6 +2781,9 @@ def get_panel_data():
                 "stale_minutes": gold_stale_minutes,
             },
         }
+        payload["paper_trades"] = AUTO_TRADES
+        payload["paper_trade_history"] = PAPER_TRADE_HISTORY[-20:]
+        payload["paper_trade_stats"] = get_paper_trade_stats()
 
         return payload
 
@@ -2602,10 +2794,22 @@ def get_panel_data():
     gold_result = get_signal(gold, gold_htf, "GOLD")
 
     if not eurusd.empty:
-       update_paper_trade("EURUSD", eurusd_result, eurusd["Close"].iloc[-1].item())
+       update_paper_trade(
+           "EURUSD",
+           eurusd_result,
+           eurusd["Close"].iloc[-1].item(),
+           eurusd["Low"].iloc[-1].item(),
+           eurusd["High"].iloc[-1].item()
+       )
 
     if not gold.empty:
-        update_paper_trade("GOLD", gold_result, gold["Close"].iloc[-1].item())
+        update_paper_trade(
+            "GOLD",
+            gold_result,
+            gold["Close"].iloc[-1].item(),
+            gold["Low"].iloc[-1].item(),
+            gold["High"].iloc[-1].item()
+        )
 
     if eurusd_closed:
         eurusd_result = _make_closed_result(
@@ -2636,6 +2840,8 @@ def get_panel_data():
         update_signal_history("GOLD", gold_result)
         update_trade_results(gold, "GOLD")
 
+        create_test_live_trade()
+
     payload = {
         "EURUSD": eurusd_result,
         "GOLD": gold_result,
@@ -2654,6 +2860,10 @@ def get_panel_data():
         "history": SIGNAL_HISTORY[-20:],
         "paper_trades": AUTO_TRADES,
         "paper_trade_history": PAPER_TRADE_HISTORY[-20:],
+        "paper_trade_stats": get_paper_trade_stats(),
+        "live_trades": LIVE_TRADES,
+        "live_trade_history": LIVE_TRADE_HISTORY[-20:],
+
         "market_closed": all_closed,
         "feed_status": {
             "EURUSD": {

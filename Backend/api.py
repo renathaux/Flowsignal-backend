@@ -9,6 +9,11 @@ import json
 import os
 import hashlib
 import uuid
+from ctrader_connector import (
+    get_open_positions,
+    place_market_order,
+    set_debug_open_positions
+)
 
 app = FastAPI()
 @app.on_event("startup")
@@ -43,6 +48,9 @@ class SignupRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: str
     password: str
+
+class DebugBrokerPositionsRequest(BaseModel):
+    positions: list
 
 # =========================
 # DEFAULT PANEL DATA
@@ -149,17 +157,42 @@ def root():
 def panel_data():
     age = time.time() - PANEL_CACHE["last_update"]
 
-    data = PANEL_CACHE["data"].copy()
+    cached_data = PANEL_CACHE.get("data")
+
+    if not isinstance(cached_data, dict):
+        cached_data = default_panel()
+
+    data = cached_data.copy()
+
+    sync_live_positions()
 
     data["_meta"] = {
         "source": "shared_cache",
         "cache_age_seconds": round(age, 1),
         "refresh_seconds": CACHE_SECONDS,
-        "error": None
+        "error": None,
+
+        "paper_auto_enabled":
+            AUTO_TRADE_ENABLED["enabled"],
+
+        "live_auto_enabled":
+            LIVE_AUTO_TRADE_ENABLED["enabled"],
+
+        "live_account":
+            LIVE_ACCOUNT_STATE,
+
+        "live_active_orders":
+            LIVE_ACTIVE_ORDERS,
+
+        "live_trade_history":
+            LIVE_TRADE_HISTORY,
+
+
+        "execution_mode":
+            EXECUTION_MODE["mode"]
     }
 
     return data
-
 @app.post("/feedback")
 def send_feedback(request: FeedbackRequest):
     try:
@@ -377,10 +410,43 @@ def execute_trade(request: TradeRequest):
             "ok": False,
             "message": str(e)
         }
-    
-    AUTO_TRADE_ENABLED = {
+
+
+AUTO_TRADE_ENABLED = {
     "enabled": False
 }
+
+EXECUTION_MODE = {
+    "mode": "paper"
+}
+
+@app.post("/execution-mode")
+def set_execution_mode(payload: dict):
+
+    mode = str(
+        payload.get("mode", "paper")
+    ).lower()
+
+    allowed_modes = [
+        "paper",
+        "live"
+    ]
+
+    if mode not in allowed_modes:
+        return {
+            "ok": False,
+            "message": "Invalid execution mode",
+            "mode": EXECUTION_MODE["mode"]
+        }
+
+    EXECUTION_MODE["mode"] = mode
+
+    print("EXECUTION MODE:", EXECUTION_MODE["mode"])
+
+    return {
+        "ok": True,
+        "mode": EXECUTION_MODE["mode"]
+    }
 
 @app.post("/paper-auto-toggle")
 def paper_auto_toggle(payload: dict):
@@ -399,4 +465,392 @@ def paper_auto_toggle(payload: dict):
     return {
         "status": "ok",
         "enabled": AUTO_TRADE_ENABLED["enabled"]
+    }
+
+LIVE_AUTO_TRADE_ENABLED = {
+    "enabled": False
+}
+
+LIVE_ACCOUNT_STATE = {
+    "connected": False,
+    "mode": "demo",   # demo/live
+    "broker": "ctrader"
+}
+
+LIVE_ACTIVE_ORDERS = {
+    "EURUSD": None,
+    "GOLD": None
+}
+
+LIVE_TRADE_HISTORY = []
+MAX_LIVE_TRADE_HISTORY = 50
+LIVE_BACKUP_FILE = os.path.join(
+    os.path.dirname(__file__),
+    "live_backup.json"
+)
+
+def get_persistable_live_active_orders():
+    return {
+        symbol: trade
+        for symbol, trade in LIVE_ACTIVE_ORDERS.items()
+        if trade and trade.get("source") == "broker"
+    }
+
+def save_live_backup():
+    try:
+        with open(LIVE_BACKUP_FILE, "w") as f:
+            json.dump({
+                "live_active_orders":
+                    get_persistable_live_active_orders()
+            }, f, indent=2)
+    except Exception as e:
+        print("LIVE BACKUP SAVE ERROR:", e)
+
+def load_live_backup():
+    if not os.path.exists(LIVE_BACKUP_FILE):
+        return
+
+    try:
+        with open(LIVE_BACKUP_FILE, "r") as f:
+            backup = json.load(f)
+
+        active_orders = backup.get("live_active_orders", {})
+
+        if not isinstance(active_orders, dict):
+            return
+
+        for symbol, trade in active_orders.items():
+            if symbol in LIVE_ACTIVE_ORDERS and trade:
+                LIVE_ACTIVE_ORDERS[symbol] = trade
+
+        print("LIVE BACKUP LOADED:", get_persistable_live_active_orders())
+
+    except Exception as e:
+        print("LIVE BACKUP LOAD ERROR:", e)
+
+load_live_backup()
+
+def is_dev_request(request: Request):
+    host = request.client.host if request.client else ""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    origin = request.headers.get("origin", "")
+    referer = request.headers.get("referer", "")
+    local_hosts = ["127.0.0.1", "localhost", "::1"]
+    local_origins = [
+        "http://127.0.0.1:5501",
+        "http://localhost:5501",
+    ]
+
+    return (
+        host in local_hosts
+        or forwarded.split(",")[0].strip() in local_hosts
+        or origin in local_origins
+        or any(origin.startswith(f"http://{local}") for local in local_hosts)
+        or any(referer.startswith(f"http://{local}") for local in local_hosts)
+    )
+
+def sync_live_positions():
+    if (
+        not LIVE_ACCOUNT_STATE.get("connected")
+        or LIVE_ACCOUNT_STATE.get("mode") != "live"
+    ):
+        return []
+
+    try:
+        positions = get_open_positions()
+        print("LIVE POSITION SYNC:", positions)
+
+        synced_symbols = set()
+
+        for position in positions:
+            symbol = str(position.get("symbol", "")).upper()
+
+            if symbol not in LIVE_ACTIVE_ORDERS:
+                continue
+
+            synced_symbols.add(symbol)
+
+            position_id = (
+                position.get("position_id")
+                or f"broker-{symbol}"
+            )
+
+            mirrored_order = {
+                "order_id": f"broker-{position_id}",
+                "position_id": position_id,
+                "symbol": symbol,
+                "side": str(position.get("side", "")).upper(),
+                "mode": LIVE_ACCOUNT_STATE["mode"],
+                "broker": LIVE_ACCOUNT_STATE["broker"],
+                "volume": position.get("volume"),
+                "entry": position.get("entry"),
+                "opened_at": position.get("opened_at") or time.time(),
+                "source": "broker",
+                "result": "RUNNING",
+                "raw": position.get("raw", position),
+            }
+
+            current_order = LIVE_ACTIVE_ORDERS.get(symbol)
+
+            if current_order and current_order.get("position_id") == position_id:
+                LIVE_ACTIVE_ORDERS[symbol] = {
+                    **current_order,
+                    **mirrored_order,
+                    "opened_at": current_order.get("opened_at") or mirrored_order["opened_at"],
+                }
+                save_live_backup()
+                continue
+
+            if not current_order:
+                LIVE_ACTIVE_ORDERS[symbol] = mirrored_order
+                save_live_backup()
+                print("BROKER POSITION MIRRORED:", mirrored_order)
+
+        closed_at = time.time()
+
+        for symbol, trade in list(LIVE_ACTIVE_ORDERS.items()):
+            if not trade or trade.get("source") != "broker":
+                continue
+
+            if symbol in synced_symbols:
+                continue
+
+            closed_trade = {
+                **trade,
+                "result": "BROKER_CLOSED",
+                "closed_at": closed_at,
+                "note": "Broker position disappeared during read-only sync."
+            }
+
+            LIVE_TRADE_HISTORY.insert(0, closed_trade)
+            LIVE_ACTIVE_ORDERS[symbol] = None
+            save_live_backup()
+
+            print("BROKER POSITION CLOSED:", closed_trade)
+
+        del LIVE_TRADE_HISTORY[MAX_LIVE_TRADE_HISTORY:]
+
+        return positions
+    except Exception as e:
+        print("LIVE POSITION SYNC ERROR:", e)
+        return []
+
+@app.post("/debug/set-broker-positions")
+async def debug_set_broker_positions(
+    payload: DebugBrokerPositionsRequest,
+    request: Request
+):
+    if not is_dev_request(request):
+        print(
+            "DEBUG BROKER POSITIONS BLOCKED:",
+            {
+                "client_host": request.client.host if request.client else "",
+                "origin": request.headers.get("origin", ""),
+            }
+        )
+
+        return {
+            "ok": False,
+            "message": "Debug endpoint is only available locally"
+        }
+
+    received_payload = payload.model_dump()
+    requested_positions = received_payload.get("positions")
+
+    print("DEBUG BROKER POSITIONS PAYLOAD:", received_payload)
+
+    if not isinstance(requested_positions, list):
+        print("DEBUG BROKER POSITIONS VALIDATION ERROR:", received_payload)
+
+        return {
+            "ok": False,
+            "message": "Expected payload shape: { positions: [] }"
+        }
+
+    positions = set_debug_open_positions(requested_positions)
+
+    print("DEBUG BROKER POSITIONS:", positions)
+
+    return {
+        "ok": True,
+        "positions": positions
+    }
+
+@app.post("/connect-ctrader")
+def connect_ctrader(payload: dict):
+    mode = str(payload.get("mode", "demo")).lower()
+
+    if mode not in ["demo", "live"]:
+        return {
+            "ok": False,
+            "message": "Invalid mode"
+        }
+
+    LIVE_ACCOUNT_STATE["connected"] = True
+    LIVE_ACCOUNT_STATE["mode"] = mode
+    LIVE_ACCOUNT_STATE["broker"] = "ctrader"
+
+    print("CTRADER CONNECTED:", LIVE_ACCOUNT_STATE)
+
+    return {
+        "ok": True,
+        "connected": LIVE_ACCOUNT_STATE["connected"],
+        "mode": LIVE_ACCOUNT_STATE["mode"],
+        "broker": LIVE_ACCOUNT_STATE["broker"]
+    }
+
+
+@app.post("/disconnect-ctrader")
+def disconnect_ctrader():
+    LIVE_AUTO_TRADE_ENABLED["enabled"] = False
+
+    disconnected_at = time.time()
+
+    for symbol, trade in list(LIVE_ACTIVE_ORDERS.items()):
+        if not trade:
+            continue
+
+        order_id = trade.get("order_id")
+        history_trade = None
+
+        for item in LIVE_TRADE_HISTORY:
+            if order_id and item.get("order_id") == order_id:
+                history_trade = item
+                break
+
+        disconnected_trade = {
+            **trade,
+            "symbol": symbol,
+            "result": "DISCONNECTED",
+            "closed_at": disconnected_at,
+            "note": "FlowSignal tracking stopped; broker positions were not auto-closed."
+        }
+
+        if history_trade:
+            LIVE_TRADE_HISTORY.remove(history_trade)
+
+        LIVE_TRADE_HISTORY.insert(0, disconnected_trade)
+
+    del LIVE_TRADE_HISTORY[MAX_LIVE_TRADE_HISTORY:]
+
+    LIVE_ACCOUNT_STATE["connected"] = False
+    LIVE_ACCOUNT_STATE["mode"] = "demo"
+    LIVE_ACCOUNT_STATE["broker"] = "ctrader"
+    LIVE_ACTIVE_ORDERS["EURUSD"] = None
+    LIVE_ACTIVE_ORDERS["GOLD"] = None
+    save_live_backup()
+
+    print("CTRADER DISCONNECTED")
+
+    return {
+        "ok": True,
+        "connected": False,
+        "mode": "demo",
+        "broker": "ctrader",
+        "live_auto_enabled": False
+    }
+
+@app.post("/live-auto-toggle")
+def live_auto_toggle(payload: dict):
+    enabled = bool(
+        payload.get("enabled", False)
+    )
+
+    if enabled and not LIVE_ACCOUNT_STATE["connected"]:
+        LIVE_AUTO_TRADE_ENABLED["enabled"] = False
+
+        return {
+            "status": "error",
+            "enabled": False,
+            "message": "Connect broker mode before enabling LIVE auto"
+        }
+
+    LIVE_AUTO_TRADE_ENABLED["enabled"] = enabled
+
+    print(
+        "LIVE AUTO TRADE STATE:",
+        LIVE_AUTO_TRADE_ENABLED["enabled"]
+    )
+
+    return {
+        "status": "ok",
+        "enabled": LIVE_AUTO_TRADE_ENABLED["enabled"]
+    }
+
+@app.post("/execute-live-order")
+def execute_live_order(payload: dict):
+
+    if not LIVE_ACCOUNT_STATE["connected"]:
+
+        return {
+            "ok": False,
+            "message": "No LIVE account connected"
+        }
+
+    if not LIVE_AUTO_TRADE_ENABLED["enabled"]:
+
+        return {
+            "ok": False,
+            "message": "LIVE auto disabled"
+        }
+
+    symbol = payload.get("symbol")
+    side = str(payload.get("side", "")).upper()
+
+    if symbol not in LIVE_ACTIVE_ORDERS:
+        return {
+            "ok": False,
+            "message": "Invalid symbol"
+        }
+
+    if side not in ["BUY", "SELL"]:
+        return {
+            "ok": False,
+            "message": "Invalid side"
+        }
+
+    if LIVE_ACTIVE_ORDERS[symbol] is not None:
+        return {
+            "ok": False,
+            "message": f"Active LIVE order already exists for {symbol}",
+            "active_order": LIVE_ACTIVE_ORDERS[symbol]
+        }
+
+    result = place_market_order(
+        symbol=symbol,
+        side=side,
+        volume=0.01
+    )
+
+    if not result.get("ok", False):
+        return {
+            "ok": False,
+            "message": "LIVE order rejected",
+            "result": result
+        }
+
+    order_id = str(uuid.uuid4())
+
+    LIVE_ACTIVE_ORDERS[symbol] = {
+        "order_id": order_id,
+        "symbol": symbol,
+        "side": side,
+        "mode": LIVE_ACCOUNT_STATE["mode"],
+        "broker": LIVE_ACCOUNT_STATE["broker"],
+        "volume": 0.01,
+        "opened_at": time.time(),
+        "result": result
+    }
+
+    LIVE_TRADE_HISTORY.insert(0, {
+        **LIVE_ACTIVE_ORDERS[symbol],
+        "result": "RUNNING"
+    })
+
+    del LIVE_TRADE_HISTORY[MAX_LIVE_TRADE_HISTORY:]
+
+    return {
+        "ok": True,
+        "result": result,
+        "active_order": LIVE_ACTIVE_ORDERS[symbol]
     }
