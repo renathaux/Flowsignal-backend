@@ -2,23 +2,284 @@
 # 📦 IMPORTS
 # =========================
 import json
+import math
 import os
 import time
 import copy
+import uuid
 import pandas as pd
 import requests
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+from ctrader_connector import (
+    append_current_forming_candle,
+    get_ctrader_candle_cache_status,
+    get_ctrader_candle_health,
+    get_ctrader_live_price_status,
+    get_ctrader_market_data,
+    hydrate_persisted_ctrader_candle_cache,
+    normalize_symbol,
+    normalize_trade_levels
+)
 
-def is_market_calendar_closed():
-    now = datetime.now(timezone.utc)
-    day = now.weekday()  # Monday=0, Sunday=6
-    hour = now.hour
+MARKET_DATA_SOURCES = ["ctrader"]
+MARKET_TIMEZONE = ZoneInfo("America/New_York")
+MARKET_DATA_SOURCE_FILE = os.path.join(
+    os.path.dirname(__file__),
+    "market_data_source.json"
+)
+FINAL_SIGNAL_HOLD_FILE = os.path.join(
+    os.path.dirname(__file__),
+    "final_signal_hold.json"
+)
+FIFTEEN_M_SWING_WATCH_FILE = os.path.join(
+    os.path.dirname(__file__),
+    "fifteen_m_swing_watch.json"
+)
+FINAL_SIGNAL_HOLD_EXPIRATION_SECONDS = 4 * 60 * 60
+FINAL_SIGNAL_HOLD_MAX_SETUP_CANDLES = 6
+FINAL_SIGNAL_HOLD_STALE_5M_CANDLES = 2
+FINAL_SIGNAL_HOLD_MAX_TP1_PROGRESS = 0.75
+FIFTEEN_M_PENDING_MAX_5M_CANDLES = 6
+# XAUUSD's final pre-maintenance H1 candle closes at 4 PM New York.
+# During the 5 PM maintenance break and the first post-reopen H1 candle,
+# that valid closed candle can be almost three hours old before the next
+# completed H1 bar becomes available at 7 PM.
+XAUUSD_DAILY_PAUSE_MAX_STALE_SECONDS = 190 * 60
 
-    if day == 4 and hour >= 22:
+# =========================
+# SIMPLE MOMENTUM MODE
+# =========================
+# Goal: FlowSignal should take clean 15m momentum trades without waiting
+# for a perfect SMC checklist. 1H/HTF becomes a confidence warning, not
+# a hard blocker. This keeps protection against obvious fake breakouts
+# while avoiding the constant WAIT problem.
+SIMPLE_MOMENTUM_MODE = True
+SIMPLE_MOMENTUM_MIN_SCORE = 68
+SIMPLE_MOMENTUM_MIN_CONFIDENCE = 52
+SIMPLE_MOMENTUM_MIN_GAP = 10
+# When a clean 15m momentum breakout appears, do not let 5m timing
+# erase the trade. The 5m confirmation can still improve the entry, but
+# it is not allowed to turn a completed 15m BUY/SELL back into WAIT.
+SIMPLE_MOMENTUM_DIRECT_15M_ENTRY = False
+
+def load_saved_market_data_source():
+    if not os.path.exists(MARKET_DATA_SOURCE_FILE):
+        return {
+            "source": "ctrader",
+            "saved_source": None,
+            "loaded_from_file": False,
+        }
+
+    try:
+        with open(MARKET_DATA_SOURCE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        saved_source = str(data.get("source", "")).lower()
+
+        if saved_source in MARKET_DATA_SOURCES:
+            return {
+                "source": saved_source,
+                "saved_source": saved_source,
+                "loaded_from_file": True,
+            }
+
+    except Exception as e:
+        print("MARKET DATA SOURCE LOAD ERROR:", e)
+
+    return {
+        "source": "ctrader",
+        "saved_source": None,
+        "loaded_from_file": False,
+    }
+
+def save_market_data_source(source):
+    with open(MARKET_DATA_SOURCE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"source": source}, f, indent=2)
+
+SOURCE_BOOT_STATE = load_saved_market_data_source()
+MARKET_DATA_SOURCE = os.getenv(
+    "MARKET_DATA_SOURCE",
+    SOURCE_BOOT_STATE["source"]
+).lower()
+
+if MARKET_DATA_SOURCE not in MARKET_DATA_SOURCES:
+    print("MARKET DATA SOURCE INVALID, using ctrader:", MARKET_DATA_SOURCE)
+    MARKET_DATA_SOURCE = "ctrader"
+
+MARKET_DATA_RUNTIME = {
+    "source": MARKET_DATA_SOURCE,
+    "saved_source": SOURCE_BOOT_STATE["saved_source"],
+    "loaded_from_file": SOURCE_BOOT_STATE["loaded_from_file"],
+}
+
+MARKET_DATA_STATUS = {
+    "last_fetch_source": None,
+    "fallback_used": False,
+    "error": None,
+}
+
+CTRADER_HEALTH_TIMEFRAMES = {
+    "5m": {
+        "label": "5min",
+        # cTrader returns only completed trendbars and can publish the newest
+        # closed bar one refresh late. Keep the frame usable for three 5m
+        # slots while the provider catches up.
+        "stale_after": 15 * 60,
+    },
+    "15m": {
+        "label": "15min",
+        "stale_after": 45 * 60,
+    },
+    "1h": {
+        "label": "1h",
+        "stale_after": 150 * 60,
+    },
+}
+
+CTRADER_HEALTH_SYMBOLS = ["EURUSD", "XAUUSD"]
+CTRADER_LAST_SUCCESS_TIMES = {
+    f"{symbol}:{settings['label']}": None
+    for symbol in CTRADER_HEALTH_SYMBOLS
+    for settings in CTRADER_HEALTH_TIMEFRAMES.values()
+}
+
+def set_market_data_source(source, persist=True):
+    global MARKET_DATA_SOURCE
+
+    normalized = "ctrader"
+
+    if normalized not in MARKET_DATA_SOURCES:
+        return {
+            "ok": False,
+            "source": MARKET_DATA_RUNTIME["source"],
+            "available_sources": MARKET_DATA_SOURCES,
+            "error": "Invalid market data source",
+        }
+
+    MARKET_DATA_SOURCE = normalized
+    MARKET_DATA_RUNTIME["source"] = normalized
+    MARKET_DATA_RUNTIME["saved_source"] = normalized
+    MARKET_DATA_RUNTIME["loaded_from_file"] = True
+    MARKET_DATA_STATUS["fallback_used"] = False
+    MARKET_DATA_STATUS["error"] = None
+
+    if persist:
+        save_market_data_source(normalized)
+
+    print("MARKET DATA SOURCE:", MARKET_DATA_RUNTIME["source"])
+
+    return {
+        "ok": True,
+        **get_market_data_source_status()
+    }
+
+def get_market_data_source():
+    return "ctrader"
+
+def get_market_data_source_status():
+    ctrader_status = get_ctrader_candle_cache_status()
+    ctrader_health = get_ctrader_data_health()
+    live_price_status = get_ctrader_live_price_status()
+
+    return {
+        "source": get_market_data_source(),
+        "saved_source": MARKET_DATA_RUNTIME.get("saved_source"),
+        "loaded_from_file": MARKET_DATA_RUNTIME.get("loaded_from_file", False),
+        "available_sources": MARKET_DATA_SOURCES,
+        "last_fetch_source": MARKET_DATA_STATUS.get("last_fetch_source"),
+        "fallback_used": MARKET_DATA_STATUS.get("fallback_used", False),
+        "error": MARKET_DATA_STATUS.get("error"),
+        "live_price_health": live_price_status.get("live_price_health"),
+        "live_price_last_update": live_price_status.get("live_price_last_update"),
+        **ctrader_health,
+        **ctrader_status,
+    }
+
+def _ctrader_health_key(symbol, timeframe):
+    normalized_symbol = normalize_symbol(symbol)
+    settings = CTRADER_HEALTH_TIMEFRAMES.get(str(timeframe or "").lower())
+    label = settings["label"] if settings else str(timeframe or "").lower()
+
+    return f"{normalized_symbol}:{label}"
+
+def _mark_ctrader_success(symbol, timeframe, timestamp=None):
+    key = _ctrader_health_key(symbol, timeframe)
+    if timestamp is not None:
+        timestamp = pd.Timestamp(timestamp)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("UTC")
+        else:
+            timestamp = timestamp.tz_convert("UTC")
+        timestamp = timestamp.to_pydatetime()
+
+    CTRADER_LAST_SUCCESS_TIMES[key] = timestamp or datetime.now(timezone.utc)
+
+def _is_ctrader_data_fresh(symbol, timeframe, now=None):
+    settings = CTRADER_HEALTH_TIMEFRAMES.get(str(timeframe or "").lower())
+
+    if not settings:
+        return False
+
+    timestamp = CTRADER_LAST_SUCCESS_TIMES.get(_ctrader_health_key(symbol, timeframe))
+
+    if not timestamp:
+        return False
+
+    current_time = now or datetime.now(timezone.utc)
+
+    return (current_time - timestamp).total_seconds() <= settings["stale_after"]
+
+def get_ctrader_data_health(now=None):
+    current_time = now or datetime.now(timezone.utc)
+    active_source = get_market_data_source()
+    stale_keys = []
+    last_success_times = {}
+
+    for key, timestamp in CTRADER_LAST_SUCCESS_TIMES.items():
+        last_success_times[key] = timestamp.isoformat() if timestamp else None
+
+        if active_source != "ctrader":
+            continue
+
+        _, timeframe_label = key.split(":", 1)
+        timeframe = "5m" if timeframe_label == "5min" else "15m" if timeframe_label == "15min" else "1h"
+        settings = CTRADER_HEALTH_TIMEFRAMES[timeframe]
+        symbol = key.split(":", 1)[0]
+        candle_health = get_ctrader_candle_health(symbol, timeframe)
+
+        if (
+            not candle_health.get("usable")
+            and (
+                not timestamp
+                or (current_time - timestamp).total_seconds() > settings["stale_after"]
+            )
+        ):
+            stale_keys.append(key)
+
+    return {
+        "data_health": "STALE" if stale_keys else "OK",
+        "stale_keys": stale_keys,
+        "last_success_times": last_success_times,
+    }
+
+def is_market_calendar_closed(now=None):
+    current_time = now or datetime.now(MARKET_TIMEZONE)
+
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=MARKET_TIMEZONE)
+    else:
+        current_time = current_time.astimezone(MARKET_TIMEZONE)
+
+    day = current_time.weekday()  # Monday=0, Sunday=6
+    hour = current_time.hour
+
+    # Forex week: Sunday 5 PM New York through Friday 5 PM New York.
+    if day == 4 and hour >= 17:
         return True
     if day == 5:
         return True
-    if day == 6 and hour < 22:
+    if day == 6 and hour < 17:
         return True
 
     return False
@@ -395,8 +656,16 @@ def apply_fake_signal_killer(
         reasons_fk.append("Fake killer: range trap")
 
     if dist_ema9 > stretch_ema9 or dist_ema21 > stretch_ema21:
-        kill_trade = True
-        reasons_fk.append("Fake killer: too stretched")
+        if (
+            SIMPLE_MOMENTUM_MODE
+            and momentum_strength in ["MEDIUM", "STRONG"]
+            and top_score >= SIMPLE_MOMENTUM_MIN_SCORE
+            and score_gap >= SIMPLE_MOMENTUM_MIN_GAP
+        ):
+            reasons_fk.append("Soft warning: momentum is stretched, not blocked")
+        else:
+            kill_trade = True
+            reasons_fk.append("Fake killer: too stretched")
 
     if direction == "BUY":
         if htf_structure == "BEARISH" and not (
@@ -407,8 +676,17 @@ def apply_fake_signal_killer(
             and buy_score >= 85
             and score_gap >= 20
         ):
-            kill_trade = True
-            reasons_fk.append("Fake killer: buy against HTF")
+            if (
+                SIMPLE_MOMENTUM_MODE
+                and momentum_strength in ["MEDIUM", "STRONG"]
+                and recent_pressure == "BULLISH"
+                and buy_score >= SIMPLE_MOMENTUM_MIN_SCORE
+                and score_gap >= SIMPLE_MOMENTUM_MIN_GAP
+            ):
+                reasons_fk.append("Soft HTF warning: buy against 1H/HTF, not blocked")
+            else:
+                kill_trade = True
+                reasons_fk.append("Fake killer: buy against HTF")
 
         if c1 > recent_high + breakout_buffer and entry_timing in ["LATE_BUY", "WAIT_PULLBACK_BUY"]:
             kill_trade = True
@@ -423,8 +701,17 @@ def apply_fake_signal_killer(
             and sell_score >= 85
             and score_gap >= 20
         ):
-            kill_trade = True
-            reasons_fk.append("Fake killer: sell against HTF")
+            if (
+                SIMPLE_MOMENTUM_MODE
+                and momentum_strength in ["MEDIUM", "STRONG"]
+                and recent_pressure == "BEARISH"
+                and sell_score >= SIMPLE_MOMENTUM_MIN_SCORE
+                and score_gap >= SIMPLE_MOMENTUM_MIN_GAP
+            ):
+                reasons_fk.append("Soft HTF warning: sell against 1H/HTF, not blocked")
+            else:
+                kill_trade = True
+                reasons_fk.append("Fake killer: sell against HTF")
 
         if c1 < recent_low - breakout_buffer and entry_timing in ["LATE_SELL", "WAIT_PULLBACK_SELL"]:
             kill_trade = True
@@ -464,6 +751,58 @@ def detect_htf_structure(htf_data):
         return "BEARISH"
 
     return "NEUTRAL"
+
+def detect_hh_hl_lh_ll_structure(data, lookback=40):
+    if data is None or data.empty or len(data) < 10:
+        return {
+            "structure": "NEUTRAL",
+            "last_high": None,
+            "last_low": None,
+            "prev_high": None,
+            "prev_low": None,
+        }
+
+    window = data.tail(lookback)
+    highs = window["High"]
+    lows = window["Low"]
+    swing_highs = []
+    swing_lows = []
+
+    for index in range(2, len(window) - 2):
+        high_value = float(highs.iloc[index])
+        low_value = float(lows.iloc[index])
+
+        if high_value >= float(highs.iloc[index - 1]) and high_value >= float(highs.iloc[index + 1]):
+            swing_highs.append(high_value)
+
+        if low_value <= float(lows.iloc[index - 1]) and low_value <= float(lows.iloc[index + 1]):
+            swing_lows.append(low_value)
+
+    if len(swing_highs) < 2:
+        swing_highs = [float(value) for value in highs.tail(8).nlargest(2).sort_index()]
+
+    if len(swing_lows) < 2:
+        swing_lows = [float(value) for value in lows.tail(8).nsmallest(2).sort_index()]
+
+    last_high = swing_highs[-1] if swing_highs else None
+    prev_high = swing_highs[-2] if len(swing_highs) >= 2 else None
+    last_low = swing_lows[-1] if swing_lows else None
+    prev_low = swing_lows[-2] if len(swing_lows) >= 2 else None
+    structure = "NEUTRAL"
+
+    if last_high is not None and prev_high is not None and last_low is not None and prev_low is not None:
+        if last_high > prev_high and last_low > prev_low:
+            structure = "HH_HL"
+        elif last_high < prev_high and last_low < prev_low:
+            structure = "LH_LL"
+
+    return {
+        "structure": structure,
+        "last_high": last_high,
+        "last_low": last_low,
+        "prev_high": prev_high,
+        "prev_low": prev_low,
+    }
 
 # =========================
 # 🧭 MULTI-TIMEFRAME CONFLUENCE
@@ -557,6 +896,126 @@ def calculate_smart_confidence(
             confidence -= 12
 
     return max(1, min(99, confidence))
+
+def clamp_score(value, low=1, high=99):
+    return max(low, min(high, int(round(value))))
+
+def calculate_dynamic_smc_retest_scores(
+    side,
+    symbol,
+    htf_structure,
+    choch_signal,
+    bullish_bos,
+    bearish_bos,
+    displacement_score,
+    bullish_displacement,
+    bearish_displacement,
+    recent_pressure,
+    momentum_strength,
+    zone_position,
+    session_active,
+    retest_distance,
+    retest_buffer,
+    candle_body,
+    candle_range,
+    fake_breakout,
+):
+    side = str(side or "").upper()
+    bullish_side = side == "BUY"
+    side_score = 58
+    confidence = 48
+    components = {}
+
+    aligned_htf = "BULLISH" if bullish_side else "BEARISH"
+    opposite_htf = "BEARISH" if bullish_side else "BULLISH"
+    aligned_choch = "BULLISH" if bullish_side else "BEARISH"
+    aligned_pressure = "BULLISH" if bullish_side else "BEARISH"
+    opposite_pressure = "BEARISH" if bullish_side else "BULLISH"
+    preferred_zone = "DISCOUNT" if bullish_side else "PREMIUM"
+    bad_zone = "PREMIUM" if bullish_side else "DISCOUNT"
+    has_aligned_bos = bullish_bos if bullish_side else bearish_bos
+    has_aligned_displacement = bullish_displacement if bullish_side else bearish_displacement
+
+    if htf_structure == aligned_htf:
+        components["htf_structure"] = 8
+    elif htf_structure == "NEUTRAL":
+        components["htf_structure"] = 3
+    elif htf_structure == opposite_htf:
+        components["htf_structure"] = -8
+    else:
+        components["htf_structure"] = 0
+
+    components["choch"] = 7 if choch_signal == aligned_choch else 0
+    components["bos"] = 6 if has_aligned_bos else 0
+
+    displacement_component = min(10, max(0, float(displacement_score or 0) * 2))
+    components["displacement"] = displacement_component if has_aligned_displacement else -3
+
+    if recent_pressure == aligned_pressure:
+        components["recent_pressure"] = 6
+    elif recent_pressure == opposite_pressure:
+        components["recent_pressure"] = -6
+    else:
+        components["recent_pressure"] = 1
+
+    if momentum_strength == "STRONG":
+        components["momentum"] = 6
+    elif momentum_strength == "MEDIUM":
+        components["momentum"] = 3
+    else:
+        components["momentum"] = -2
+
+    if zone_position == preferred_zone:
+        components["zone"] = 5
+    elif zone_position == bad_zone:
+        components["zone"] = -5
+    else:
+        components["zone"] = 0
+
+    components["session"] = 3 if session_active else -4
+
+    try:
+        retest_ratio = abs(float(retest_distance)) / max(float(retest_buffer), 1e-12)
+    except (TypeError, ValueError):
+        retest_ratio = 1
+
+    retest_quality = max(0, min(1, 1 - retest_ratio))
+    components["retest_quality"] = round(retest_quality * 10, 2)
+
+    try:
+        body_ratio = abs(float(candle_body)) / max(float(candle_range), 1e-12)
+    except (TypeError, ValueError):
+        body_ratio = 0
+
+    if body_ratio >= 0.65:
+        components["body_strength"] = 6
+    elif body_ratio >= 0.45:
+        components["body_strength"] = 3
+    else:
+        components["body_strength"] = -2
+
+    components["fake_breakout"] = -10 if fake_breakout != "NONE" else 0
+
+    component_total = sum(float(value or 0) for value in components.values())
+    side_score = clamp_score(side_score + component_total, 55, 94)
+    opposite_score = clamp_score(100 - side_score + max(0, -components.get("recent_pressure", 0)), 5, 42)
+    confidence = clamp_score(confidence + component_total + (6 if has_aligned_bos or choch_signal == aligned_choch else 0), 35, 92)
+
+    return {
+        "buy_score": side_score if bullish_side else opposite_score,
+        "sell_score": opposite_score if bullish_side else side_score,
+        "confidence": confidence,
+        "components": {
+            **components,
+            "component_total": round(component_total, 2),
+            "retest_distance": retest_distance,
+            "retest_buffer": retest_buffer,
+            "retest_quality": round(retest_quality, 3),
+            "body_ratio": round(body_ratio, 3),
+            "symbol": symbol,
+            "side": side,
+        },
+    }
 
 
 def detect_choch(data):
@@ -1039,7 +1498,7 @@ def calculate_confidence(
 # 📊 DATA FETCH (TWELVE DATA)
 # =========================
 import os
-TWELVE_DATA_API_KEY = "9bce0b4c48b1498d8e2afb8a5c186359"
+TWELVE_DATA_API_KEY = "6cdda0e63fd34eb586552edf157a188b"
 
 def _normalize_td_values(values):
     if not values:
@@ -1126,29 +1585,294 @@ def safe_download(symbol, interval, outputsize=80, tries=1, pause=1):
     return pd.DataFrame()
 
 _FETCH_LOCK = False
-def fetch_market_data():
+def _update_market_cache(cache, key, fetched_df, label):
+    if fetched_df is not None and not fetched_df.empty:
+        cache[key] = fetched_df
+        return True
+
+    if cache[key].empty:
+        print(f"{label}: no new data and no cached candles available")
+        return False
+
+    print(f"{label}: keeping last good cached candles")
+    return False
+
+def _fetch_twelvedata_symbol(symbol, interval, outputsize):
+    td_symbol = "EUR/USD" if symbol == "EURUSD" else "XAU/USD"
+    return safe_download(td_symbol, interval, outputsize=outputsize)
+
+def _fetch_ctrader_symbol(symbol, timeframe, limit, force_refresh=False):
+    print(f"CTRADER DATA TRY: {symbol} {timeframe}")
+
+    try:
+        df = get_ctrader_market_data(
+            symbol,
+            timeframe,
+            limit=limit,
+            force_refresh=force_refresh
+        )
+    except Exception as e:
+        print(f"CTRADER DATA ERROR: {symbol} {timeframe} {e}")
+        return pd.DataFrame()
+
+    if df is not None and not df.empty:
+        print(f"CTRADER DATA OK: {symbol} {timeframe} rows={len(df)}")
+        return df
+
+    print(f"CTRADER DATA EMPTY: {symbol} {timeframe}")
+    return pd.DataFrame()
+
+def _get_last_candle_timestamp(df):
+    if df is None or df.empty:
+        return None
+
+    try:
+        last_idx = pd.Timestamp(df.index[-1])
+        if last_idx.tzinfo is None:
+            last_idx = last_idx.tz_localize("UTC")
+        else:
+            last_idx = last_idx.tz_convert("UTC")
+        return last_idx
+    except Exception:
+        return None
+
+def log_candle_freshness(symbol, timeframe, df):
+    now_utc = datetime.now(timezone.utc)
+    last_timestamp = _get_last_candle_timestamp(df)
+    age_minutes = None
+    last_open = None
+    last_high = None
+    last_low = None
+    last_close = None
+
+    if last_timestamp is not None:
+        age_minutes = round(
+            (now_utc - last_timestamp.to_pydatetime()).total_seconds() / 60,
+            2
+        )
+
+    if df is not None and not df.empty:
+        last = df.iloc[-1]
+        last_open = float(last.get("Open")) if pd.notna(last.get("Open")) else None
+        last_high = float(last.get("High")) if pd.notna(last.get("High")) else None
+        last_low = float(last.get("Low")) if pd.notna(last.get("Low")) else None
+        last_close = float(last.get("Close")) if pd.notna(last.get("Close")) else None
+
+    print("CANDLE_FRESHNESS_DEBUG =", {
+        "symbol": normalize_symbol(symbol),
+        "timeframe": timeframe,
+        "last_candle_time": last_timestamp.isoformat() if last_timestamp is not None else None,
+        "now_utc": now_utc.isoformat(),
+        "age_minutes": age_minutes,
+        "rows": len(df) if df is not None else 0,
+        "last_open": last_open,
+        "last_high": last_high,
+        "last_low": last_low,
+        "last_close": last_close,
+        "source": "ctrader",
+    })
+
+    return {
+        "last_candle_time": last_timestamp,
+        "age_minutes": age_minutes,
+    }
+
+def _refresh_market_symbol(cache, source, symbol, timeframe, interval, outputsize, cache_key, force_refresh=False):
+    log_candle_freshness(symbol, timeframe, cache.get(cache_key))
+
+    if (
+        not force_refresh
+        and not cache[cache_key].empty
+        and _is_ctrader_data_fresh(symbol, timeframe)
+    ):
+        print(f"CTRADER DATA HEALTH OK: {_ctrader_health_key(symbol, timeframe)}")
+        MARKET_DATA_STATUS["last_fetch_source"] = "ctrader"
+        MARKET_DATA_STATUS["fallback_used"] = False
+        return True
+
+    ctrader_df = _fetch_ctrader_symbol(
+        symbol,
+        timeframe,
+        outputsize,
+        force_refresh=force_refresh
+    )
+    candle_health = get_ctrader_candle_health(symbol, timeframe)
+
+    if ctrader_df is not None and not ctrader_df.empty and candle_health.get("usable"):
+        freshness = log_candle_freshness(symbol, timeframe, ctrader_df)
+        last_candle_time = freshness.get("last_candle_time")
+        _update_market_cache(
+            cache,
+            cache_key,
+            ctrader_df,
+            f"ctrader {symbol} {timeframe}"
+        )
+        if candle_health.get("missed_fetch_count", 0) == 0:
+            _mark_ctrader_success(symbol, timeframe, timestamp=last_candle_time)
+        MARKET_DATA_STATUS["last_fetch_source"] = "ctrader"
+        MARKET_DATA_STATUS["fallback_used"] = candle_health.get("source") == "ctrader_cache"
+        print("BRAIN_CANDLE_DEBUG =", {
+            **candle_health,
+            "symbol": normalize_symbol(symbol),
+            "timeframe": timeframe,
+            "rows": len(ctrader_df),
+            "brain_accepted": True,
+        })
+        return True
+
+    if ctrader_df is not None and not ctrader_df.empty and cache[cache_key].empty:
+        cache[cache_key] = ctrader_df
+
+    print(f"CTRADER DATA HEALTH STALE: {_ctrader_health_key(symbol, timeframe)}")
+    print("BRAIN_CANDLE_DEBUG =", {
+        **candle_health,
+        "symbol": normalize_symbol(symbol),
+        "timeframe": timeframe,
+        "rows": len(ctrader_df) if ctrader_df is not None else 0,
+        "brain_accepted": False,
+    })
+
+    if not MARKET_DATA_STATUS.get("error"):
+        MARKET_DATA_STATUS["error"] = "cTrader candles unavailable"
+
+    MARKET_DATA_STATUS["fallback_used"] = False
+    return False
+
+def _refresh_market_pair(cache, source, timeframe, interval, outputsize, eurusd_key, gold_key, force_refresh=False):
+    eurusd_updated = _refresh_market_symbol(
+        cache,
+        source,
+        "EURUSD",
+        timeframe,
+        interval,
+        outputsize,
+        eurusd_key,
+        force_refresh=force_refresh
+    )
+    xauusd_updated = _refresh_market_symbol(
+        cache,
+        source,
+        "XAUUSD",
+        timeframe,
+        interval,
+        outputsize,
+        gold_key,
+        force_refresh=force_refresh
+    )
+
+    return eurusd_updated and xauusd_updated
+
+def _advance_cached_market_frames(cache):
+    frame_map = [
+        ("eurusd_5m", "EURUSD", "5m"),
+        ("gold_5m", "XAUUSD", "5m"),
+        ("eurusd_15m", "EURUSD", "15m"),
+        ("gold_15m", "XAUUSD", "15m"),
+        ("eurusd_1h", "EURUSD", "1h"),
+        ("gold_1h", "XAUUSD", "1h"),
+    ]
+
+    for cache_key, symbol, timeframe in frame_map:
+        current = cache.get(cache_key)
+
+        if current is None or current.empty:
+            continue
+
+        advanced = append_current_forming_candle(
+            current,
+            symbol,
+            timeframe,
+        )
+        if advanced is not None and not advanced.empty:
+            cache[cache_key] = advanced
+
+def _empty_market_data_cache():
+    return {
+        "eurusd_5m": pd.DataFrame(),
+        "gold_5m": pd.DataFrame(),
+        "eurusd_15m": pd.DataFrame(),
+        "gold_15m": pd.DataFrame(),
+        "eurusd_1h": pd.DataFrame(),
+        "gold_1h": pd.DataFrame(),
+        "last_5m_update": None,
+        "last_15m_update": None,
+        "last_1h_update": None,
+    }
+
+
+def hydrate_market_data_cache_from_disk():
+    frame_map = {
+        "eurusd_5m": ("EURUSD", "5m"),
+        "gold_5m": ("XAUUSD", "5m"),
+        "eurusd_15m": ("EURUSD", "15m"),
+        "gold_15m": ("XAUUSD", "15m"),
+        "eurusd_1h": ("EURUSD", "1h"),
+        "gold_1h": ("XAUUSD", "1h"),
+    }
+    restored = {}
+
+    for cache_key, (symbol, timeframe) in frame_map.items():
+        persisted = hydrate_persisted_ctrader_candle_cache(symbol, timeframe)
+        frame = (
+            persisted.get("data")
+            if isinstance(persisted, dict)
+            else persisted
+        )
+        if frame is None or frame.empty:
+            print("MARKET_CACHE_HYDRATION_SKIPPED =", {
+                "missing_symbol": symbol,
+                "missing_timeframe": timeframe,
+            })
+            return False
+        restored[cache_key] = frame
+
+    cache = _empty_market_data_cache()
+    cache.update(restored)
+    # Disk hydration is not a market-data refresh. Leaving these timestamps
+    # empty forces the startup pass to request the missing bars immediately
+    # instead of treating an old persisted candle as freshly fetched.
+    cache.update({
+        "last_5m_update": None,
+        "last_15m_update": None,
+        "last_1h_update": None,
+    })
+    fetch_market_data._cache = cache
+    MARKET_DATA_STATUS["last_fetch_source"] = "ctrader_cache"
+    MARKET_DATA_STATUS["fallback_used"] = True
+    MARKET_DATA_STATUS["error"] = None
+    print("MARKET_CACHE_HYDRATED =", {
+        cache_key: len(frame)
+        for cache_key, frame in restored.items()
+    })
+    return True
+
+
+def fetch_market_data(force_refresh=False):
     global _FETCH_LOCK
 
+    started_at = time.time()
     now = datetime.now(timezone.utc)
     calendar_closed = is_market_calendar_closed()
+    active_source = get_market_data_source()
+
+    print("MARKET DATA SOURCE ACTIVE:", active_source)
+
+    print("CTRADER DATA TRY START")
+
+    MARKET_DATA_STATUS["fallback_used"] = False
+    MARKET_DATA_STATUS["error"] = None
 
     if not hasattr(fetch_market_data, "_cache"):
-        fetch_market_data._cache = {
-            "eurusd_5m": pd.DataFrame(),
-            "gold_5m": pd.DataFrame(),
-            "eurusd_15m": pd.DataFrame(),
-            "gold_15m": pd.DataFrame(),
-            "eurusd_1h": pd.DataFrame(),
-            "gold_1h": pd.DataFrame(),
-            "last_5m_update": None,
-            "last_15m_update": None,
-            "last_1h_update": None,
-        }
+        fetch_market_data._cache = _empty_market_data_cache()
 
     cache = fetch_market_data._cache
 
-    if _FETCH_LOCK:
+    if force_refresh:
+        print("FORCE MARKET DATA REFRESH")
+
+    if _FETCH_LOCK and not force_refresh:
         print("===== FETCH LOCK ACTIVE: USING CACHE =====")
+        _advance_cached_market_frames(cache)
         return (
             cache["eurusd_5m"],
             cache["gold_5m"],
@@ -1165,51 +1889,82 @@ def fetch_market_data():
     _FETCH_LOCK = True
 
     need_5m = (
-        cache["eurusd_5m"].empty
+        force_refresh
+        or cache["eurusd_5m"].empty
         or cache["gold_5m"].empty
         or last_5m is None
         or (now - last_5m).total_seconds() >= 300
     )
 
     need_15m = (
-        cache["eurusd_15m"].empty
+        force_refresh
+        or cache["eurusd_15m"].empty
         or cache["gold_15m"].empty
         or last_15m is None
         or (now - last_15m).total_seconds() >= 900
     )
     need_1h = (
-        cache["eurusd_1h"].empty
+        force_refresh
+        or cache["eurusd_1h"].empty
         or cache["gold_1h"].empty
         or last_1h is None
         or (now - last_1h).total_seconds() >= 3600
     )
     try:
-        if need_5m and (not calendar_closed or cache["eurusd_5m"].empty or cache["gold_5m"].empty):
+        if need_5m and (force_refresh or not calendar_closed or cache["eurusd_5m"].empty or cache["gold_5m"].empty):
             print("===== REFRESHING 5M DATA =====")
-            cache["eurusd_5m"] = safe_download("EUR/USD", "5min", outputsize=5000)
-            cache["gold_5m"] = safe_download("XAU/USD", "5min", outputsize=5000)
+            _refresh_market_pair(
+                cache,
+                active_source,
+                "5m",
+                "5min",
+                5000,
+                "eurusd_5m",
+                "gold_5m",
+                force_refresh=force_refresh
+            )
             cache["last_5m_update"] = now
         else:
             print("===== USING CACHED 5M DATA =====")
 
-        if need_15m and (not calendar_closed or cache["eurusd_15m"].empty or cache["gold_15m"].empty):
+        if need_15m and (force_refresh or not calendar_closed or cache["eurusd_15m"].empty or cache["gold_15m"].empty):
             print("===== REFRESHING 15M DATA =====")
-            cache["eurusd_15m"] = safe_download("EUR/USD", "15min", outputsize=5000)
-            cache["gold_15m"] = safe_download("XAU/USD", "15min", outputsize=5000)
+            _refresh_market_pair(
+                cache,
+                active_source,
+                "15m",
+                "15min",
+                5000,
+                "eurusd_15m",
+                "gold_15m",
+                force_refresh=force_refresh
+            )
             cache["last_15m_update"] = now
         else:
             print("===== USING CACHED 15M DATA =====")
 
-        if need_1h and (not calendar_closed or cache["eurusd_1h"].empty or cache["gold_1h"].empty):
+        if need_1h and (force_refresh or not calendar_closed or cache["eurusd_1h"].empty or cache["gold_1h"].empty):
             print("===== REFRESHING 1H DATA =====")
-            cache["eurusd_1h"] = safe_download("EUR/USD", "1h", outputsize=5000)
-            cache["gold_1h"] = safe_download("XAU/USD", "1h", outputsize=5000)
+            _refresh_market_pair(
+                cache,
+                active_source,
+                "1h",
+                "1h",
+                5000,
+                "eurusd_1h",
+                "gold_1h",
+                force_refresh=force_refresh
+            )
             cache["last_1h_update"] = now
         else:
             print("===== USING CACHED 1H DATA =====")
 
     finally:
         _FETCH_LOCK = False
+
+    # Historical trendbars are refreshed on their normal timeframe cadence,
+    # but the active candle must advance on every panel cycle using live ticks.
+    _advance_cached_market_frames(cache)
 
     eurusd = cache["eurusd_5m"]
     gold = cache["gold_5m"]
@@ -1230,14 +1985,24 @@ def fetch_market_data():
         if cache["last_15m_update"] else None
     )
     print("EURUSD 5m rows:", len(eurusd))
-    print("GOLD 5m rows:", len(gold))
+    print("XAUUSD 5m rows:", len(gold))
     print("EURUSD 15m rows:", len(eurusd_htf))
-    print("GOLD 15m rows:", len(gold_htf))
+    print("XAUUSD 15m rows:", len(gold_htf))
 
     print("EURUSD 5m columns:", eurusd.columns.tolist() if not eurusd.empty else "EMPTY")
-    print("GOLD 5m columns:", gold.columns.tolist() if not gold.empty else "EMPTY")
+    print("XAUUSD 5m columns:", gold.columns.tolist() if not gold.empty else "EMPTY")
     print("EURUSD 15m columns:", eurusd_htf.columns.tolist() if not eurusd_htf.empty else "EMPTY")
-    print("GOLD 15m columns:", gold_htf.columns.tolist() if not gold_htf.empty else "EMPTY")
+    print("XAUUSD 15m columns:", gold_htf.columns.tolist() if not gold_htf.empty else "EMPTY")
+    print("MARKET_DATA_FETCH_DURATION_DEBUG =", {
+        "seconds": round(time.time() - started_at, 2),
+        "force_refresh": force_refresh,
+        "source": active_source,
+        "refreshed": {
+            "5m": need_5m,
+            "15m": need_15m,
+            "1h": need_1h,
+        },
+    })
 
     return eurusd, gold, eurusd_htf, gold_htf, eurusd_1h, gold_1h
 
@@ -1307,33 +2072,286 @@ SMC_STATE = {
         "stage": "WAIT",
         "bos_level": None,
         "sweep_level": None,
+        "retest_seen": False,
+        "entry_confirm_level": None,
+        "structure_pattern": "NEUTRAL",
         "last_idea": None
         },
-    "GOLD": {
+    "XAUUSD": {
         "pending": None,
         "stage": "WAIT",
         "bos_level": None,
         "sweep_level": None,
+        "retest_seen": False,
+        "entry_confirm_level": None,
+        "structure_pattern": "NEUTRAL",
         "last_idea": None
             }
         }
+
+def load_final_signal_hold():
+    if not os.path.exists(FINAL_SIGNAL_HOLD_FILE):
+        return {}
+
+    try:
+        with open(FINAL_SIGNAL_HOLD_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            return {}
+
+        return {
+            normalize_symbol(symbol): value
+            for symbol, value in data.items()
+            if isinstance(value, dict)
+            and not value.get("consumed_at")
+            and str(value.get("setup_freshness") or "").upper() != "EXPIRED"
+        }
+    except Exception as exc:
+        print("FINAL_SIGNAL_HOLD_LOAD_ERROR =", str(exc))
+        return {}
+
+def save_final_signal_hold():
+    try:
+        with open(FINAL_SIGNAL_HOLD_FILE, "w", encoding="utf-8") as f:
+            json.dump(FINAL_SIGNAL_HOLD, f, indent=2, default=str)
+    except Exception as exc:
+        print("FINAL_SIGNAL_HOLD_SAVE_ERROR =", str(exc))
+
+FINAL_SIGNAL_HOLD = load_final_signal_hold()
+
+def load_fifteen_m_swing_watch():
+    if not os.path.exists(FIFTEEN_M_SWING_WATCH_FILE):
+        return {}
+
+    try:
+        with open(FIFTEEN_M_SWING_WATCH_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        print("FIFTEEN_M_SWING_WATCH_LOAD_ERROR =", str(exc))
+        return {}
+
+def save_fifteen_m_swing_watch():
+    try:
+        with open(FIFTEEN_M_SWING_WATCH_FILE, "w", encoding="utf-8") as f:
+            json.dump(FIFTEEN_M_SWING_WATCH, f, indent=2, default=str)
+    except Exception as exc:
+        print("FIFTEEN_M_SWING_WATCH_SAVE_ERROR =", str(exc))
+
+FIFTEEN_M_SWING_WATCH = load_fifteen_m_swing_watch()
+
+def get_final_signal_hold_key(symbol):
+    return normalize_symbol(symbol)
+
+def is_final_signal_hold_expired(held):
+    if not isinstance(held, dict):
+        return True
+
+    if held.get("consumed_at"):
+        return True
+
+    if str(held.get("setup_freshness") or "").upper() == "EXPIRED":
+        return True
+
+    try:
+        saved_at = pd.Timestamp(held.get("saved_at"))
+
+        if saved_at.tzinfo is None:
+            saved_at = saved_at.tz_localize("UTC")
+        else:
+            saved_at = saved_at.tz_convert("UTC")
+
+        age = (datetime.now(timezone.utc) - saved_at.to_pydatetime()).total_seconds()
+        return age > FINAL_SIGNAL_HOLD_EXPIRATION_SECONDS
+    except Exception:
+        return True
+
+def parse_final_signal_hold_timestamp(value):
+    try:
+        ts = pd.Timestamp(value)
+
+        if pd.isna(ts):
+            return None
+
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+
+        return ts
+    except Exception:
+        return None
+
+def get_final_signal_hold_candle_age(saved_candle_time, current_candle_time):
+    saved = parse_final_signal_hold_timestamp(saved_candle_time)
+    current = parse_final_signal_hold_timestamp(current_candle_time)
+
+    if saved is None or current is None:
+        return None
+
+    age_seconds = (current - saved).total_seconds()
+
+    if pd.isna(age_seconds) or not math.isfinite(float(age_seconds)):
+        return None
+
+    return max(0, int(age_seconds // 300))
+
+def calculate_final_signal_hold_tp1_progress(held, current_price):
+    side = str(held.get("signal") or "").upper()
+    held_fields = held.get("fields") or {}
+
+    try:
+        entry = float(held.get("entry") or held_fields.get("entry_price"))
+        tp1 = float(held.get("tp1") or held_fields.get("tp1"))
+        price = float(current_price)
+    except (TypeError, ValueError):
+        return None
+
+    full_distance = abs(tp1 - entry)
+
+    if full_distance <= 0:
+        return None
+
+    if side == "BUY":
+        moved = price - entry
+    elif side == "SELL":
+        moved = entry - price
+    else:
+        return None
+
+    return max(0, moved / full_distance)
+
+def evaluate_setup_hold_expiration(held, current_candle_time, current_price):
+    candle_age = get_final_signal_hold_candle_age(
+        held.get("five_m_candle_time"),
+        current_candle_time,
+    )
+    tp1_progress = calculate_final_signal_hold_tp1_progress(
+        held,
+        current_price,
+    )
+
+    if candle_age is not None and candle_age > FINAL_SIGNAL_HOLD_MAX_SETUP_CANDLES:
+        return {
+            "expired": True,
+            "reason": f"setup older than {FINAL_SIGNAL_HOLD_MAX_SETUP_CANDLES} candles",
+            "candle_age": candle_age,
+            "tp1_progress": tp1_progress,
+        }
+
+    if (
+        tp1_progress is not None
+        and tp1_progress >= FINAL_SIGNAL_HOLD_MAX_TP1_PROGRESS
+    ):
+        return {
+            "expired": True,
+            "reason": "price reached 75% of TP1 without entry",
+            "candle_age": candle_age,
+            "tp1_progress": tp1_progress,
+        }
+
+    return {
+        "expired": False,
+        "reason": None,
+        "candle_age": candle_age,
+        "tp1_progress": tp1_progress,
+    }
+
+def evaluate_setup_freshness(
+    previous_setup,
+    side,
+    bos_level,
+    setup_candle_time,
+    closed_data_5m,
+    setup_result,
+):
+    side = str(side or "").upper()
+
+    if side not in ["BUY", "SELL"]:
+        return {
+            "setup_freshness": "EXPIRED",
+            "fresh": False,
+            "reason": "No actionable setup",
+        }
+
+    previous_side = str((previous_setup or {}).get("signal") or "").upper()
+
+    if previous_side != side:
+        return {
+            "setup_freshness": "FRESH",
+            "fresh": True,
+            "reason": f"Fresh {side} direction",
+        }
+
+    try:
+        previous_bos = float((previous_setup or {}).get("bos_level"))
+        current_bos = float(bos_level)
+        new_bos = current_bos > previous_bos if side == "BUY" else current_bos < previous_bos
+    except (TypeError, ValueError):
+        new_bos = False
+
+    if new_bos:
+        return {
+            "setup_freshness": "FRESH",
+            "fresh": True,
+            "reason": "New BOS beyond previous BOS",
+        }
+
+    score_debug = setup_result.get("score_contribution_debug") or {}
+    fresh_choch = bool(
+        score_debug.get("bullish_choch")
+        if side == "BUY"
+        else score_debug.get("bearish_choch")
+    )
+    previous_candle_time = (previous_setup or {}).get("setup_candle_time")
+
+    if fresh_choch and setup_candle_time and setup_candle_time != previous_candle_time:
+        return {
+            "setup_freshness": "FRESH",
+            "fresh": True,
+            "reason": "Fresh CHOCH after retracement",
+        }
+
+    return {
+        "setup_freshness": "ACTIVE",
+        "fresh": False,
+        "reason": f"{side} trend remains active without a fresh entry setup",
+    }
+
+def create_smc_state():
+    return {
+        "pending": None,
+        "stage": "WAIT",
+        "bos_level": None,
+        "sweep_level": None,
+        "retest_seen": False,
+        "entry_confirm_level": None,
+        "setup_candle_time": None,
+        "structure_pattern": "NEUTRAL",
+        "last_idea": None,
+    }
 
 # =========================
 # 🤖 PAPER AUTO-TRADER
 # =========================
 AUTO_TRADES = {
     "EURUSD": None,
-    "GOLD": None,
+    "XAUUSD": None,
 }
+PAPER_ACTIVE_TRADES = []
 
 PAPER_TRADE_HISTORY = []
 PAPER_BACKUP_FILE = "paper_backup.json"
 PAPER_RESET_KEY = "last_paper_reset"
 PAPER_MAX_OPEN_SECONDS = 24 * 60 * 60
+PAPER_REENTRY_COOLDOWN_SECONDS = 15 * 60
 LAST_PAPER_RESET = 0
+PAPER_SETUP_LOCKS = {}
 LIVE_TRADES = {
     "EURUSD": None,
-    "GOLD": None,
+    "XAUUSD": None,
 }
 
 LIVE_TRADE_HISTORY = []
@@ -1366,12 +2384,67 @@ if os.path.exists(PAPER_BACKUP_FILE):
         with open(PAPER_BACKUP_FILE, "r") as f:
             backup = json.load(f)
 
-        AUTO_TRADES = backup.get("paper_trades", AUTO_TRADES)
+        loaded_paper_trades = backup.get("paper_trades", AUTO_TRADES)
+        loaded_active_trades = backup.get("paper_active_trades")
+        if isinstance(loaded_active_trades, list):
+            PAPER_ACTIVE_TRADES = [
+                trade for trade in loaded_active_trades
+                if isinstance(trade, dict)
+                and str(trade.get("status", "")).upper() == "OPEN"
+            ]
+        elif isinstance(loaded_paper_trades, dict):
+            PAPER_ACTIVE_TRADES = [
+                trade for trade in loaded_paper_trades.values()
+                if isinstance(trade, dict)
+                and str(trade.get("status", "")).upper() == "OPEN"
+            ]
+
         PAPER_TRADE_HISTORY = backup.get(
             "paper_trade_history",
             PAPER_TRADE_HISTORY
         )
         LAST_PAPER_RESET = float(backup.get(PAPER_RESET_KEY, 0) or 0)
+        PAPER_SETUP_LOCKS = backup.get("paper_setup_locks", {})
+        if not isinstance(PAPER_SETUP_LOCKS, dict):
+            PAPER_SETUP_LOCKS = {}
+
+        for trade in PAPER_ACTIVE_TRADES:
+            trade["symbol"] = normalize_symbol(trade.get("symbol"))
+
+        for history_trade in PAPER_TRADE_HISTORY:
+            if isinstance(history_trade, dict):
+                history_trade["symbol"] = normalize_symbol(
+                    history_trade.get("symbol")
+                )
+
+        for trade in PAPER_ACTIVE_TRADES:
+            trade.setdefault("trade_id", f"paper-{uuid.uuid4()}")
+
+            for history_trade in reversed(PAPER_TRADE_HISTORY):
+                if (
+                    history_trade.get("symbol") == trade.get("symbol")
+                    and history_trade.get("opened_at") == trade.get("opened_at")
+                    and str(history_trade.get("status", "")).upper() == "OPEN"
+                ):
+                    history_trade["trade_id"] = trade["trade_id"]
+                    break
+
+        AUTO_TRADES = {
+            "EURUSD": next(
+                (
+                    trade for trade in reversed(PAPER_ACTIVE_TRADES)
+                    if trade.get("symbol") == "EURUSD"
+                ),
+                None
+            ),
+            "XAUUSD": next(
+                (
+                    trade for trade in reversed(PAPER_ACTIVE_TRADES)
+                    if trade.get("symbol") == "XAUUSD"
+                ),
+                None
+            ),
+        }
 
         print("✅ Loaded paper backup")
 
@@ -1383,20 +2456,24 @@ def save_paper_backup():
         with open(PAPER_BACKUP_FILE, "w") as f:
             json.dump({
                 "paper_trades": AUTO_TRADES,
+                "paper_active_trades": PAPER_ACTIVE_TRADES,
                 "paper_trade_history": PAPER_TRADE_HISTORY,
+                "paper_setup_locks": PAPER_SETUP_LOCKS,
                 PAPER_RESET_KEY: LAST_PAPER_RESET,
             }, f, indent=2)
     except Exception as e:
         print("❌ Failed saving paper backup:", e)
 
-def get_last_saturday_5pm_local_ts():
-    now = datetime.now().astimezone()
+def get_last_sunday_5pm_local_ts(now=None):
+    now = now or datetime.now().astimezone()
+    if now.tzinfo is None:
+        now = now.astimezone()
     reset = now.replace(hour=17, minute=0, second=0, microsecond=0)
 
-    days_since_saturday = (now.weekday() - 5) % 7
-    reset = reset - timedelta(days=days_since_saturday)
+    days_since_sunday = (now.weekday() - 6) % 7
+    reset = reset - timedelta(days=days_since_sunday)
 
-    if now.weekday() == 5 and now < reset:
+    if now.weekday() == 6 and now < reset:
         reset = reset - timedelta(days=7)
 
     return reset.timestamp()
@@ -1439,7 +2516,7 @@ def get_paper_trade_stats():
 def run_weekly_paper_reset():
     global PAPER_TRADE_HISTORY, LAST_PAPER_RESET
 
-    reset_ts = get_last_saturday_5pm_local_ts()
+    reset_ts = get_last_sunday_5pm_local_ts()
 
     if reset_ts <= LAST_PAPER_RESET:
         return
@@ -1641,15 +2718,339 @@ def parse_paper_trade_time(value):
         return None
 
 def update_open_paper_history(symbol, trade):
+    trade_id = trade.get("trade_id")
+
     for i in range(len(PAPER_TRADE_HISTORY) - 1, -1, -1):
         if (
             PAPER_TRADE_HISTORY[i].get("symbol") == symbol
             and PAPER_TRADE_HISTORY[i].get("status") == "OPEN"
+            and (
+                (trade_id and PAPER_TRADE_HISTORY[i].get("trade_id") == trade_id)
+                or (
+                    not PAPER_TRADE_HISTORY[i].get("trade_id")
+                    and PAPER_TRADE_HISTORY[i].get("opened_at") == trade.get("opened_at")
+                )
+            )
         ):
             PAPER_TRADE_HISTORY[i] = trade.copy()
             return True
 
     return False
+
+def backfill_paper_trade_keys(trade):
+    if not isinstance(trade, dict):
+        return
+
+    symbol = normalize_symbol(trade.get("symbol"))
+    side = str(trade.get("side") or "").upper()
+    trade["symbol"] = symbol
+
+    if not trade.get("level_lock_key"):
+        level_result = {
+            "entry_price": trade.get("entry"),
+            "stop_loss": trade.get("sl") or trade.get("original_sl"),
+            "tp2": trade.get("tp2"),
+        }
+        trade["level_lock_key"] = get_paper_level_lock_key(symbol, side, level_result)
+
+    if not trade.get("setup_lock_key"):
+        trade["setup_lock_key"] = (
+            trade.get("signal_key")
+            or trade.get("level_lock_key")
+        )
+
+def dedupe_paper_trade_history():
+    seen_closed_keys = set()
+    deduped = []
+    removed = 0
+
+    for trade in PAPER_TRADE_HISTORY:
+        if not isinstance(trade, dict):
+            continue
+
+        backfill_paper_trade_keys(trade)
+        status = str(trade.get("status", "")).upper()
+        keys = [
+            trade.get("setup_lock_key"),
+            trade.get("level_lock_key"),
+            trade.get("signal_key"),
+        ]
+        keys = [key for key in keys if key]
+
+        if status == "OPEN":
+            deduped.append(trade)
+            remember_paper_setup_lock(trade)
+            continue
+
+        duplicate_key = next(
+            (key for key in keys if key in seen_closed_keys),
+            None,
+        )
+
+        if duplicate_key:
+            removed += 1
+            continue
+
+        for key in keys:
+            seen_closed_keys.add(key)
+        deduped.append(trade)
+        remember_paper_setup_lock(trade)
+
+    if removed:
+        PAPER_TRADE_HISTORY[:] = deduped
+        print("PAPER HISTORY DUPLICATES REMOVED:", {
+            "removed": removed,
+            "remaining": len(PAPER_TRADE_HISTORY),
+        })
+
+    return removed
+
+def refresh_paper_trade_summary(symbol):
+    AUTO_TRADES[symbol] = next(
+        (
+            trade for trade in reversed(PAPER_ACTIVE_TRADES)
+            if trade.get("symbol") == symbol
+            and str(trade.get("status", "")).upper() == "OPEN"
+        ),
+        None
+    )
+
+def dedupe_open_paper_trades():
+    seen_symbols = set()
+    deduped_active = []
+    duplicate_ids = set()
+    history_duplicates_removed = dedupe_paper_trade_history()
+
+    for trade in reversed(PAPER_ACTIVE_TRADES):
+        symbol = normalize_symbol(trade.get("symbol"))
+        trade["symbol"] = symbol
+        backfill_paper_trade_keys(trade)
+
+        if (
+            symbol in seen_symbols or
+            str(trade.get("status", "")).upper() != "OPEN"
+        ):
+            duplicate_id = trade.get("trade_id")
+            if duplicate_id:
+                duplicate_ids.add(duplicate_id)
+            trade["status"] = "CLOSED"
+            trade["result"] = "DUPLICATE_CLOSED"
+            trade["closed_at"] = datetime.now(timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S UTC"
+            )
+            continue
+
+        seen_symbols.add(symbol)
+        remember_paper_setup_lock(trade)
+        deduped_active.append(trade)
+
+    PAPER_ACTIVE_TRADES[:] = list(reversed(deduped_active))
+
+    if duplicate_ids or history_duplicates_removed:
+        for history_trade in PAPER_TRADE_HISTORY:
+            if history_trade.get("trade_id") in duplicate_ids:
+                history_trade["status"] = "CLOSED"
+                history_trade["result"] = "DUPLICATE_CLOSED"
+                history_trade["closed_at"] = datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M:%S UTC"
+                )
+
+        print("PAPER DUPLICATES CLEARED:", {
+            "duplicates": len(duplicate_ids),
+            "history_duplicates_removed": history_duplicates_removed,
+            "active_remaining": len(PAPER_ACTIVE_TRADES),
+        })
+
+        save_paper_backup()
+
+    refresh_paper_trade_summary("EURUSD")
+    refresh_paper_trade_summary("XAUUSD")
+
+def remove_active_paper_trade(trade):
+    trade_id = trade.get("trade_id")
+    PAPER_ACTIVE_TRADES[:] = [
+        active_trade
+        for active_trade in PAPER_ACTIVE_TRADES
+        if active_trade is not trade
+        and (
+            not trade_id
+            or active_trade.get("trade_id") != trade_id
+        )
+    ]
+    refresh_paper_trade_summary(trade.get("symbol"))
+
+def get_paper_signal_key(symbol, side, result):
+    signal_time = (
+        result.get("five_m_closed_candle_time")
+        or result.get("setup_candle_time")
+    )
+
+    if signal_time:
+        return f"{symbol}:{side}:{signal_time}"
+
+    return ":".join(str(value) for value in [
+        symbol,
+        side,
+        result.get("entry_price"),
+        result.get("stop_loss"),
+        result.get("tp2"),
+    ])
+
+def _paper_round(symbol, value):
+    try:
+        decimals = 5 if normalize_symbol(symbol) == "EURUSD" else 2
+        return round(float(value), decimals)
+    except (TypeError, ValueError):
+        return None
+
+def get_paper_level_lock_key(symbol, side, result):
+    symbol = normalize_symbol(symbol)
+    entry = _paper_round(symbol, result.get("entry_price"))
+    sl = _paper_round(symbol, result.get("stop_loss"))
+    tp2 = _paper_round(symbol, result.get("tp2"))
+
+    if entry is None or sl is None or tp2 is None:
+        return None
+
+    return f"{symbol}:{side}:levels:{entry}:{sl}:{tp2}"
+
+def get_paper_setup_lock_key(symbol, side, result):
+    symbol = normalize_symbol(symbol)
+    swing_break = result.get("fifteen_m_swing_break") or {}
+    anchor_time = (
+        result.get("fifteen_m_breakout_candle_time")
+        or swing_break.get("closed_candle_time")
+        or result.get("setup_candle_time")
+        or result.get("five_m_closed_candle_time")
+    )
+    setup_level = (
+        result.get("fifteen_m_swing_level")
+        or result.get("fifteen_m_bos_level")
+        or swing_break.get("swing_level")
+        or result.get("structure_resistance")
+        or result.get("structure_support")
+    )
+    rounded_level = _paper_round(symbol, setup_level)
+    setup_type = str(
+        result.get("strategy_setup_type")
+        or result.get("plan_type")
+        or "SETUP"
+    ).replace(" ", "_").upper()
+
+    if anchor_time and rounded_level is not None:
+        return f"{symbol}:{side}:{setup_type}:{rounded_level}:{anchor_time}"
+
+    return get_paper_level_lock_key(symbol, side, result)
+
+def get_existing_paper_setup_lock(symbol, side, *keys):
+    active_keys = {key for key in keys if key}
+
+    if not active_keys:
+        return None
+
+    for key in active_keys:
+        lock = PAPER_SETUP_LOCKS.get(key)
+        if lock and lock.get("symbol") == symbol and lock.get("side") == side:
+            return lock
+
+    for trade in reversed(PAPER_TRADE_HISTORY):
+        if (
+            trade.get("symbol") == symbol
+            and str(trade.get("side", "")).upper() == side
+            and (
+                trade.get("setup_lock_key") in active_keys
+                or trade.get("level_lock_key") in active_keys
+                or trade.get("signal_key") in active_keys
+            )
+        ):
+            return trade
+
+    return None
+
+def remember_paper_setup_lock(trade):
+    for key_name in ["setup_lock_key", "level_lock_key", "signal_key"]:
+        key = trade.get(key_name)
+        if not key:
+            continue
+
+        PAPER_SETUP_LOCKS[key] = {
+            "symbol": trade.get("symbol"),
+            "side": trade.get("side"),
+            "trade_id": trade.get("trade_id"),
+            "opened_at": trade.get("opened_at"),
+            "entry": trade.get("entry"),
+            "sl": trade.get("sl"),
+            "tp2": trade.get("tp2"),
+        }
+
+dedupe_open_paper_trades()
+
+def paper_trade_age_seconds(trade):
+    timestamps = [
+        trade.get("closed_at"),
+        trade.get("opened_at"),
+        trade.get("updated_at"),
+    ]
+
+    for timestamp in timestamps:
+        parsed = parse_paper_trade_time(timestamp)
+        if parsed:
+            return (
+                datetime.now(timezone.utc) -
+                parsed.astimezone(timezone.utc)
+            ).total_seconds()
+
+    return None
+
+def has_open_paper_trade_for_symbol(symbol):
+    return any(
+        trade for trade in PAPER_ACTIVE_TRADES
+        if trade.get("symbol") == symbol
+        and str(trade.get("status", "")).upper() == "OPEN"
+    )
+
+def has_seen_paper_signal(symbol, side, signal_key):
+    if not signal_key:
+        return False
+
+    return any(
+        trade for trade in PAPER_TRADE_HISTORY
+        if trade.get("symbol") == symbol
+        and str(trade.get("side", "")).upper() == side
+        and trade.get("signal_key") == signal_key
+    )
+
+def is_paper_reentry_cooling_down(symbol, side):
+    recent_trades = [
+        trade for trade in reversed(PAPER_TRADE_HISTORY)
+        if trade.get("symbol") == symbol
+        and str(trade.get("side", "")).upper() == side
+    ]
+
+    if not recent_trades:
+        return False, None
+
+    age_seconds = paper_trade_age_seconds(recent_trades[0])
+
+    if age_seconds is None:
+        return False, None
+
+    return age_seconds < PAPER_REENTRY_COOLDOWN_SECONDS, age_seconds
+
+def trim_paper_trade_history(max_trades=50):
+    while len(PAPER_TRADE_HISTORY) > max_trades:
+        closed_index = next(
+            (
+                index for index, trade in enumerate(PAPER_TRADE_HISTORY)
+                if str(trade.get("status", "")).upper() == "CLOSED"
+            ),
+            None
+        )
+
+        if closed_index is None:
+            return
+
+        PAPER_TRADE_HISTORY.pop(closed_index)
 
 def close_stale_paper_trade(symbol, trade, current_price, calc_pips):
     opened_at = parse_paper_trade_time(trade.get("opened_at"))
@@ -1675,7 +3076,7 @@ def close_stale_paper_trade(symbol, trade, current_price, calc_pips):
     )
 
     update_open_paper_history(symbol, trade)
-    AUTO_TRADES[symbol] = None
+    remove_active_paper_trade(trade)
     save_paper_backup()
 
     print("PAPER STALE CLEARED:", trade)
@@ -1690,9 +3091,9 @@ def update_paper_trade(
 ):
     global AUTO_TRADES, PAPER_TRADE_HISTORY
 
+    symbol = normalize_symbol(symbol)
     run_weekly_paper_reset()
-
-    trade = AUTO_TRADES.get(symbol)
+    dedupe_open_paper_trades()
 
     def calc_pips(symbol, side, entry, close_price):
         if symbol == "EURUSD":
@@ -1705,12 +3106,140 @@ def update_paper_trade(
         else:
             return round((entry - close_price) / pip_value, 1)
 
+    def calculate_tp1(entry, tp2, side):
+        if side == "BUY":
+            return entry + ((tp2 - entry) * 0.80)
+
+        return entry - ((entry - tp2) * 0.80)
+
+    def calculate_protected_sl(entry, tp2, side):
+        if side == "BUY":
+            return entry + ((tp2 - entry) * 0.50)
+
+        return entry - ((entry - tp2) * 0.50)
+
+    def protect_trade_after_tp1(trade):
+        if trade.get("hit_tp1"):
+            return
+
+        protected_sl = calculate_protected_sl(
+            trade["entry"],
+            trade["tp2"],
+            trade["side"]
+        )
+        decimals = 5 if trade["symbol"] == "EURUSD" else 2
+
+        trade["hit_tp1"] = True
+        trade["profit_protected"] = True
+        trade["protected_sl_price"] = round(protected_sl, decimals)
+        trade["original_sl"] = trade.get("original_sl", trade["sl"])
+        trade["sl"] = trade["protected_sl_price"]
+        trade["result"] = "TP1 HIT"
+
+        print("TP1_HIT_PROTECT_PROFIT:", {
+            "symbol": trade["symbol"],
+            "side": trade["side"],
+            "entry": trade["entry"],
+            "tp1": trade["tp1"],
+            "tp2": trade["tp2"],
+            "original_sl": trade["original_sl"],
+            "protected_sl_price": trade["protected_sl_price"],
+            "profit_protected": True,
+        })
+
     signal = result.get("signal")
 
     is_buy_trade = signal == "BUY"
     is_sell_trade = signal == "SELL"
+
+    active_trades = [
+        trade for trade in list(PAPER_ACTIVE_TRADES)
+        if trade.get("symbol") == symbol
+        and str(trade.get("status", "")).upper() == "OPEN"
+    ]
+
+    for trade in active_trades:
+        side = trade["side"]
+        entry = trade["entry"]
+        sl = trade["sl"]
+        tp1 = trade["tp1"]
+        tp2 = trade["tp2"]
+
+        numeric_current_price = float(current_price)
+
+        if close_stale_paper_trade(
+            symbol,
+            trade,
+            numeric_current_price,
+            calc_pips
+        ):
+            continue
+
+        trade["pips"] = calc_pips(
+            symbol,
+            side,
+            entry,
+            numeric_current_price
+        )
+
+        numeric_current_low = float(
+            current_low
+            if current_low is not None
+            else result.get("current_low", numeric_current_price)
+        )
+        numeric_current_high = float(
+            current_high
+            if current_high is not None
+            else result.get("current_high", numeric_current_price)
+        )
+
+        if side == "BUY":
+            if numeric_current_high >= tp2:
+                trade["status"] = "CLOSED"
+                trade["result"] = "WIN"
+            elif numeric_current_high >= tp1:
+                protect_trade_after_tp1(trade)
+
+            if trade["status"] != "CLOSED" and numeric_current_low <= trade["sl"]:
+                trade["status"] = "CLOSED"
+                trade["result"] = (
+                    "WIN" if trade.get("profit_protected") else "LOSS"
+                )
+
+        if side == "SELL":
+            if numeric_current_low <= tp2:
+                trade["status"] = "CLOSED"
+                trade["result"] = "WIN"
+            elif numeric_current_low <= tp1:
+                protect_trade_after_tp1(trade)
+
+            if trade["status"] != "CLOSED" and numeric_current_high >= trade["sl"]:
+                trade["status"] = "CLOSED"
+                trade["result"] = (
+                    "WIN" if trade.get("profit_protected") else "LOSS"
+                )
+
+        update_open_paper_history(symbol, trade)
+
+        if trade["status"] == "CLOSED":
+            trade["closed_at"] = datetime.now(timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S UTC"
+            )
+            trade["closed_price"] = numeric_current_price
+            trade["pips"] = calc_pips(
+                symbol,
+                side,
+                entry,
+                numeric_current_price
+            )
+
+            update_open_paper_history(symbol, trade)
+            remove_active_paper_trade(trade)
+            save_paper_backup()
+            print("PAPER CLOSED:", trade)
+
     # OPEN NEW TRADE
-    if trade is None and (is_buy_trade or is_sell_trade):
+    if is_buy_trade or is_sell_trade:
         entry = result.get("entry_price")
         sl = result.get("stop_loss")
         tp1 = result.get("tp1")
@@ -1721,15 +3250,101 @@ def update_paper_trade(
             return
 
         side = "BUY" if is_buy_trade else "SELL"
+        signal_key = get_paper_signal_key(symbol, side, result)
+        setup_lock_key = get_paper_setup_lock_key(symbol, side, result)
+        level_lock_key = get_paper_level_lock_key(symbol, side, result)
+
+        if has_open_paper_trade_for_symbol(symbol):
+            print("PAPER BLOCKED:", {
+                "symbol": symbol,
+                "side": side,
+                "reason": "active paper trade already running for symbol",
+                "signal_key": signal_key,
+            })
+            return
+
+        existing_setup_lock = get_existing_paper_setup_lock(
+            symbol,
+            side,
+            setup_lock_key,
+            level_lock_key,
+            signal_key,
+        )
+
+        if existing_setup_lock or has_seen_paper_signal(symbol, side, signal_key):
+            print("PAPER BLOCKED:", {
+                "symbol": symbol,
+                "side": side,
+                "reason": "paper setup already handled",
+                "setup_lock_key": setup_lock_key,
+                "level_lock_key": level_lock_key,
+                "signal_key": signal_key,
+                "previous_trade_id": (
+                    existing_setup_lock.get("trade_id")
+                    if isinstance(existing_setup_lock, dict)
+                    else None
+                ),
+            })
+            return
+
+        cooling_down, cooldown_age = is_paper_reentry_cooling_down(symbol, side)
+
+        if cooling_down:
+            print("PAPER BLOCKED:", {
+                "symbol": symbol,
+                "side": side,
+                "reason": "paper re-entry cooldown active",
+                "cooldown_seconds": PAPER_REENTRY_COOLDOWN_SECONDS,
+                "age_seconds": round(cooldown_age or 0, 1),
+                "signal_key": signal_key,
+            })
+            return
+
+        decimals = 5 if symbol == "EURUSD" else 2
+
+        try:
+            entry_value = float(entry)
+            tp2_value = float(tp2)
+            tp1 = round(calculate_tp1(entry_value, tp2_value, side), decimals)
+        except (TypeError, ValueError):
+            print("PAPER BLOCKED:", symbol, signal, entry, sl, tp1, tp2)
+            return
+
+        normalized = normalize_trade_levels(
+            symbol,
+            side,
+            entry,
+            sl,
+            tp1,
+            tp2
+        )
+
+        if not normalized.get("ok"):
+            print(
+                "PAPER BLOCKED:",
+                symbol,
+                side,
+                entry,
+                sl,
+                tp1,
+                tp2,
+                normalized.get("reason")
+            )
+            return
 
         new_trade = {
+            "trade_id": f"paper-{uuid.uuid4()}",
+            "signal_key": signal_key,
+            "setup_lock_key": setup_lock_key,
+            "level_lock_key": level_lock_key,
             "symbol": symbol,
             "side": side,
             "source": "paper",
-            "entry": float(entry),
-            "sl": float(sl),
-            "tp1": float(tp1),
-            "tp2": float(tp2),
+            "entry": normalized["entry"],
+            "sl": normalized["sl"],
+            "original_sl": normalized["sl"],
+            "tp1": normalized["tp1"],
+            "tp2": normalized["tp2"],
             "opened_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
             "closed_at": None,
             "closed_price": None,
@@ -1737,86 +3352,33 @@ def update_paper_trade(
             "result": "RUNNING",
             "pips": 0,
             "hit_tp1": False,
+            "profit_protected": False,
+            "protected_sl_price": None,
         }
 
-        AUTO_TRADES[symbol] = new_trade
+        PAPER_ACTIVE_TRADES.append(new_trade)
+        remember_paper_setup_lock(new_trade)
+        refresh_paper_trade_summary(symbol)
         PAPER_TRADE_HISTORY.append(new_trade.copy())
-
-        if len(PAPER_TRADE_HISTORY) > 50:
-            PAPER_TRADE_HISTORY.pop(0)
+        trim_paper_trade_history()
 
         save_paper_backup()
 
+        print("PAPER OPEN GUARD:", {
+            "symbol": symbol,
+            "side": side,
+            "trade_id": new_trade["trade_id"],
+            "strategy_setup_complete": result.get("strategy_setup_complete"),
+            "duplicate_signal_allowed": False,
+            "active_symbol_trade_count": sum(
+                1 for active_trade in PAPER_ACTIVE_TRADES
+                if active_trade.get("symbol") == symbol
+            ),
+        })
         print("PAPER OPENED:", new_trade)
         return
 
-    if trade is None:
-        return
-
-    side = trade["side"]
-    entry = trade["entry"]
-    sl = trade["sl"]
-    tp1 = trade["tp1"]
-    tp2 = trade["tp2"]
-
-    current_price = float(current_price)
-
-    if close_stale_paper_trade(symbol, trade, current_price, calc_pips):
-        return
-
-    # UPDATE RUNNING PIPS
-    trade["pips"] = calc_pips(symbol, side, entry, current_price)
-
-    # MANAGE BUY
-    current_low = float(
-        current_low
-        if current_low is not None
-        else result.get("current_low", current_price)
-    )
-    current_high = float(
-        current_high
-        if current_high is not None
-        else result.get("current_high", current_price)
-    )
-
-    if side == "BUY":
-        if current_low <= trade["sl"]:
-            trade["status"] = "CLOSED"
-            trade["result"] = "LOSS"
-        elif current_high >= trade["tp2"]:
-            trade["status"] = "CLOSED"
-            trade["result"] = "WIN"
-        elif current_high >= trade["tp1"]:
-            trade["result"] = "TP1 HIT"
-
-    # MANAGE SELL
-    if side == "SELL":
-        if current_high >= trade["sl"]:
-            trade["status"] = "CLOSED"
-            trade["result"] = "LOSS"
-        elif current_low <= trade["tp2"]:
-            trade["status"] = "CLOSED"
-            trade["result"] = "WIN"
-        elif current_low <= trade["tp1"]:
-            trade["result"] = "TP1 HIT"
-
-    # UPDATE HISTORY WHILE RUNNING
-    update_open_paper_history(symbol, trade)
-
-    # CLOSE TRADE
-    if trade["status"] == "CLOSED":
-        trade["closed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        trade["closed_price"] = current_price
-        trade["pips"] = calc_pips(symbol, side, entry, current_price)
-
-        update_open_paper_history(symbol, trade)
-
-        print("PAPER CLOSED:", trade)
-
-        AUTO_TRADES[symbol] = None
-        save_paper_backup()
-
-def get_signal(data, htf_data, symbol):
+def get_signal(data, htf_data, symbol, state_key=None):
     if data.empty or len(data) < 30:
         return {
             "signal": "WAIT",
@@ -1838,6 +3400,12 @@ def get_signal(data, htf_data, symbol):
     open_ = data["Open"]
     high = data["High"]
     low = data["Low"]
+    setup_candle_time = None
+
+    try:
+        setup_candle_time = pd.Timestamp(data.index[-1]).isoformat()
+    except Exception:
+        setup_candle_time = None
 
     c1 = close.iloc[-1].item()
     o1 = open_.iloc[-1].item()
@@ -1897,6 +3465,8 @@ def get_signal(data, htf_data, symbol):
         swing_structure,
         smc_swings
     ) = detect_swing_liquidity(data)
+    fifteen_m_structure = detect_hh_hl_lh_ll_structure(data)
+    fifteen_m_pattern = fifteen_m_structure.get("structure")
 
     recent_high = (
         prev_swing_high
@@ -1966,27 +3536,80 @@ def get_signal(data, htf_data, symbol):
 
     bullish_choch = (
         htf_structure in ["BEARISH", "NEUTRAL"]
-        and h1 > recent_high
+        and c1 > recent_high
         and c1 > o1
     )
 
     bearish_choch = (
         htf_structure in ["BULLISH", "NEUTRAL"]
-        and l1 < recent_low
+        and c1 < recent_low
         and c1 < o1
     )
 
     bullish_bos = (
         htf_structure == "BULLISH"
-        and h1 > recent_high
+        and c1 > recent_high
         and c1 > o1
     )
 
     bearish_bos = (
         htf_structure == "BEARISH"
-        and l1 < recent_low
+        and c1 < recent_low
         and c1 < o1
     )
+
+    ema9 = close.ewm(span=9).mean().iloc[-1].item()
+    ema21 = close.ewm(span=21).mean().iloc[-1].item()
+    ema50 = close.ewm(span=50).mean().iloc[-1].item()
+    recent_pressure, recent_pressure_score = detect_recent_pressure(data, symbol)
+    momentum_strength, momentum_score = detect_momentum_strength(data, symbol)
+    zone_position, zone_score, pd_high, pd_low, _pd_price = detect_pd_zone(data)
+    choch_signal = (
+        "BULLISH" if bullish_choch
+        else "BEARISH" if bearish_choch
+        else "NONE"
+    )
+    market_condition = detect_market_condition(data, ema9, ema21, ema50)
+    market_state = detect_market_state(data, ema9, ema21, ema50, choch_signal)
+    eurusd_recovery_setup = (
+        symbol == "EURUSD"
+        and htf_structure == "BEARISH"
+        and choch_signal == "BULLISH"
+        and recent_pressure == "BULLISH"
+        and c1 > ema21
+    )
+    score_contribution_debug = {
+        "symbol": symbol,
+        "htf_structure": htf_structure,
+        "fifteen_m_pattern": fifteen_m_pattern,
+        "fifteen_m_last_high": fifteen_m_structure.get("last_high"),
+        "fifteen_m_last_low": fifteen_m_structure.get("last_low"),
+        "choch_signal": choch_signal,
+        "recent_pressure": recent_pressure,
+        "momentum_strength": momentum_strength,
+        "zone_position": zone_position,
+        "market_state": market_state,
+        "mtf_bias": mtf_bias,
+        "mtf_score": mtf_score,
+        "bullish_fvg": bullish_fvg,
+        "bearish_fvg": bearish_fvg,
+        "bullish_bos": bullish_bos,
+        "bearish_bos": bearish_bos,
+        "bullish_choch": bullish_choch,
+        "bearish_choch": bearish_choch,
+        "bullish_displacement": bullish_displacement,
+        "bearish_displacement": bearish_displacement,
+        "displacement_score": displacement_score,
+        "ema21_reclaimed": c1 > ema21,
+        "eurusd_recovery_setup": eurusd_recovery_setup,
+        "penalties": {
+            "htf_bearish_penalty": 0,
+            "sell_holding_penalty": 0,
+            "bearish_fvg_penalty": 0,
+            "structure_weighting_penalty": 0,
+        },
+        "branch": None,
+    }
 
         # =========================
     # RECENT BOS MEMORY AFTER RESTART
@@ -1997,10 +3620,10 @@ def get_signal(data, htf_data, symbol):
     recent_bear_break = False
 
     for _, candle in recent_lookback.iterrows():
-        if candle["High"] > recent_high and candle["Close"] > candle["Open"]:
+        if candle["Close"] > recent_high and candle["Close"] > candle["Open"]:
             recent_bull_break = True
 
-        if candle["Low"] < recent_low and candle["Close"] < candle["Open"]:
+        if candle["Close"] < recent_low and candle["Close"] < candle["Open"]:
             recent_bear_break = True
 
     # Do NOT force BOS from tiny recent candles.
@@ -2035,6 +3658,15 @@ def get_signal(data, htf_data, symbol):
     entry_timing = "WAIT"
     plan_type = "WAIT FOR BOS"
     plan_side = "WAIT"
+    smc_branch = None
+    dynamic_score_components = None
+    hardcoded_score_removed = False
+    breakout_entry_allowed = False
+    breakout_plan_reason = None
+    smc_breakout_debug = []
+    momentum_breakout_debug = []
+    strategy_setup_complete = False
+    strategy_setup_type = None
 
     if bullish_sweep:
         reasons.append("Bullish liquidity sweep detected")
@@ -2045,7 +3677,7 @@ def get_signal(data, htf_data, symbol):
     if fake_breakout != "NONE":
       reasons.append(fake_breakout)
 
-    state = SMC_STATE[symbol]
+    state = SMC_STATE.setdefault(state_key or symbol, create_smc_state())
         # =========================
     # 🔄 STRUCTURE FLIP RESET
     # =========================
@@ -2053,6 +3685,10 @@ def get_signal(data, htf_data, symbol):
         state["pending"] = "BUY"
         state["bos_level"] = recent_high
         state["sweep_level"] = swing_low
+        state["retest_seen"] = False
+        state["entry_confirm_level"] = recent_high
+        state["setup_candle_time"] = setup_candle_time
+        state["structure_pattern"] = fifteen_m_pattern
         state["stage"] = "BUY_READY"
         reasons.append("State flipped from SELL to BUY")
 
@@ -2060,6 +3696,10 @@ def get_signal(data, htf_data, symbol):
         state["pending"] = "SELL"
         state["bos_level"] = recent_low
         state["sweep_level"] = swing_high
+        state["retest_seen"] = False
+        state["entry_confirm_level"] = recent_low
+        state["setup_candle_time"] = setup_candle_time
+        state["structure_pattern"] = fifteen_m_pattern
         state["stage"] = "SELL_READY"
         reasons.append("State flipped from BUY to SELL")
 
@@ -2071,12 +3711,20 @@ def get_signal(data, htf_data, symbol):
             state["pending"] = "BUY"
             state["bos_level"] = recent_high
             state["sweep_level"] = swing_low
+            state["retest_seen"] = False
+            state["entry_confirm_level"] = recent_high
+            state["setup_candle_time"] = setup_candle_time
+            state["structure_pattern"] = fifteen_m_pattern
             reasons.append("Bullish CHOCH/BOS saved")
 
         elif bearish_choch or bearish_bos:
             state["pending"] = "SELL"
             state["bos_level"] = recent_low
             state["sweep_level"] = swing_high
+            state["retest_seen"] = False
+            state["entry_confirm_level"] = recent_low
+            state["setup_candle_time"] = setup_candle_time
+            state["structure_pattern"] = fifteen_m_pattern
             reasons.append("Bearish CHOCH/BOS saved")
 
         # =========================
@@ -2087,6 +3735,19 @@ def get_signal(data, htf_data, symbol):
         in_buy_retest_zone = (
     c1 > state["bos_level"] - retest_buffer
 )
+        buy_retest_touched = (
+            l1 <= state["bos_level"] + retest_buffer
+            and c1 >= state["bos_level"] - retest_buffer
+        )
+        if buy_retest_touched:
+            state["retest_seen"] = True
+
+        buy_close_confirmed = (
+            state.get("retest_seen")
+            and c1 >= (state.get("entry_confirm_level") or state["bos_level"])
+            and c1 > o1
+            and state.get("structure_pattern") in ["HH_HL", "NEUTRAL"]
+        )
         buy_displacement = (
                 c1 > o1
                 and c1 > state["bos_level"] - (retest_buffer * 0.3)
@@ -2100,7 +3761,7 @@ def get_signal(data, htf_data, symbol):
             and ((c1 - o1) / (h1 - l1)) >= 0.60
         )
 
-        if in_buy_retest_zone:
+        if in_buy_retest_zone and buy_close_confirmed:
 
             if (
                 bullish_choch
@@ -2111,9 +3772,32 @@ def get_signal(data, htf_data, symbol):
 
                 final_signal = "BUY"
 
-                buy_score = 88
-                sell_score = 8
-                confidence = 82
+                dynamic_scores = calculate_dynamic_smc_retest_scores(
+                    "BUY",
+                    symbol,
+                    htf_structure,
+                    choch_signal,
+                    bullish_bos,
+                    bearish_bos,
+                    displacement_score,
+                    bullish_displacement,
+                    bearish_displacement,
+                    recent_pressure,
+                    momentum_strength,
+                    zone_position,
+                    session_active,
+                    abs(c1 - state["bos_level"]),
+                    retest_buffer,
+                    abs(c1 - o1),
+                    h1 - l1,
+                    fake_breakout,
+                )
+                buy_score = dynamic_scores["buy_score"]
+                sell_score = dynamic_scores["sell_score"]
+                confidence = dynamic_scores["confidence"]
+                smc_branch = "SMC_BUY_RETEST"
+                dynamic_score_components = dynamic_scores["components"]
+                hardcoded_score_removed = True
 
                 entry_quality = "SMC"
                 entry_timing = "CHOCH/BOS RETEST"
@@ -2123,6 +3807,9 @@ def get_signal(data, htf_data, symbol):
 
                 state["pending"] = None
                 state["stage"] = "BUY_ACTIVE"
+                state["retest_seen"] = False
+                strategy_setup_complete = True
+                strategy_setup_type = "BUY_RETEST"
 
             else:
                 state["stage"] = "BUY_READY"
@@ -2135,130 +3822,23 @@ def get_signal(data, htf_data, symbol):
                 sell_score = 10
                 confidence = 55
 
-        elif (
-            (
-                (in_buy_retest_zone and buy_displacement)
-                or buy_no_retest_momentum
-                or
-                (
-                    state["stage"] == "BUY_READY"
-                    and c1 > state["bos_level"]
-                    and c1 > state["bos_level"]
-                )
-            )
-           and not (
-                    htf_structure == "BEARISH"
-                    and recent_pressure != "BULLISH"
-                    and momentum_strength == "WEAK"
-                    and not bullish_bos
-                    and not bullish_choch
-                )
-            ):
-            distance_from_bos = c1 - state["bos_level"]
-            # =========================
-            # ANTI-FOMO FILTER
-            # =========================
-
-            recent_candle_range = h1 - l1
-            recent_body = abs(c1 - o1)
-
-            weak_breakout = (
-                recent_body < (recent_candle_range * 0.35)
-            )
-
-            too_extended = (
-                distance_from_bos > late_entry_distance
-            )
-
-            buying_into_liquidity = (
-                nearest_buy_liquidity is not None
-                and abs(nearest_buy_liquidity - c1) <= retest_buffer
-            )
-
-            if too_extended or weak_breakout or buying_into_liquidity:
-                final_signal = "WAIT"
-                buy_score = 75
-                sell_score = 10
-                confidence = 70
-                entry_quality = "LATE"
-                entry_timing = "WAIT PULLBACK"
+        elif buy_no_retest_momentum:
+            plan_type = "WAIT BUY RETEST OR STRONG BREAKOUT"
+            plan_side = "WAIT"
+            entry_timing = "WAIT BREAKOUT QUALITY"
+            buy_score = 65
+            sell_score = 12
+            confidence = 52
+            reasons.append("Bullish break exists, waiting for retest or stronger breakout confirmation")
+        else:
+            if state["stage"] in ["BUY_READY", "BUY_ACTIVE"] and state.get("retest_seen"):
                 plan_type = "BUY HOLDING"
                 plan_side = "WAIT"
-                reasons.append("Bullish trend active but entry is late")
-            else:
-                if fake_breakout == "FAKE_BULL_BREAKOUT":
-                    final_signal = "WAIT"
-                    buy_score = 25
-                    sell_score = 65
-                    confidence = 72
-                    entry_quality = "FAKE"
-                    entry_timing = "FAKE BUY BREAKOUT"
-                    plan_type = "FAKE BUY BREAKOUT"
-                    plan_side = "WAIT"
-                    reasons.append("Buy blocked: fake bullish breakout")
-
-                elif mtf_bias == "BEARISH":
-                    final_signal = "WAIT"
-                    buy_score = 55
-                    sell_score = 35
-                    confidence = 58
-                    entry_quality = "CONFLICT"
-                    entry_timing = "WAIT MTF ALIGNMENT"
-                    plan_type = "BUY CONFLICT WITH HTF"
-                    plan_side = "WAIT"
-                    reasons.append(f"BUY blocked by MTF bearish bias ({mtf_score})")
-
-                elif not bullish_displacement and confidence < 55:
-                    final_signal = "WAIT"
-                    buy_score = 72
-                    sell_score = 8
-                    confidence = 66
-                    entry_quality = "WEAK"
-                    entry_timing = "WAIT DISPLACEMENT"
-                    plan_type = "WAIT BULLISH DISPLACEMENT"
-                    plan_side = "WAIT"
-                    reasons.append(f"Weak bullish displacement: {displacement}")
-
-                if not session_active:
-                    final_signal = "WAIT"
-                    buy_score = 70
-                    sell_score = 8
-                    confidence = 62
-                    entry_quality = "WAIT"
-                    entry_timing = "WAIT SESSION"
-                    plan_type = "WAIT SESSION"
-                    plan_side = "WAIT"
-                    reasons.append(f"Session inactive: {session_name}")
-
-                else:
-                    final_signal = "BUY"
-                    buy_score = 94 if bullish_fvg else 92
-                    sell_score = 8
-                    confidence = calculate_smart_confidence(
-                        session_active,
-                        bullish_fvg,
-                        bearish_fvg,
-                        bullish_displacement,
-                        bearish_displacement,
-                        fake_breakout,
-                        mtf_bias,
-                        "BUY"
-                    )
-                    entry_quality = "FVG" if bullish_fvg else "BOS"
-                    entry_timing = "FVG BUY ENTRY" if bullish_fvg else "BOS BUY ENTRY"
-                    plan_type = "FVG BUY" if bullish_fvg else "BOS BUY"
-                    plan_side = "BUY"
-                    state["pending"] = None
-                    state["stage"] = "BUY_ACTIVE"
-                    state["last_idea"] = "BUY"
-        else:
-            if state["stage"] in ["BUY_READY", "BUY_ACTIVE"] and c1 > state["bos_level"] - retest_buffer:
-                plan_type = "BUY HOLDING"
-                plan_side = "BUY"
-                entry_timing = "BUY HOLDING"
+                entry_timing = "WAIT 15M CLOSE ABOVE LAST HIGH"
                 buy_score = 75
                 sell_score = 10
                 confidence = 70
+                reasons.append("Retest seen; waiting 15m close above last high")
             else:
                 plan_type = "WAIT BUY RETEST"
                 plan_side = "WAIT"
@@ -2271,6 +3851,19 @@ def get_signal(data, htf_data, symbol):
         in_sell_retest_zone = (
     c1 < state["bos_level"] + retest_buffer
 )
+        sell_retest_touched = (
+            h1 >= state["bos_level"] - retest_buffer
+            and c1 <= state["bos_level"] + retest_buffer
+        )
+        if sell_retest_touched:
+            state["retest_seen"] = True
+
+        sell_close_confirmed = (
+            state.get("retest_seen")
+            and c1 <= (state.get("entry_confirm_level") or state["bos_level"])
+            and c1 < o1
+            and state.get("structure_pattern") in ["LH_LL", "NEUTRAL"]
+        )
         sell_displacement = (
             c1 < o1
             and c1 < state["bos_level"] + (retest_buffer * 0.3)
@@ -2284,7 +3877,7 @@ def get_signal(data, htf_data, symbol):
             and ((o1 - c1) / (h1 - l1)) >= 0.60
         )
 
-        if in_sell_retest_zone:
+        if in_sell_retest_zone and sell_close_confirmed:
 
             if (
                 bearish_choch
@@ -2295,9 +3888,32 @@ def get_signal(data, htf_data, symbol):
 
                 final_signal = "SELL"
 
-                buy_score = 8
-                sell_score = 88
-                confidence = 82
+                dynamic_scores = calculate_dynamic_smc_retest_scores(
+                    "SELL",
+                    symbol,
+                    htf_structure,
+                    choch_signal,
+                    bullish_bos,
+                    bearish_bos,
+                    displacement_score,
+                    bullish_displacement,
+                    bearish_displacement,
+                    recent_pressure,
+                    momentum_strength,
+                    zone_position,
+                    session_active,
+                    abs(c1 - state["bos_level"]),
+                    retest_buffer,
+                    abs(c1 - o1),
+                    h1 - l1,
+                    fake_breakout,
+                )
+                buy_score = dynamic_scores["buy_score"]
+                sell_score = dynamic_scores["sell_score"]
+                confidence = dynamic_scores["confidence"]
+                smc_branch = "SMC_SELL_RETEST"
+                dynamic_score_components = dynamic_scores["components"]
+                hardcoded_score_removed = True
 
                 entry_quality = "SMC"
                 entry_timing = "CHOCH/BOS RETEST"
@@ -2307,6 +3923,9 @@ def get_signal(data, htf_data, symbol):
 
                 state["pending"] = None
                 state["stage"] = "SELL_ACTIVE"
+                state["retest_seen"] = False
+                strategy_setup_complete = True
+                strategy_setup_type = "SELL_RETEST"
 
             else:
                 state["stage"] = "SELL_READY"
@@ -2315,105 +3934,46 @@ def get_signal(data, htf_data, symbol):
                 plan_side = "WAIT"
                 entry_timing = "SELL READY"
 
-                buy_score = 10
-                sell_score = 65
-                confidence = 55
-        elif (
-                (
-                    (in_sell_retest_zone and sell_displacement)
-                    or sell_no_retest_momentum
-                    or (
-                        state["stage"] == "SELL_READY"
-                        and c1 < state["bos_level"]
-                        and c1 < o1
-                    )
-                )
-                and not (
-                        htf_structure == "BULLISH"
-                        and recent_pressure != "BEARISH"
-                        and momentum_strength == "WEAK"
-                        and not bearish_bos
-                        and not bearish_choch
-                    )
-            ):
-            distance_from_bos = state["bos_level"] - c1
-
-            selling_into_liquidity = (
-                nearest_sell_liquidity is not None
-                and abs(c1 - nearest_sell_liquidity) <= retest_buffer
-            )
-
-            if distance_from_bos > late_entry_distance or selling_into_liquidity:
-                final_signal = "WAIT"
-                buy_score = 10
-                sell_score = 75
-                confidence = 70
-                entry_quality = "LATE"
-                entry_timing = "WAIT PULLBACK"
+                if eurusd_recovery_setup:
+                    buy_score = 35
+                    sell_score = 50
+                    confidence = 52
+                    score_contribution_debug["branch"] = "EURUSD_RECOVERY_SOFTENED_SELL_READY"
+                    score_contribution_debug["penalties"]["sell_holding_penalty"] = -15
+                    reasons.append("EURUSD recovery: reduced sell ready penalty")
+                else:
+                    buy_score = 10
+                    sell_score = 65
+                    confidence = 55
+                    score_contribution_debug["branch"] = "SELL_READY"
+                    score_contribution_debug["penalties"]["sell_holding_penalty"] = -55
+        elif sell_no_retest_momentum:
+            plan_type = "WAIT SELL RETEST OR STRONG BREAKOUT"
+            plan_side = "WAIT"
+            entry_timing = "WAIT BREAKOUT QUALITY"
+            buy_score = 12
+            sell_score = 65
+            confidence = 52
+            reasons.append("Bearish break exists, waiting for retest or stronger breakout confirmation")
+        else:
+            if state["stage"] in ["SELL_READY", "SELL_ACTIVE"] and state.get("retest_seen"):
                 plan_type = "SELL HOLDING"
                 plan_side = "WAIT"
-                reasons.append("Bearish trend active but entry is late")
-            else:
-                if fake_breakout == "FAKE_BEAR_BREAKOUT":
-                    final_signal = "WAIT"
-                    buy_score = 65
-                    sell_score = 25
-                    confidence = 72
-                    entry_quality = "FAKE"
-                    entry_timing = "FAKE SELL BREAKOUT"
-                    plan_type = "FAKE SELL BREAKOUT"
-                    plan_side = "WAIT"
-                    reasons.append("Sell blocked: fake bearish breakout")
-
-                elif mtf_bias == "BULLISH" and not bearish_bos and not bearish_choch:
-                    final_signal = "WAIT"
+                entry_timing = "WAIT 15M CLOSE BELOW LAST LOW"
+                if eurusd_recovery_setup:
                     buy_score = 35
                     sell_score = 55
                     confidence = 58
-                    entry_quality = "CONFLICT"
-                    entry_timing = "WAIT MTF ALIGNMENT"
-                    plan_type = "SELL CONFLICT WITH HTF"
-                    plan_side = "WAIT"
-                    reasons.append(f"SELL blocked by MTF bullish bias ({mtf_score})")
-                elif not bearish_displacement and confidence < 55 and not bearish_bos and not bearish_choch:
-                    final_signal = "WAIT"
-                    buy_score = 8
-                    sell_score = 70
-                    confidence = 62
-                    entry_quality = "WAIT"
-                    entry_timing = "WAIT DISPLACEMENT"
-                    plan_type = "WAIT BEARISH DISPLACEMENT"
-                    plan_side = "WAIT"
-                    reasons.append(f"Weak bearish displacement: {displacement}")
+                    score_contribution_debug["branch"] = "EURUSD_RECOVERY_SOFTENED_SELL_HOLDING_RETEST"
+                    score_contribution_debug["penalties"]["sell_holding_penalty"] = -20
+                    reasons.append("EURUSD recovery: reduced sell holding penalty")
                 else:
-                    final_signal = "SELL"
-                    buy_score = 8
-                    sell_score = 94 if bearish_fvg else 92
-                    confidence = calculate_smart_confidence(
-                        session_active,
-                        bullish_fvg,
-                        bearish_fvg,
-                        bullish_displacement,
-                        bearish_displacement,
-                        fake_breakout,
-                        mtf_bias,
-                        "SELL"
-                    )
-                    entry_quality = "FVG" if bearish_fvg else "BOS"
-                    entry_timing = "FVG SELL ENTRY" if bearish_fvg else "BOS SELL ENTRY"
-                    plan_type = "FVG SELL" if bearish_fvg else "BOS SELL"
-                    plan_side = "SELL"
-                    state["pending"] = None
-                    state["stage"] = "SELL_ACTIVE"
-                    state["last_idea"] = "SELL"
-        else:
-            if state["stage"] in ["SELL_READY", "SELL_ACTIVE"] and c1 < state["bos_level"] + retest_buffer:
-                plan_type = "SELL HOLDING"
-                plan_side = "SELL"
-                entry_timing = "SELL HOLDING"
-                buy_score = 10
-                sell_score = 75
-                confidence = 70
+                    buy_score = 10
+                    sell_score = 75
+                    confidence = 70
+                    score_contribution_debug["branch"] = "SELL_HOLDING_RETEST"
+                    score_contribution_debug["penalties"]["sell_holding_penalty"] = -65
+                reasons.append("Retest seen; waiting 15m close below last low")
             else:
                 plan_type = "WAIT SELL RETEST"
                 plan_side = "WAIT"
@@ -2451,18 +4011,28 @@ def get_signal(data, htf_data, symbol):
             and state["bos_level"] is not None
             and c1 < state["bos_level"] + retest_buffer
         ):
-            final_signal = "SELL"
+            final_signal = "WAIT"
 
-            buy_score = 10
-            sell_score = 75
-            confidence = 70
+            if eurusd_recovery_setup:
+                buy_score = 35
+                sell_score = 55
+                confidence = 58
+                score_contribution_debug["branch"] = "EURUSD_RECOVERY_SOFTENED_SELL_HOLDING_MEMORY"
+                score_contribution_debug["penalties"]["sell_holding_penalty"] = -20
+                reasons.append("EURUSD recovery: reduced sell holding penalty")
+            else:
+                buy_score = 10
+                sell_score = 75
+                confidence = 70
+                score_contribution_debug["branch"] = "SELL_HOLDING_MEMORY"
+                score_contribution_debug["penalties"]["sell_holding_penalty"] = -65
 
             entry_quality = "HOLDING"
-            entry_timing = "SELL HOLDING"
+            entry_timing = "WAIT SELL COMPLETION"
 
             plan_type = "SELL HOLDING"
             plan_side = "WAIT"
-            reasons.append("Bearish trend still active")
+            reasons.append("Bearish trend active; waiting for completed 15m setup")
 
         else:
 
@@ -2500,10 +4070,298 @@ def get_signal(data, htf_data, symbol):
                 entry_timing = "WAIT"
 
             plan_side = "WAIT"
+
+    # =========================
+    # CONTROLLED SMC BREAKOUT ENTRY
+    # Retest remains preferred. This only opens a clean displacement BOS
+    # when price does not give a retest.
+    # =========================
+    if symbol == "EURUSD":
+        stretch_ema9 = 0.0012
+        stretch_ema21 = 0.0018
+    else:
+        stretch_ema9 = 6.0
+        stretch_ema21 = 9.0
+
+    provisional_buy_score = max(
+        buy_score,
+        62
+        + (10 if bullish_bos or bullish_choch else 0)
+        + (8 if bullish_displacement else 0)
+        + (6 if recent_pressure == "BULLISH" else 0)
+        + (4 if bullish_fvg else 0)
+    )
+    provisional_sell_score = max(
+        sell_score,
+        62
+        + (10 if bearish_bos or bearish_choch else 0)
+        + (8 if bearish_displacement else 0)
+        + (6 if recent_pressure == "BEARISH" else 0)
+        + (4 if bearish_fvg else 0)
+    )
+    provisional_buy_confidence = max(
+        confidence,
+        calculate_smart_confidence(
+            session_active,
+            bullish_fvg,
+            bearish_fvg,
+            bullish_displacement,
+            bearish_displacement,
+            fake_breakout,
+            mtf_bias,
+            "BUY",
+        ) if bullish_bos or bullish_choch else confidence
+    )
+    provisional_sell_confidence = max(
+        confidence,
+        calculate_smart_confidence(
+            session_active,
+            bullish_fvg,
+            bearish_fvg,
+            bullish_displacement,
+            bearish_displacement,
+            fake_breakout,
+            mtf_bias,
+            "SELL",
+        ) if bearish_bos or bearish_choch else confidence
+    )
+
+    # =========================
+    # MOMENTUM BREAKOUT ENTRY
+    # Retest remains preferred. This second path handles clean, high-score
+    # breaks that continue without returning to the setup level.
+    # =========================
+    momentum_stretched_ok = (
+        abs(c1 - ema9) <= stretch_ema9
+        and abs(c1 - ema21) <= stretch_ema21
+    )
+    momentum_buy_close_break_ok = c1 > recent_high
+    momentum_sell_close_break_ok = c1 < recent_low
+    momentum_buy_allowed = (
+        final_signal == "WAIT"
+        and momentum_buy_close_break_ok
+        and recent_pressure == "BULLISH"
+        and momentum_strength in ["MEDIUM", "STRONG"]
+        and provisional_buy_score >= SIMPLE_MOMENTUM_MIN_SCORE
+        and provisional_buy_confidence >= SIMPLE_MOMENTUM_MIN_CONFIDENCE
+        and fake_breakout == "NONE"
+    )
+    momentum_sell_allowed = (
+        final_signal == "WAIT"
+        and momentum_sell_close_break_ok
+        and recent_pressure == "BEARISH"
+        and momentum_strength in ["MEDIUM", "STRONG"]
+        and provisional_sell_score >= SIMPLE_MOMENTUM_MIN_SCORE
+        and provisional_sell_confidence >= SIMPLE_MOMENTUM_MIN_CONFIDENCE
+        and fake_breakout == "NONE"
+    )
+
+    if momentum_buy_allowed:
+        final_signal = "BUY"
+        buy_score = min(95, provisional_buy_score)
+        sell_score = max(5, min(sell_score, 25))
+        confidence = min(95, provisional_buy_confidence)
+        strategy_setup_complete = True
+        strategy_setup_type = "BUY_MOMENTUM_BREAKOUT"
+        plan_type = "SMC BUY MOMENTUM BREAKOUT"
+        entry_timing = "MOMENTUM BREAKOUT BUY"
+        plan_side = "BUY"
+        entry_quality = "SMC"
+        breakout_entry_allowed = True
+        smc_branch = "SMC_BUY_MOMENTUM_BREAKOUT"
+        breakout_plan_reason = "BUY momentum breakout accepted: retest not required"
+        state["pending"] = None
+        state["stage"] = "BUY_ACTIVE"
+        state["last_idea"] = "BUY"
+        reasons.append(breakout_plan_reason)
+
+    elif momentum_sell_allowed:
+        final_signal = "SELL"
+        buy_score = max(5, min(buy_score, 25))
+        sell_score = min(95, provisional_sell_score)
+        confidence = min(95, provisional_sell_confidence)
+        strategy_setup_complete = True
+        strategy_setup_type = "SELL_MOMENTUM_BREAKOUT"
+        plan_type = "SMC SELL MOMENTUM BREAKOUT"
+        entry_timing = "MOMENTUM BREAKOUT SELL"
+        plan_side = "SELL"
+        entry_quality = "SMC"
+        breakout_entry_allowed = True
+        smc_branch = "SMC_SELL_MOMENTUM_BREAKOUT"
+        breakout_plan_reason = "SELL momentum breakout accepted: retest not required"
+        state["pending"] = None
+        state["stage"] = "SELL_ACTIVE"
+        state["last_idea"] = "SELL"
+        reasons.append(breakout_plan_reason)
+
+    momentum_breakout_debug = [
+        {
+            "symbol": symbol,
+            "side": "BUY",
+            "bullish_bos": bullish_bos,
+            "bearish_bos": bearish_bos,
+            "bullish_choch": bullish_choch,
+            "bearish_choch": bearish_choch,
+            "recent_pressure": recent_pressure,
+            "momentum_strength": momentum_strength,
+            "buy_score": provisional_buy_score,
+            "sell_score": provisional_sell_score,
+            "confidence": provisional_buy_confidence,
+            "displacement_score": displacement_score,
+            "fake_breakout": fake_breakout,
+            "close_break_ok": momentum_buy_close_break_ok,
+            "stretched_ok": momentum_stretched_ok,
+            "allowed": momentum_buy_allowed,
+            "final_signal": final_signal,
+        },
+        {
+            "symbol": symbol,
+            "side": "SELL",
+            "bullish_bos": bullish_bos,
+            "bearish_bos": bearish_bos,
+            "bullish_choch": bullish_choch,
+            "bearish_choch": bearish_choch,
+            "recent_pressure": recent_pressure,
+            "momentum_strength": momentum_strength,
+            "buy_score": provisional_buy_score,
+            "sell_score": provisional_sell_score,
+            "confidence": provisional_sell_confidence,
+            "displacement_score": displacement_score,
+            "fake_breakout": fake_breakout,
+            "close_break_ok": momentum_sell_close_break_ok,
+            "stretched_ok": momentum_stretched_ok,
+            "allowed": momentum_sell_allowed,
+            "final_signal": final_signal,
+        },
+    ]
+
+    for momentum_debug in momentum_breakout_debug:
+        print("MOMENTUM_BREAKOUT_ENTRY_DEBUG", momentum_debug)
+
+    buy_bos_level = state.get("bos_level") if state.get("pending") == "BUY" else recent_high
+    sell_bos_level = state.get("bos_level") if state.get("pending") == "SELL" else recent_low
+
+    buy_score_ok = provisional_buy_score >= SIMPLE_MOMENTUM_MIN_SCORE
+    sell_score_ok = provisional_sell_score >= SIMPLE_MOMENTUM_MIN_SCORE
+    buy_confidence_ok = provisional_buy_confidence >= SIMPLE_MOMENTUM_MIN_CONFIDENCE
+    sell_confidence_ok = provisional_sell_confidence >= SIMPLE_MOMENTUM_MIN_CONFIDENCE
+    buy_displacement_ok = bullish_displacement or displacement_score >= 4
+    sell_displacement_ok = bearish_displacement or displacement_score >= 4
+    buy_pressure_ok = recent_pressure == "BULLISH"
+    sell_pressure_ok = recent_pressure == "BEARISH"
+    fake_breakout_ok = fake_breakout == "NONE"
+    buy_close_break_ok = (
+        bullish_bos
+        and c1 > recent_high
+        and (buy_bos_level is None or c1 > buy_bos_level)
+    )
+    sell_close_break_ok = (
+        bearish_bos
+        and c1 < recent_low
+        and (sell_bos_level is None or c1 < sell_bos_level)
+    )
+    stretched_ok = (
+        abs(c1 - ema9) <= stretch_ema9
+        and abs(c1 - ema21) <= stretch_ema21
+    )
+
+    buy_breakout_allowed = (
+        final_signal == "WAIT"
+        and bullish_bos
+        and buy_score_ok
+        and buy_confidence_ok
+        and buy_displacement_ok
+        and buy_pressure_ok
+        and fake_breakout_ok
+        and buy_close_break_ok
+    )
+    sell_breakout_allowed = (
+        final_signal == "WAIT"
+        and bearish_bos
+        and sell_score_ok
+        and sell_confidence_ok
+        and sell_displacement_ok
+        and sell_pressure_ok
+        and fake_breakout_ok
+        and sell_close_break_ok
+    )
+
+    if buy_breakout_allowed:
+        final_signal = "BUY"
+        buy_score = min(92, provisional_buy_score)
+        sell_score = max(5, min(sell_score, 25))
+        confidence = min(88, provisional_buy_confidence)
+        plan_type = "SMC BUY BREAKOUT"
+        entry_timing = "BOS BUY BREAKOUT"
+        plan_side = "BUY"
+        entry_quality = "SMC"
+        breakout_entry_allowed = True
+        breakout_plan_reason = "BUY after BOS breakout with strong displacement; retest not required"
+        smc_branch = "SMC_BUY_BREAKOUT"
+        state["pending"] = None
+        state["stage"] = "BUY_ACTIVE"
+        state["last_idea"] = "BUY"
+        strategy_setup_complete = True
+        strategy_setup_type = "BUY_BREAKOUT"
+        reasons.append(breakout_plan_reason)
+
+    elif sell_breakout_allowed:
+        final_signal = "SELL"
+        buy_score = max(5, min(buy_score, 25))
+        sell_score = min(92, provisional_sell_score)
+        confidence = min(88, provisional_sell_confidence)
+        plan_type = "SMC SELL BREAKOUT"
+        entry_timing = "BOS SELL BREAKOUT"
+        plan_side = "SELL"
+        entry_quality = "SMC"
+        breakout_entry_allowed = True
+        breakout_plan_reason = "SELL after BOS breakout with strong displacement; retest not required"
+        smc_branch = "SMC_SELL_BREAKOUT"
+        state["pending"] = None
+        state["stage"] = "SELL_ACTIVE"
+        state["last_idea"] = "SELL"
+        strategy_setup_complete = True
+        strategy_setup_type = "SELL_BREAKOUT"
+        reasons.append(breakout_plan_reason)
+
+    smc_breakout_debug = [
+        {
+            "symbol": symbol,
+            "side": "BUY",
+            "bos_confirmed": bullish_bos,
+            "score_ok": buy_score_ok,
+            "confidence_ok": buy_confidence_ok,
+            "displacement_ok": buy_displacement_ok,
+            "pressure_ok": buy_pressure_ok,
+            "fake_breakout": fake_breakout,
+            "close_break_ok": buy_close_break_ok,
+            "stretched_ok": stretched_ok,
+            "breakout_entry_allowed": buy_breakout_allowed,
+            "final_signal": final_signal,
+        },
+        {
+            "symbol": symbol,
+            "side": "SELL",
+            "bos_confirmed": bearish_bos,
+            "score_ok": sell_score_ok,
+            "confidence_ok": sell_confidence_ok,
+            "displacement_ok": sell_displacement_ok,
+            "pressure_ok": sell_pressure_ok,
+            "fake_breakout": fake_breakout,
+            "close_break_ok": sell_close_break_ok,
+            "stretched_ok": stretched_ok,
+            "breakout_entry_allowed": sell_breakout_allowed,
+            "final_signal": final_signal,
+        },
+    ]
+
+    for breakout_debug in smc_breakout_debug:
+        print("SMC_BREAKOUT_ENTRY_DEBUG =", breakout_debug)
+
     # =========================
     # EXIT IDEA LOGIC
     # =========================
-    if state.get("last_idea") == "SELL" and (bullish_choch or bullish_bos):
+    if final_signal == "WAIT" and state.get("last_idea") == "SELL" and (bullish_choch or bullish_bos):
         final_signal = "EXIT SELL"
         buy_score = 70
         sell_score = 20
@@ -2514,7 +4372,7 @@ def get_signal(data, htf_data, symbol):
         plan_side = "EXIT"
         state["last_idea"] = None
 
-    elif state.get("last_idea") == "BUY" and (bearish_choch or bearish_bos):
+    elif final_signal == "WAIT" and state.get("last_idea") == "BUY" and (bearish_choch or bearish_bos):
         final_signal = "EXIT BUY"
         buy_score = 20
         sell_score = 70
@@ -2525,31 +4383,230 @@ def get_signal(data, htf_data, symbol):
         plan_side = "EXIT"
         state["last_idea"] = None
 
+    if final_signal in ["BUY", "SELL"] and not strategy_setup_complete:
+        simple_momentum_completion = (
+            SIMPLE_MOMENTUM_MODE
+            and (
+                (
+                    final_signal == "BUY"
+                    and recent_pressure == "BULLISH"
+                    and momentum_strength in ["MEDIUM", "STRONG"]
+                    and buy_score >= SIMPLE_MOMENTUM_MIN_SCORE
+                    and confidence >= SIMPLE_MOMENTUM_MIN_CONFIDENCE
+                )
+                or
+                (
+                    final_signal == "SELL"
+                    and recent_pressure == "BEARISH"
+                    and momentum_strength in ["MEDIUM", "STRONG"]
+                    and sell_score >= SIMPLE_MOMENTUM_MIN_SCORE
+                    and confidence >= SIMPLE_MOMENTUM_MIN_CONFIDENCE
+                )
+            )
+        )
+
+        if simple_momentum_completion:
+            strategy_setup_complete = True
+            strategy_setup_type = f"{final_signal}_SIMPLE_MOMENTUM"
+            entry_quality = "SIMPLE_MOMENTUM"
+            entry_timing = f"SIMPLE MOMENTUM {final_signal}"
+            plan_type = f"SIMPLE MOMENTUM {final_signal}"
+            plan_side = final_signal
+            reasons.append("Simple Momentum Mode: completed without requiring perfect SMC retest")
+        else:
+            blocked_side = final_signal
+            final_signal = "WAIT"
+            plan_side = "WAIT"
+            entry_quality = "WAIT"
+            entry_timing = (
+                "WAIT RETEST OR STRONG BREAKOUT"
+                if blocked_side == "BUY"
+                else "WAIT RETEST OR STRONG BREAKOUT"
+            )
+            plan_type = (
+                "WAIT BUY SETUP COMPLETION"
+                if blocked_side == "BUY"
+                else "WAIT SELL SETUP COMPLETION"
+            )
+            reasons.append(
+                "Strategy incomplete: waiting for completed retest entry or strong breakout setup"
+            )
+
+    # XAUUSD only: keep displayed directional bias aligned with bearish
+    # structure without creating a trade signal or bypassing entry guards.
+    is_gold = normalize_symbol(symbol) == "XAUUSD"
+
+    if is_gold and final_signal in ["WAIT", "BUY", "SELL"]:
+        bearish_market_states = {
+            "BEAR_EXPANSION",
+            "BEAR_PULLBACK",
+            "TREND_CONTINUATION_BEAR",
+            "BREAKOUT_BEAR",
+        }
+
+        bearish_regime = (
+            htf_structure == "BEARISH"
+            or market_state in bearish_market_states
+        )
+
+        bearish_ema_alignment = (
+            c1 < ema9
+            and c1 < ema21
+            and ema9 < ema21
+        )
+
+        before_buy_score = buy_score
+        before_sell_score = sell_score
+        before_confidence = confidence
+
+        gold_bearish_points = 0
+        if htf_structure == "BEARISH":
+            gold_bearish_points += 25
+
+        if bearish_choch:
+            gold_bearish_points += 20
+
+        if bearish_bos:
+            gold_bearish_points += 15
+
+        if bearish_displacement:
+            gold_bearish_points += 15
+
+        if bearish_fvg:
+            gold_bearish_points += 10
+
+        if recent_pressure == "BEARISH":
+            gold_bearish_points += 10
+
+        if bearish_regime:
+            gold_bearish_points += 28
+
+        if bearish_bos:
+            gold_bearish_points += 18
+
+        if bearish_ema_alignment:
+            gold_bearish_points += 22
+
+        if bearish_displacement:
+            gold_bearish_points += 8
+
+        if bullish_displacement and bearish_regime:
+            gold_bearish_points += 7
+
+        if gold_bearish_points > 0:
+            sell_score += gold_bearish_points
+            buy_score -= int(gold_bearish_points * 0.8)
+
+        if (
+            htf_structure == "BEARISH"
+            and (
+                bearish_choch
+                or bearish_bos
+                or "CHOCH SELL" in str(entry_timing or "").upper()
+            )
+        ):
+            sell_score = max(sell_score, 75)
+            buy_score = min(buy_score, 25)
+            reasons.append("XAUUSD bearish override: 1h bearish + 15m sell setup")
+            
+        buy_score = max(5, min(95, int(round(buy_score))))
+        sell_score = max(5, min(95, int(round(sell_score))))
+
+        # Normalize display scores so Buy + Sell never goes over 100.
+        score_total = buy_score + sell_score
+        if score_total > 100:
+            buy_score = int(round((buy_score / score_total) * 100))
+            sell_score = 100 - buy_score
+
+        buy_score = max(5, min(95, buy_score))
+        sell_score = max(5, min(95, sell_score))
+        # Final bearish override after normalization
+        if (
+            htf_structure == "BEARISH"
+            and (
+                bearish_choch
+                or bearish_bos
+            )
+        ):
+            sell_score = max(sell_score, 75)
+            buy_score = min(buy_score, 25)
+
+        # Final bullish override after normalization
+        if (
+            htf_structure == "BULLISH"
+            and (
+                bullish_choch
+                or bullish_bos
+            )
+        ):
+            buy_score = max(buy_score, 75)
+            sell_score = min(sell_score, 25)
+
+        corrected_confidence = calculate_confidence(
+            buy_score,
+            sell_score,
+            htf_structure,
+            choch_signal,
+            zone_position,
+            "NONE",
+            market_state,
+            entry_timing,
+            market_condition,
+        )
+
+        if final_signal == "BUY" and sell_score > buy_score:
+            confidence = min(before_confidence, corrected_confidence)
+        else:
+            confidence = max(before_confidence, corrected_confidence)
+
+        print("XAUUSD_SCORING_CORRECTION_DEBUG =", {
+            "symbol": symbol,
+            "before_buy_score": before_buy_score,
+            "after_buy_score": buy_score,
+            "before_sell_score": before_sell_score,
+            "after_sell_score": sell_score,
+            "before_confidence": before_confidence,
+            "after_confidence": confidence,
+            "gold_bearish_points": gold_bearish_points,
+            "htf_structure": htf_structure,
+            "market_state": market_state,
+            "recent_pressure": recent_pressure,
+            "bullish_displacement": bullish_displacement,
+            "bearish_displacement": bearish_displacement,
+            "bullish_bos": bullish_bos,
+            "bearish_bos": bearish_bos,
+            "bearish_ema_alignment": bearish_ema_alignment,
+        })
+
     if final_signal == "BUY" and swing_low:
         entry_price = round(c1, decimals)
         stop_loss = round(swing_low - buffer, decimals)
         risk = entry_price - stop_loss
-        tp1 = round(entry_price + risk * 1.0, decimals)
-        tp2 = round(entry_price + risk * 1.25, decimals)
+        tp2 = round(entry_price + risk * 2.0, decimals)
+        tp1 = round(entry_price + ((tp2 - entry_price) * 0.80), decimals)
         invalidation = "Exit if bearish CHOCH or break below SL"
-        plan_reason = "BUY after CHOCH/BOS confirmation + retest"
+        plan_reason = breakout_plan_reason or "BUY after 15m swing break and close confirmation"
 
     elif final_signal == "SELL" and swing_high:
         entry_price = round(c1, decimals)
         stop_loss = round(swing_high + buffer, decimals)
         risk = stop_loss - entry_price
-        tp1 = round(entry_price - risk * 1.0, decimals)
-        tp2 = round(entry_price - risk * 1.25, decimals)
+        tp2 = round(entry_price - risk * 2.0, decimals)
+        tp1 = round(entry_price - ((entry_price - tp2) * 0.80), decimals)
         invalidation = "Exit if bullish CHOCH or break above SL"
-        plan_reason = "SELL after CHOCH/BOS confirmation + retest"
+        plan_reason = breakout_plan_reason or "SELL after 15m swing break and close confirmation"
 
     else:
         entry_price = "--"
         stop_loss = "--"
         tp1 = "--"
         tp2 = "--"
-        invalidation = "Wait for CHOCH/BOS + retest"
-        plan_reason = "No entry until structure confirms"
+        invalidation = "Wait for 15m swing break + close"
+        plan_reason = "No entry until 15m structure confirms"
+
+    signal_before_filters = final_signal
+    no_trade = False
+    kill_trade = False
 
     # =========================
     # ✅ FINAL TRADE GATE — SOFTER SCALPER VERSION
@@ -2558,8 +4615,11 @@ def get_signal(data, htf_data, symbol):
 
     # Confidence was too strict at 80. Scalper can start at 65.
     if confidence < 65:
-        allow_trade = False
-        reasons.append("Blocked: confidence below 65")
+        if breakout_entry_allowed and confidence >= 55:
+            reasons.append("SMC breakout confidence allowed at 55+")
+        else:
+            allow_trade = False
+            reasons.append("Blocked: confidence below 65")
 
     # Fake breakout still blocks trade
     if fake_breakout != "NONE":
@@ -2568,19 +4628,23 @@ def get_signal(data, htf_data, symbol):
 
     # Displacement should warn, not always block
     if final_signal == "BUY" and not bullish_displacement:
-        if confidence < 75:
+        if breakout_entry_allowed and displacement_score >= 4:
+            reasons.append("SMC breakout allowed by displacement score")
+        elif confidence < 75:
             allow_trade = False
             reasons.append("Blocked: weak bullish displacement under 75 confidence")
         else:
             reasons.append("Warning: weak bullish displacement allowed by confidence")
 
     if final_signal == "SELL" and not bearish_displacement:
-        if confidence < 75:
+        if breakout_entry_allowed and displacement_score >= 4:
+            reasons.append("SMC breakout allowed by displacement score")
+        elif confidence < 75:
             allow_trade = False
             reasons.append("Blocked: weak bearish displacement under 75 confidence")
         else:
             reasons.append("Warning: weak bearish displacement allowed by confidence")
-
+            
     # Inactive session should not fully kill SMC trades
     if not session_active:
         confidence = max(1, confidence - 8)
@@ -2606,6 +4670,26 @@ def get_signal(data, htf_data, symbol):
         plan_side = "WAIT"
         entry_timing = "NO TRADE"
 
+    if symbol == "EURUSD":
+        if htf_structure == "BEARISH" and choch_signal == "BULLISH":
+            score_contribution_debug["penalties"]["htf_bearish_penalty"] = -8
+
+        if bearish_fvg and not bullish_fvg:
+            score_contribution_debug["penalties"]["bearish_fvg_penalty"] = -6
+
+        if bearish_bos and not bullish_choch:
+            score_contribution_debug["penalties"]["structure_weighting_penalty"] = -10
+
+        score_contribution_debug.update({
+            "buy_score_after_components": buy_score,
+            "sell_score_after_components": sell_score,
+            "confidence_after_components": confidence,
+            "final_signal_after_gate": final_signal,
+            "allow_trade": allow_trade,
+        })
+
+        print("EURUSD_RECOVERY_SCORE_DEBUG =", score_contribution_debug)
+
     if final_signal == "BUY":
         signal_text = f"BUY 🟢 ({confidence}% | {entry_timing})"
     elif final_signal == "SELL":
@@ -2620,6 +4704,153 @@ def get_signal(data, htf_data, symbol):
         else "BOS SELL" if bearish_bos
         else "NEUTRAL"
     )
+    bos_signal = (
+        "BULLISH" if bullish_bos
+        else "BEARISH" if bearish_bos
+        else "NONE"
+    )
+    score_gap = abs(buy_score - sell_score)
+    blocked_by = None
+    blocked_reason = None
+    blocker_rule_name = None
+
+    if final_signal == "WAIT":
+        blocked_reasons = [
+            reason for reason in reasons
+            if str(reason).startswith("Blocked:")
+        ]
+
+        if signal_before_filters in ["BUY", "SELL"] and not allow_trade:
+            blocked_by = "final_trade_gate"
+            blocked_reason = blocked_reasons[-1] if blocked_reasons else "Final trade gate blocked signal"
+            blocked_text = str(blocked_reason).lower()
+            if "bearish displacement" in blocked_text:
+                blocker_rule_name = "bearish_displacement"
+            elif "confidence below 65" in blocked_text:
+                blocker_rule_name = "confidence_under_65"
+            elif "under 75 confidence" in blocked_text:
+                blocker_rule_name = "confidence_under_75"
+            else:
+                blocker_rule_name = "final_trade_gate"
+        elif "RETEST" in str(entry_timing).upper() or "RETEST" in str(plan_type).upper():
+            blocked_by = "missing_15m_swing_break"
+            blocked_reason = "Waiting for fresh 15m swing break and close"
+            blocker_rule_name = "fifteen_m_closed_swing_break_required"
+        elif "PULLBACK" in str(entry_timing).upper() or "LATE" in str(entry_quality).upper():
+            blocked_by = "late_entry"
+            blocked_reason = reasons[-1] if reasons else plan_reason
+            blocker_rule_name = "late_entry_or_pullback"
+        elif "CONFLICT" in str(entry_quality).upper() or "CONFLICT" in str(plan_type).upper():
+            blocked_by = "htf_conflict"
+            blocked_reason = reasons[-1] if reasons else plan_reason
+            blocker_rule_name = "mtf_conflict"
+        elif fake_breakout != "NONE":
+            blocked_by = "fake_breakout"
+            blocked_reason = fake_breakout
+            blocker_rule_name = "fake_breakout"
+        elif not session_active and "SESSION" in str(entry_timing).upper():
+            blocked_by = "session_filter"
+            blocked_reason = f"Session inactive: {session_name}"
+            blocker_rule_name = "session_inactive"
+        elif confidence < 65:
+            blocked_by = "confidence_filter"
+            blocked_reason = "Blocked: confidence below 65"
+            blocker_rule_name = "confidence_below_65"
+        else:
+            blocked_by = "structure_wait"
+            blocked_reason = plan_reason or (reasons[-1] if reasons else "Waiting for structure confirmation")
+            blocker_rule_name = "structure_confirmation_required"
+
+        print(f"BLOCKED BY: {blocker_rule_name}")
+
+    print("FINAL_SIGNAL_DECISION_DEBUG =", {
+        "symbol": symbol,
+        "timeframe": "15m",
+        "signal_before_filters": signal_before_filters,
+        "final_signal": final_signal,
+        "buy_score": buy_score,
+        "sell_score": sell_score,
+        "confidence": confidence,
+        "score_gap": score_gap,
+        "plan_type": plan_type,
+        "structure_type": structure_type,
+        "htf_structure": htf_structure,
+        "choch_signal": choch_signal,
+        "bos_signal": bos_signal,
+        "entry_timing": entry_timing,
+        "market_condition": market_condition,
+        "session_active": session_active,
+        "fake_breakout": fake_breakout,
+        "no_trade": no_trade,
+        "kill_trade": kill_trade,
+        "blocked_by": blocked_by,
+        "blocked_reason": blocked_reason,
+        "blocker_rule_name": blocker_rule_name,
+    })
+
+    trend_score = mtf_score
+    choch_score = 0
+
+    if bullish_choch:
+        choch_score = 1
+    elif bearish_choch:
+        choch_score = -1
+
+    bos_score = 0
+
+    if bullish_bos:
+        bos_score = 1
+    elif bearish_bos:
+        bos_score = -1
+
+    final_score = max(buy_score, sell_score, confidence)
+
+    try:
+        data_last_time = pd.Timestamp(data.index[-1]).isoformat()
+    except Exception:
+        data_last_time = None
+
+    try:
+        htf_last_time = pd.Timestamp(htf_data.index[-1]).isoformat()
+    except Exception:
+        htf_last_time = None
+
+    print("SYMBOL_SCORE_DEBUG =", {
+        "symbol": symbol,
+        "state_key": state_key or symbol,
+        "buy_percent": buy_score,
+        "sell_percent": sell_score,
+        "confidence": confidence,
+        "trend_score": trend_score,
+        "choch_score": choch_score,
+        "bos_score": bos_score,
+        "displacement_score": displacement_score,
+        "final_score": final_score,
+        "data_rows": len(data) if data is not None else 0,
+        "htf_rows": len(htf_data) if htf_data is not None else 0,
+        "data_last_time": data_last_time,
+        "htf_last_time": htf_last_time,
+        "last_close": round(c1, decimals),
+        "recent_high": round(recent_high, decimals),
+        "recent_low": round(recent_low, decimals),
+        "fifteen_m_pattern": fifteen_m_pattern,
+        "pending_setup": state.get("pending"),
+        "setup_candle_time": state.get("setup_candle_time"),
+        "entry_confirm_level": state.get("entry_confirm_level"),
+        "retest_seen": state.get("retest_seen"),
+        "strategy_setup_complete": strategy_setup_complete,
+        "strategy_setup_type": strategy_setup_type,
+        "htf_structure": htf_structure,
+        "structure_type": structure_type,
+        "plan_type": plan_type,
+        "final_signal": final_signal,
+        "smc_branch": smc_branch,
+        "dynamic_score_components": dynamic_score_components,
+        "hardcoded_score_removed": hardcoded_score_removed,
+        "score_contribution_debug": score_contribution_debug,
+        "smc_breakout_debug": smc_breakout_debug,
+        "momentum_breakout_debug": momentum_breakout_debug,
+    })
 
     result = {
         "signal": final_signal,
@@ -2639,14 +4870,23 @@ def get_signal(data, htf_data, symbol):
         "stop_loss": stop_loss,
         "tp1": tp1,
         "tp2": tp2,
-       "risk_reward": "1:1.25" if final_signal in ["BUY", "SELL"] else "--",
+       "risk_reward": "1:2" if final_signal in ["BUY", "SELL"] else "--",
         "invalidation": invalidation,
         "plan_reason": plan_reason,
+        "blocked_by": blocked_by,
+        "blocked_reason": blocked_reason,
+        "signal_before_filters": signal_before_filters,
+        "blocker_rule_name": blocker_rule_name,
         "structure_trend": htf_structure,
         "structure_type": structure_type,
         "structure_next": plan_type,
         "structure_resistance": round(recent_high, decimals),
         "structure_support": round(recent_low, decimals),
+        "fifteen_m_pattern": fifteen_m_pattern,
+        "entry_confirm_level": state.get("entry_confirm_level"),
+        "retest_seen": state.get("retest_seen"),
+        "strategy_setup_complete": strategy_setup_complete,
+        "strategy_setup_type": strategy_setup_type,
         "smc_swings": smc_swings,
         "equal_highs": liquidity_levels["equal_highs"],
         "equal_lows": liquidity_levels["equal_lows"],
@@ -2658,7 +4898,3367 @@ def get_signal(data, htf_data, symbol):
         "fake_breakout": fake_breakout,
         "mtf_bias": mtf_bias,
         "mtf_score": mtf_score,
+        "smc_branch": smc_branch,
+        "dynamic_score_components": dynamic_score_components,
+        "hardcoded_score_removed": hardcoded_score_removed,
+        "score_contribution_debug": score_contribution_debug,
+        "smc_breakout_debug": smc_breakout_debug,
+        "momentum_breakout_debug": momentum_breakout_debug,
     }
+
+    return result
+
+def detect_1h_trend_filter(data_1h, symbol):
+    if data_1h is None or data_1h.empty or len(data_1h) < 30:
+        return {
+            "bias": "NEUTRAL",
+            "shift": "NONE",
+            "buy_allowed": True,
+            "sell_allowed": True,
+            "reason": "1h data unavailable"
+        }
+
+    close = data_1h["Close"]
+    ema9 = close.ewm(span=9).mean().iloc[-1].item()
+    ema21 = close.ewm(span=21).mean().iloc[-1].item()
+    ema50 = close.ewm(span=50).mean().iloc[-1].item()
+    structure = detect_htf_structure(data_1h)
+    pressure, pressure_score = detect_recent_pressure(data_1h, symbol)
+    momentum, momentum_score = detect_momentum_strength(data_1h, symbol)
+
+    if ema9 > ema21 > ema50 or structure == "BULLISH":
+        bias = "BULLISH"
+    elif ema9 < ema21 < ema50 or structure == "BEARISH":
+        bias = "BEARISH"
+    else:
+        bias = "NEUTRAL"
+
+    bullish_shift = (
+        pressure == "BULLISH"
+        and momentum in ["MEDIUM", "STRONG"]
+        and close.iloc[-1].item() > ema21
+    )
+    bearish_shift = (
+        pressure == "BEARISH"
+        and momentum in ["MEDIUM", "STRONG"]
+        and close.iloc[-1].item() < ema21
+    )
+
+    shift = "BULLISH" if bullish_shift else "BEARISH" if bearish_shift else "NONE"
+
+    return {
+        "bias": bias,
+        "shift": shift,
+        "buy_allowed": bias in ["BULLISH", "NEUTRAL"] or bullish_shift,
+        "sell_allowed": bias in ["BEARISH", "NEUTRAL"] or bearish_shift,
+        "structure": structure,
+        "pressure": pressure,
+        "pressure_score": pressure_score,
+        "momentum": momentum,
+        "momentum_score": momentum_score,
+    }
+
+def detect_lightweight_5m_confirmation(data_5m, htf_data, symbol):
+    if data_5m is None or data_5m.empty or len(data_5m) < 30:
+        return "WAIT"
+
+    close = data_5m["Close"]
+    open_ = data_5m["Open"]
+    high = data_5m["High"]
+    low = data_5m["Low"]
+    c1 = close.iloc[-1].item()
+    o1 = open_.iloc[-1].item()
+    h1 = high.iloc[-1].item()
+    l1 = low.iloc[-1].item()
+
+    try:
+        _swing_high, _swing_low, prev_swing_high, prev_swing_low, _structure, _swings = detect_swing_liquidity(data_5m)
+        recent_high = prev_swing_high if prev_swing_high is not None else high.iloc[-20:-1].max().item()
+        recent_low = prev_swing_low if prev_swing_low is not None else low.iloc[-20:-1].min().item()
+    except Exception:
+        recent_high = high.iloc[-20:-1].max().item()
+        recent_low = low.iloc[-20:-1].min().item()
+
+    if h1 > recent_high and c1 > o1:
+        return "BUY"
+
+    if l1 < recent_low and c1 < o1:
+        return "SELL"
+
+    return "WAIT"
+
+def remove_current_forming_candle(data, timeframe_minutes):
+    if data is None or data.empty:
+        return data
+
+    try:
+        last_time = pd.Timestamp(data.index[-1])
+
+        if last_time.tzinfo is None:
+            last_time = last_time.tz_localize("UTC")
+        else:
+            last_time = last_time.tz_convert("UTC")
+
+        now_utc = datetime.now(timezone.utc)
+        current_bucket_minute = (now_utc.minute // timeframe_minutes) * timeframe_minutes
+        current_bucket = now_utc.replace(
+            minute=current_bucket_minute,
+            second=0,
+            microsecond=0
+        )
+
+        if last_time >= current_bucket and len(data) >= 2:
+            return data.iloc[:-1].copy()
+    except Exception:
+        pass
+
+    return data.copy()
+
+def calculate_tp1_from_tp2_price(entry, tp2, side):
+    entry_value = float(entry)
+    tp2_value = float(tp2)
+
+    if str(side or "").upper() == "BUY":
+        return entry_value + ((tp2_value - entry_value) * 0.50)
+
+    return entry_value - ((entry_value - tp2_value) * 0.50)
+
+def calculate_protected_sl_from_tp2_price(entry, tp2, side):
+    entry_value = float(entry)
+    tp2_value = float(tp2)
+
+    if str(side or "").upper() == "BUY":
+        return entry_value + ((tp2_value - entry_value) * 0.50)
+
+    return entry_value - ((entry_value - tp2_value) * 0.50)
+
+def get_strategy_pip_size(symbol):
+    return 0.0001 if normalize_symbol(symbol) == "EURUSD" else 0.1
+
+def get_strategy_decimals(symbol):
+    return 5 if normalize_symbol(symbol) == "EURUSD" else 2
+
+def build_15m_swing_risk_levels(closed_data_15m, entry, side, symbol):
+    side = str(side or "").upper()
+    normalized_symbol = normalize_symbol(symbol)
+    decimals = get_strategy_decimals(normalized_symbol)
+    pip_size = get_strategy_pip_size(normalized_symbol)
+    buffer_pips = 1.5 if normalized_symbol == "EURUSD" else 30
+    buffer = pip_size * buffer_pips
+    max_swing_age_candles = 20
+    broker_min_distance = 0.0008 if normalized_symbol == "EURUSD" else 1.5
+    debug = {
+        "ok": False,
+        "reason": "WAIT_INVALID_SWING_SL",
+        "reason_if_wait": "WAIT_INVALID_SWING_SL",
+        "entry": entry,
+        "stop_loss": None,
+        "tp1": None,
+        "tp2": None,
+        "risk": None,
+        "reward": None,
+        "risk_reward": None,
+        "swing_low": None,
+        "swing_high": None,
+        "sl_buffer": round(buffer, decimals),
+        "sl_buffer_pips": buffer_pips,
+        "minimum_risk_pips": None,
+        "selected_swing_sl": None,
+        "selected_swing_time": None,
+        "selected_swing_age_candles": None,
+        "sl_source": None,
+        "sl_distance": None,
+        "sl_distance_pips": None,
+        "broker_min_distance": broker_min_distance,
+        "rejected_swing_candidates": [],
+        "final_entry": None,
+        "final_sl": None,
+        "final_tp1": None,
+        "final_tp2": None,
+    }
+
+    if side not in ["BUY", "SELL"] or closed_data_15m is None or len(closed_data_15m) < 10:
+        return debug
+
+    try:
+        entry_price = float(entry)
+        swing_source = closed_data_15m.iloc[:-1].copy() if len(closed_data_15m) > 1 else closed_data_15m.copy()
+        (
+            swing_high,
+            swing_low,
+            _prev_high,
+            _prev_low,
+            _structure,
+            _swings,
+        ) = detect_swing_liquidity(swing_source)
+        debug["swing_low"] = swing_low
+        debug["swing_high"] = swing_high
+        rejected_candidates = []
+        last_swing_position = len(swing_source) - 1
+
+        def numeric_candidate(value, source):
+            try:
+                candidate = float(value)
+                if math.isfinite(candidate):
+                    return {"price": candidate, "source": source}
+            except (TypeError, ValueError):
+                pass
+            return None
+
+        swing_candidates = []
+
+        for swing in _swings or []:
+            if not isinstance(swing, dict):
+                continue
+            swing_type = str(swing.get("type") or "").upper()
+            if side == "BUY" and swing_type != "LOW":
+                continue
+            if side == "SELL" and swing_type != "HIGH":
+                continue
+            candidate = numeric_candidate(
+                swing.get("price"),
+                f"detected_15m_swing_{swing_type.lower()}",
+            )
+            if candidate:
+                candidate["index"] = swing.get("index")
+                candidate["time"] = swing.get("time")
+                swing_candidates.append(candidate)
+
+        if side == "BUY":
+            candidate = numeric_candidate(swing_low, "detected_15m_swing_low")
+            if candidate:
+                candidate["index"] = None
+                candidate["time"] = None
+                swing_candidates.append(candidate)
+        else:
+            candidate = numeric_candidate(swing_high, "detected_15m_swing_high")
+            if candidate:
+                candidate["index"] = None
+                candidate["time"] = None
+                swing_candidates.append(candidate)
+
+        seen_candidates = set()
+        deduped_candidates = []
+        for candidate in swing_candidates:
+            key = round(candidate["price"], decimals)
+            if key in seen_candidates:
+                continue
+            seen_candidates.add(key)
+            deduped_candidates.append(candidate)
+        swing_candidates = deduped_candidates
+
+        def normalize_candidate_index(candidate):
+            try:
+                index_value = candidate.get("index")
+                if index_value is None:
+                    return None
+                return int(index_value)
+            except (TypeError, ValueError):
+                return None
+
+        def candidate_time(candidate, position):
+            if candidate.get("time") is not None:
+                return candidate.get("time")
+            if position is None:
+                return None
+            try:
+                return str(swing_source.index[position])
+            except Exception:
+                return None
+
+        def enrich_candidate(candidate):
+            enriched = dict(candidate)
+            position = normalize_candidate_index(candidate)
+            if position is not None and position < 0:
+                position = None
+            if position is not None and position >= len(swing_source):
+                position = len(swing_source) - 1
+            age = None
+            if position is not None:
+                age = max(0, last_swing_position - position)
+            enriched["index"] = position
+            enriched["time"] = candidate_time(candidate, position)
+            enriched["age_candles"] = age
+            return enriched
+
+        swing_candidates = [enrich_candidate(candidate) for candidate in swing_candidates]
+        swing_candidates.sort(
+            key=lambda item: (
+                item["age_candles"] is None,
+                item["age_candles"] if item["age_candles"] is not None else 9999,
+            )
+        )
+
+        def is_recent_candidate(candidate):
+            age = candidate.get("age_candles")
+            return age is None or age <= max_swing_age_candles
+
+        def mark_wait(reason):
+            debug["reason"] = reason
+            debug["reason_if_wait"] = reason
+            debug["rejected_swing_candidates"] = rejected_candidates
+
+        if side == "BUY":
+            selected = None
+            for candidate in swing_candidates:
+                if not is_recent_candidate(candidate):
+                    rejected_candidates.append({
+                        **candidate,
+                        "reason": "BUY swing low is too old for structure SL",
+                    })
+                    continue
+
+                stop_loss_candidate = candidate["price"] - buffer
+                if candidate["price"] >= entry_price:
+                    rejected_candidates.append({
+                        **candidate,
+                        "candidate_sl": round(stop_loss_candidate, decimals),
+                        "reason": "BUY swing low is not below entry",
+                    })
+                    continue
+                if stop_loss_candidate >= entry_price:
+                    rejected_candidates.append({
+                        **candidate,
+                        "candidate_sl": round(stop_loss_candidate, decimals),
+                        "reason": "BUY swing SL is too close to entry",
+                    })
+                    continue
+                selected = candidate
+                break
+
+            if selected:
+                swing_low = selected["price"]
+                stop_loss = swing_low - buffer
+                debug["sl_source"] = selected["source"]
+            else:
+                mark_wait("WAIT_VALID_SWING_SL")
+                return debug
+
+            if stop_loss >= entry_price:
+                mark_wait("WAIT_BUY_SL_NOT_BELOW_ENTRY")
+                return debug
+            risk = entry_price - stop_loss
+            tp2 = entry_price + (risk * 2.0)
+        else:
+            selected = None
+            for candidate in swing_candidates:
+                if not is_recent_candidate(candidate):
+                    rejected_candidates.append({
+                        **candidate,
+                        "reason": "SELL swing high is too old for structure SL",
+                    })
+                    continue
+
+                stop_loss_candidate = candidate["price"] + buffer
+                if candidate["price"] <= entry_price:
+                    rejected_candidates.append({
+                        **candidate,
+                        "candidate_sl": round(stop_loss_candidate, decimals),
+                        "reason": "SELL swing high is not above entry",
+                    })
+                    continue
+                if stop_loss_candidate <= entry_price:
+                    rejected_candidates.append({
+                        **candidate,
+                        "candidate_sl": round(stop_loss_candidate, decimals),
+                        "reason": "SELL swing SL is too close to entry",
+                    })
+                    continue
+                selected = candidate
+                break
+
+            if selected:
+                swing_high = selected["price"]
+                stop_loss = swing_high + buffer
+                debug["sl_source"] = selected["source"]
+            else:
+                mark_wait("WAIT_VALID_SWING_SL")
+                return debug
+
+            if stop_loss <= entry_price:
+                mark_wait("WAIT_SELL_SL_NOT_ABOVE_ENTRY")
+                return debug
+            risk = stop_loss - entry_price
+            tp2 = entry_price - (risk * 2.0)
+
+        if risk <= 0:
+            debug["rejected_swing_candidates"] = rejected_candidates
+            return debug
+
+        tp1 = calculate_tp1_from_tp2_price(entry_price, tp2, side)
+        reward = abs(tp2 - entry_price)
+        rr = reward / risk
+
+        if abs(rr - 2.0) > 0.01:
+            debug["reason"] = "WAIT_RR_NOT_1_TO_2"
+            return debug
+
+        levels = {
+            "ok": True,
+            "reason": None,
+            "entry": round(entry_price, decimals),
+            "stop_loss": round(stop_loss, decimals),
+            "tp1": round(tp1, decimals),
+            "tp2": round(tp2, decimals),
+            "risk": round(risk, decimals),
+            "reward": round(reward, decimals),
+            "risk_reward": "1:2",
+            "level_source": debug.get("sl_source"),
+            "selected_swing_sl": round(
+                swing_low if side == "BUY" else swing_high,
+                decimals,
+            ),
+            "selected_swing_time": selected.get("time") if selected else None,
+            "selected_swing_age_candles": selected.get("age_candles") if selected else None,
+            "sl_source": debug.get("sl_source"),
+            "sl_buffer": round(buffer, decimals),
+            "sl_distance": round(abs(stop_loss - entry_price), decimals),
+            "sl_distance_pips": round(abs(stop_loss - entry_price) / pip_size, 2),
+            "broker_min_distance": broker_min_distance,
+            "rejected_swing_candidates": rejected_candidates,
+            "final_entry": round(entry_price, decimals),
+            "final_sl": round(stop_loss, decimals),
+            "final_tp1": round(tp1, decimals),
+            "final_tp2": round(tp2, decimals),
+        }
+        debug.update(levels)
+    except Exception as exc:
+        debug["reason"] = f"WAIT_INVALID_SWING_SL: {exc}"
+
+    return debug
+
+def validate_trade_levels_1_to_2(result, side):
+    side = str(side or "").upper()
+
+    try:
+        entry = float(result.get("entry_price"))
+        sl = float(result.get("stop_loss"))
+        tp1 = float(result.get("tp1"))
+        tp2 = float(result.get("tp2"))
+    except (TypeError, ValueError):
+        return False, "WAIT_TP_LEVELS_MISSING"
+
+    if side == "BUY":
+        if not (sl < entry < tp1 < tp2):
+            return False, "WAIT_TP_LEVELS_MISSING"
+        risk = entry - sl
+        reward = tp2 - entry
+    elif side == "SELL":
+        if not (tp2 < tp1 < entry < sl):
+            return False, "WAIT_TP_LEVELS_MISSING"
+        risk = sl - entry
+        reward = entry - tp2
+    else:
+        return False, "WAIT_TP_LEVELS_MISSING"
+
+    if risk <= 0 or reward <= 0:
+        return False, "WAIT_TP_LEVELS_MISSING"
+
+    expected_tp1 = calculate_tp1_from_tp2_price(entry, tp2, side)
+    tp1_rounding_tolerance = (
+        0.011
+        if abs(entry) >= 100
+        else max(abs(entry) * 1e-8, 1e-5)
+    )
+
+    if abs(tp1 - expected_tp1) > tp1_rounding_tolerance:
+        return False, "WAIT_TP_LEVELS_MISSING"
+
+    if abs((reward / risk) - 2.0) > 0.01:
+        return False, "WAIT_RR_NOT_1_TO_2"
+
+    return True, None
+
+def get_15m_swing_watch_key(symbol, side):
+    return f"{normalize_symbol(symbol)}:{str(side or '').upper()}"
+
+def get_15m_level_tolerance(symbol):
+    return 0.00015 if normalize_symbol(symbol) == "EURUSD" else 1.00
+
+def update_fifteen_m_swing_watch(symbol, side, swing_level, candle_time):
+    side = str(side or "").upper()
+
+    if side not in ["BUY", "SELL"] or swing_level is None:
+        return None
+
+    key = get_15m_swing_watch_key(symbol, side)
+    previous = FIFTEEN_M_SWING_WATCH.get(key) or {}
+
+    try:
+        swing_value = float(swing_level)
+    except (TypeError, ValueError):
+        return previous or None
+
+    previous_level = previous.get("swing_level")
+    same_level = False
+
+    try:
+        same_level = abs(float(previous_level) - swing_value) <= 1e-8
+    except (TypeError, ValueError):
+        same_level = False
+
+    if previous and not previous.get("break_confirmed") and same_level:
+        return previous
+
+    if not previous or not same_level:
+        FIFTEEN_M_SWING_WATCH[key] = {
+            "symbol": normalize_symbol(symbol),
+            "side": side,
+            "swing_level": swing_value,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "source_candle_time": candle_time,
+            "break_confirmed": False,
+            "break_candle_time": None,
+        }
+        save_fifteen_m_swing_watch()
+
+    return FIFTEEN_M_SWING_WATCH.get(key)
+
+def evaluate_closed_15m_swing_break(closed_data_15m, side, symbol=None):
+    side = str(side or "").upper()
+    normalized_symbol = normalize_symbol(symbol) if symbol else "UNKNOWN"
+    debug = {
+        "symbol": normalized_symbol,
+        "side": side,
+        "confirmed": False,
+        "closed_candle_time": None,
+        "closed_candle_close": None,
+        "swing_level": None,
+        "comparison": None,
+        "reason": "No actionable 15m side",
+    }
+
+    if side not in ["BUY", "SELL"]:
+        return debug
+
+    if closed_data_15m is None or len(closed_data_15m) < 10:
+        debug["reason"] = "Not enough closed 15m candles to validate the swing break"
+        return debug
+
+    try:
+        close_price = float(closed_data_15m["Close"].iloc[-1])
+        candle_time = pd.Timestamp(closed_data_15m.index[-1]).isoformat()
+        swing_source = closed_data_15m.iloc[:-1].copy()
+
+        if len(swing_source) < 8:
+            swing_source = closed_data_15m.copy()
+
+        (
+            swing_high,
+            swing_low,
+            _prev_swing_high,
+            _prev_swing_low,
+            _structure,
+            _swings,
+        ) = detect_swing_liquidity(swing_source)
+
+        if side == "BUY":
+            swing_level = swing_high
+
+            if swing_level is None:
+                swing_level = float(swing_source["High"].tail(20).max())
+
+            break_happened = float(closed_data_15m["High"].iloc[-1]) > float(swing_level)
+            close_confirmed = close_price > float(swing_level)
+            confirmed = break_happened and close_confirmed
+            comparison = "close > swing high"
+            if confirmed:
+                reason = f"15m candle closed above swing high {float(swing_level):.5f}"
+            elif break_happened:
+                reason = "WAIT_NO_15M_CLOSE_CONFIRMATION"
+            else:
+                reason = "WAIT_NO_15M_BREAK"
+        else:
+            swing_level = swing_low
+
+            if swing_level is None:
+                swing_level = float(swing_source["Low"].tail(20).min())
+
+            break_happened = float(closed_data_15m["Low"].iloc[-1]) < float(swing_level)
+            close_confirmed = close_price < float(swing_level)
+            confirmed = break_happened and close_confirmed
+            comparison = "close < swing low"
+            if confirmed:
+                reason = f"15m candle closed below swing low {float(swing_level):.5f}"
+            elif break_happened:
+                reason = "WAIT_NO_15M_CLOSE_CONFIRMATION"
+            else:
+                reason = "WAIT_NO_15M_BREAK"
+
+        watched = update_fifteen_m_swing_watch(
+            normalized_symbol,
+            side,
+            swing_level,
+            candle_time,
+        )
+        watched_level = None
+
+        if watched:
+            try:
+                watched_level = float(watched.get("swing_level"))
+            except (TypeError, ValueError):
+                watched_level = None
+
+        if watched_level is not None:
+            if side == "BUY":
+                break_happened = float(closed_data_15m["High"].iloc[-1]) > watched_level
+                close_confirmed = close_price > watched_level
+                confirmed = break_happened and close_confirmed
+                swing_level = watched_level
+                comparison = "close > saved swing high"
+                if confirmed:
+                    reason = f"15m candle closed above saved swing high {watched_level:.5f}"
+                elif break_happened:
+                    reason = "WAIT_NO_15M_CLOSE_CONFIRMATION"
+                else:
+                    reason = "WAIT_NO_15M_BREAK"
+            else:
+                break_happened = float(closed_data_15m["Low"].iloc[-1]) < watched_level
+                close_confirmed = close_price < watched_level
+                confirmed = break_happened and close_confirmed
+                swing_level = watched_level
+                comparison = "close < saved swing low"
+                if confirmed:
+                    reason = f"15m candle closed below saved swing low {watched_level:.5f}"
+                elif break_happened:
+                    reason = "WAIT_NO_15M_CLOSE_CONFIRMATION"
+                else:
+                    reason = "WAIT_NO_15M_BREAK"
+
+        if confirmed and watched and not watched.get("break_confirmed"):
+            key = get_15m_swing_watch_key(debug.get("symbol"), side)
+            breakout_ts = pd.Timestamp(candle_time)
+            if breakout_ts.tzinfo is None:
+                breakout_ts = breakout_ts.tz_localize("UTC")
+            else:
+                breakout_ts = breakout_ts.tz_convert("UTC")
+            FIFTEEN_M_SWING_WATCH[key] = {
+                **watched,
+                "break_confirmed": True,
+                "break_candle_time": candle_time,
+                "break_close": close_price,
+                "status": "PENDING",
+                "expires_after_5m_candles": FIFTEEN_M_PENDING_MAX_5M_CANDLES,
+                "expires_at": (
+                    breakout_ts
+                    + pd.Timedelta(
+                        minutes=5 * FIFTEEN_M_PENDING_MAX_5M_CANDLES
+                    )
+                ).isoformat(),
+                "invalidated_at": None,
+                "confirmed_5m_time": None,
+            }
+            save_fifteen_m_swing_watch()
+
+        debug.update({
+            "confirmed": confirmed,
+            "closed_candle_time": candle_time,
+            "closed_candle_close": close_price,
+            "swing_level": float(swing_level),
+            "comparison": comparison,
+            "break_happened": bool(break_happened),
+            "close_confirmed": bool(close_confirmed),
+            "reason": reason,
+        })
+    except Exception as exc:
+        debug["reason"] = f"15m swing-break validation unavailable: {exc}"
+
+    return debug
+
+def get_pending_15m_swing_setup(symbol, closed_data_5m):
+    normalized_symbol = normalize_symbol(symbol)
+    candidates = []
+    state_changed = False
+
+    if closed_data_5m is None:
+        closed_data_5m = pd.DataFrame()
+
+    for side in ["BUY", "SELL"]:
+        key = get_15m_swing_watch_key(normalized_symbol, side)
+        watched = FIFTEEN_M_SWING_WATCH.get(key)
+
+        if not isinstance(watched, dict) or not watched.get("break_confirmed"):
+            continue
+
+        if str(watched.get("status") or "PENDING").upper() != "PENDING":
+            continue
+
+        try:
+            level = float(watched.get("swing_level"))
+            breakout_ts = pd.Timestamp(watched.get("break_candle_time"))
+            if breakout_ts.tzinfo is None:
+                breakout_ts = breakout_ts.tz_localize("UTC")
+            else:
+                breakout_ts = breakout_ts.tz_convert("UTC")
+        except Exception:
+            continue
+
+        following = []
+        for candle_time, candle in closed_data_5m.iterrows():
+            try:
+                candle_ts = pd.Timestamp(candle_time)
+                if candle_ts.tzinfo is None:
+                    candle_ts = candle_ts.tz_localize("UTC")
+                else:
+                    candle_ts = candle_ts.tz_convert("UTC")
+                if candle_ts > breakout_ts:
+                    following.append((candle_ts, candle))
+            except Exception:
+                continue
+
+        if watched.get("confirmed_5m_time"):
+            watched["status"] = "CONFIRMED"
+            state_changed = True
+            continue
+
+        # A pending setup must be evaluated while its six-candle window is
+        # active. Never resurrect an old breakout by scanning historical 5m
+        # candles after that window has already passed.
+        if len(following) > FIFTEEN_M_PENDING_MAX_5M_CANDLES:
+            watched["status"] = "EXPIRED"
+            watched["expired_at"] = following[
+                FIFTEEN_M_PENDING_MAX_5M_CANDLES
+            ][0].isoformat()
+            watched["expiration_reason"] = (
+                "No 5m confirmation within six candles"
+            )
+            state_changed = True
+            continue
+
+        watched["status"] = "PENDING"
+        watched["five_m_candles_elapsed"] = len(following)
+        watched["candles_remaining"] = (
+            max(0, FIFTEEN_M_PENDING_MAX_5M_CANDLES - len(following))
+        )
+        candidates.append(watched)
+
+    if state_changed:
+        save_fifteen_m_swing_watch()
+
+    if not candidates:
+        return None
+
+    def breakout_time(item):
+        try:
+            return pd.Timestamp(item.get("break_candle_time"))
+        except Exception:
+            return pd.Timestamp.min
+
+    return max(candidates, key=breakout_time)
+
+def get_last_closed_5m_candle(data_5m):
+    closed_data = remove_current_forming_candle(data_5m, 5)
+
+    if closed_data is None or closed_data.empty:
+        return None, None
+
+    try:
+        candle = closed_data.iloc[-1]
+        candle_time = pd.Timestamp(closed_data.index[-1]).isoformat()
+        return candle, candle_time
+    except Exception:
+        return None, None
+
+def get_15m_setup_side(result):
+    if not isinstance(result, dict):
+        return "WAIT"
+
+    structure = str(result.get("structure_type") or "").upper()
+    setup_type = str(result.get("strategy_setup_type") or "").upper()
+    pending_setup = str(result.get("pending_setup") or "").upper()
+
+    if pending_setup in ["BUY", "SELL"] and result.get("entry_confirm_level") not in [None, "--"]:
+        return pending_setup
+
+    if "CHOCH BUY" in structure or "BOS BUY" in structure:
+        return "BUY"
+    if "CHOCH SELL" in structure or "BOS SELL" in structure:
+        return "SELL"
+    if setup_type in ["BUY_RETEST", "BUY_BREAKOUT", "BUY_MOMENTUM_BREAKOUT"]:
+        return "BUY"
+    if setup_type in ["SELL_RETEST", "SELL_BREAKOUT", "SELL_MOMENTUM_BREAKOUT"]:
+        return "SELL"
+
+    return "WAIT"
+
+def get_15m_setup_level(result, side):
+    if not isinstance(result, dict):
+        return None
+
+    side = str(side or "").upper()
+    candidate_keys = (
+        ["entry_confirm_level", "structure_resistance", "entry_price"]
+        if side == "BUY"
+        else ["entry_confirm_level", "structure_support", "entry_price"]
+    )
+
+    for key in candidate_keys:
+        value = result.get(key)
+
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+
+        if math.isfinite(numeric):
+            return numeric
+
+    return None
+
+def confirm_5m_entry_from_15m_setup(
+    data_5m,
+    side,
+    setup_level,
+    symbol,
+    momentum_breakout=False
+):
+    closed_5m = remove_current_forming_candle(data_5m, 5)
+    candle, candle_time = get_last_closed_5m_candle(data_5m)
+
+    if candle is None:
+        return {
+            "side": "WAIT",
+            "closed_candle_time": None,
+            "close_confirmed": False,
+            "reason": "5m closed candle unavailable",
+            "close": None,
+            "open": None,
+        }
+
+    try:
+        open_price = float(candle["Open"])
+        high_price = float(candle["High"])
+        low_price = float(candle["Low"])
+        close_price = float(candle["Close"])
+    except (TypeError, ValueError, KeyError):
+        return {
+            "side": "WAIT",
+            "closed_candle_time": candle_time,
+            "close_confirmed": False,
+            "reason": "5m candle price invalid",
+            "close": None,
+            "open": None,
+        }
+
+    side = str(side or "").upper()
+    normalized_symbol = normalize_symbol(symbol)
+    tolerance = 0.00002 if normalized_symbol == "EURUSD" else 0.05
+    min_body = 0.00015 if normalized_symbol == "EURUSD" else 0.80
+    max_confirmation_range = 0.00120 if normalized_symbol == "EURUSD" else 8.00
+    min_body_ratio = 0.45
+    max_wick_to_body = 2.25
+    level = setup_level
+
+    if level is None:
+        level = close_price
+
+    candle_body = abs(close_price - open_price)
+    candle_range = max(high_price - low_price, 0)
+    body_ratio = candle_body / candle_range if candle_range > 0 else 0
+    upper_wick = high_price - max(open_price, close_price)
+    lower_wick = min(open_price, close_price) - low_price
+    wick_to_body = max(upper_wick, lower_wick) / max(candle_body, 1e-12)
+    previous_candle = None
+
+    try:
+        if closed_5m is not None and len(closed_5m) >= 2:
+            previous_candle = closed_5m.iloc[-2]
+    except Exception:
+        previous_candle = None
+
+    bullish_engulfing = False
+    bearish_engulfing = False
+
+    if previous_candle is not None:
+        try:
+            prev_open = float(previous_candle["Open"])
+            prev_close = float(previous_candle["Close"])
+            bullish_engulfing = (
+                close_price > open_price
+                and prev_close < prev_open
+                and close_price >= prev_open
+                and open_price <= prev_close
+            )
+            bearish_engulfing = (
+                close_price < open_price
+                and prev_close > prev_open
+                and close_price <= prev_open
+                and open_price >= prev_close
+            )
+        except (TypeError, ValueError, KeyError):
+            bullish_engulfing = False
+            bearish_engulfing = False
+
+    if momentum_breakout:
+        candle_quality_ok = (
+            candle_body >= min_body
+            and body_ratio >= 0.35
+            and wick_to_body <= 3.0
+        )
+    else:
+        candle_quality_ok = (
+            candle_body >= min_body
+            and body_ratio >= min_body_ratio
+            and wick_to_body <= max_wick_to_body
+            and candle_range <= max_confirmation_range
+        )
+    engulfing_ok = bullish_engulfing if side == "BUY" else bearish_engulfing
+
+    if not candle_quality_ok and not engulfing_ok:
+        reasons = []
+
+        if candle_body < min_body:
+            reasons.append("5m body too small")
+        if body_ratio < min_body_ratio:
+            reasons.append("5m candle body not meaningful")
+        if wick_to_body > max_wick_to_body:
+            reasons.append("5m wick too large")
+        if not momentum_breakout and candle_range > max_confirmation_range:
+            reasons.append("5m candle too large to chase")
+
+        return {
+            "side": "WAIT",
+            "closed_candle_time": candle_time,
+            "close_confirmed": False,
+            "reason": "; ".join(reasons) or f"Waiting for stronger 5m {side} confirmation",
+            "close": close_price,
+            "open": open_price,
+            "high": high_price,
+            "low": low_price,
+            "setup_level": level,
+            "candle_body": candle_body,
+            "candle_range": candle_range,
+            "body_ratio": round(body_ratio, 3),
+            "wick_to_body": round(wick_to_body, 3),
+            "bullish_engulfing": bullish_engulfing,
+            "bearish_engulfing": bearish_engulfing,
+            "momentum_breakout": momentum_breakout,
+        }
+
+    bullish_close = close_price > open_price
+    bearish_close = close_price < open_price
+    buy_confirmed = (
+        side == "BUY"
+        and bullish_close
+        and close_price >= float(level) - tolerance
+    )
+    sell_confirmed = (
+        side == "SELL"
+        and bearish_close
+        and close_price <= float(level) + tolerance
+    )
+
+    if buy_confirmed:
+        confirmed_side = "BUY"
+        reason = "5m bullish closed candle confirmed entry"
+    elif sell_confirmed:
+        confirmed_side = "SELL"
+        reason = "5m bearish closed candle confirmed entry"
+    else:
+        confirmed_side = "WAIT"
+        reason = f"Waiting for 5m {side} candle close confirmation"
+
+    return {
+        "side": confirmed_side,
+        "closed_candle_time": candle_time,
+        "close_confirmed": buy_confirmed or sell_confirmed,
+        "reason": reason,
+        "close": close_price,
+        "open": open_price,
+        "high": high_price,
+        "low": low_price,
+        "setup_level": level,
+        "candle_body": candle_body,
+        "candle_range": candle_range,
+        "body_ratio": round(body_ratio, 3),
+        "wick_to_body": round(wick_to_body, 3),
+        "bullish_engulfing": bullish_engulfing,
+        "bearish_engulfing": bearish_engulfing,
+        "momentum_breakout": momentum_breakout,
+    }
+
+def confirm_5m_close_after_15m_break(data_5m, side, setup_level, breakout_candle_time, symbol):
+    side = str(side or "").upper()
+    normalized_symbol = normalize_symbol(symbol)
+    closed_5m = remove_current_forming_candle(data_5m, 5)
+    level = setup_level
+    tolerance = get_15m_level_tolerance(normalized_symbol)
+
+    base = {
+        "side": "WAIT",
+        "closed_candle_time": None,
+        "close_confirmed": False,
+        "reason": "WAIT_NO_5M_CLOSE_CONFIRMATION",
+        "close": None,
+        "open": None,
+        "high": None,
+        "low": None,
+        "setup_level": level,
+        "invalidated": False,
+        "expired": False,
+        "candles_checked": 0,
+    }
+
+    if side not in ["BUY", "SELL"] or closed_5m is None or closed_5m.empty or level is None:
+        return base
+
+    try:
+        anchor_ts = pd.Timestamp(breakout_candle_time)
+        if anchor_ts.tzinfo is None:
+            anchor_ts = anchor_ts.tz_localize("UTC")
+        else:
+            anchor_ts = anchor_ts.tz_convert("UTC")
+        level = float(level)
+    except Exception:
+        return base
+
+    following_candles = []
+
+    for candle_time, candle in closed_5m.iterrows():
+        try:
+            candle_ts = pd.Timestamp(candle_time)
+            if candle_ts.tzinfo is None:
+                candle_ts = candle_ts.tz_localize("UTC")
+            else:
+                candle_ts = candle_ts.tz_convert("UTC")
+
+            if candle_ts <= anchor_ts:
+                continue
+
+            following_candles.append((candle_ts, candle))
+        except Exception:
+            continue
+
+    for candle_ts, candle in following_candles[:FIFTEEN_M_PENDING_MAX_5M_CANDLES]:
+        try:
+            open_price = float(candle["Open"])
+            close_price = float(candle["Close"])
+            high_price = float(candle["High"])
+            low_price = float(candle["Low"])
+
+            invalidated = (
+                side == "BUY"
+                and close_price < level - tolerance
+            ) or (
+                side == "SELL"
+                and close_price > level + tolerance
+            )
+
+            if invalidated:
+                return {
+                    **base,
+                    "closed_candle_time": candle_ts.isoformat(),
+                    "reason": f"{side} 15m breakout invalidated by 5m close",
+                    "close": close_price,
+                    "open": open_price,
+                    "high": high_price,
+                    "low": low_price,
+                    "invalidated": True,
+                    "candles_checked": len(following_candles),
+                }
+
+            directional_close = (
+                side == "BUY"
+                and close_price > open_price
+                and close_price >= level - tolerance
+            ) or (
+                side == "SELL"
+                and close_price < open_price
+                and close_price <= level + tolerance
+            )
+
+            if directional_close:
+                key = get_15m_swing_watch_key(normalized_symbol, side)
+                watched = FIFTEEN_M_SWING_WATCH.get(key)
+                watched_matches_setup = False
+                if isinstance(watched, dict):
+                    try:
+                        watched_break_ts = pd.Timestamp(
+                            watched.get("break_candle_time")
+                        )
+                        if watched_break_ts.tzinfo is None:
+                            watched_break_ts = watched_break_ts.tz_localize(
+                                "UTC"
+                            )
+                        else:
+                            watched_break_ts = watched_break_ts.tz_convert(
+                                "UTC"
+                            )
+                        watched_matches_setup = (
+                            abs(
+                                float(watched.get("swing_level")) - level
+                            ) <= 1e-8
+                            and watched_break_ts == anchor_ts
+                        )
+                    except Exception:
+                        watched_matches_setup = False
+
+                if watched_matches_setup:
+                    watched["status"] = "CONFIRMED"
+                    watched["confirmed_5m_time"] = candle_ts.isoformat()
+                    watched["confirmation_close"] = close_price
+                    save_fifteen_m_swing_watch()
+
+                return {
+                    "side": side,
+                    "closed_candle_time": candle_ts.isoformat(),
+                    "close_confirmed": True,
+                    "reason": (
+                        f"{side} confirmed by directional 5m close "
+                        "above/near the broken 15m swing"
+                    ),
+                    "close": close_price,
+                    "open": open_price,
+                    "high": high_price,
+                    "low": low_price,
+                    "setup_level": level,
+                    "invalidated": False,
+                    "expired": False,
+                    "candles_checked": len(following_candles),
+                }
+        except Exception:
+            continue
+
+    if len(following_candles) >= FIFTEEN_M_PENDING_MAX_5M_CANDLES:
+        return {
+            **base,
+            "closed_candle_time": following_candles[
+                FIFTEEN_M_PENDING_MAX_5M_CANDLES - 1
+            ][0].isoformat(),
+            "reason": "WAIT_15M_SETUP_EXPIRED",
+            "expired": True,
+            "candles_checked": len(following_candles),
+        }
+
+    return {
+        **base,
+        "reason": f"Waiting for any following directional 5m {side} close",
+        "candles_checked": len(following_candles),
+        "candles_remaining": (
+            FIFTEEN_M_PENDING_MAX_5M_CANDLES - len(following_candles)
+        ),
+    }
+
+def is_current_5m_entry_confirmation(closed_data_5m, confirmation, side):
+    side = str(side or "").upper()
+    confirmation = confirmation if isinstance(confirmation, dict) else {}
+
+    if (
+        side not in ["BUY", "SELL"]
+        or closed_data_5m is None
+        or closed_data_5m.empty
+        or str(confirmation.get("side") or "").upper() != side
+        or not confirmation.get("close_confirmed")
+        or not confirmation.get("closed_candle_time")
+    ):
+        return False
+
+    try:
+        confirmation_time = pd.Timestamp(
+            confirmation["closed_candle_time"]
+        )
+        latest_closed_time = pd.Timestamp(closed_data_5m.index[-1])
+
+        if confirmation_time.tzinfo is None:
+            confirmation_time = confirmation_time.tz_localize("UTC")
+        else:
+            confirmation_time = confirmation_time.tz_convert("UTC")
+
+        if latest_closed_time.tzinfo is None:
+            latest_closed_time = latest_closed_time.tz_localize("UTC")
+        else:
+            latest_closed_time = latest_closed_time.tz_convert("UTC")
+
+        age_seconds = (
+            datetime.now(timezone.utc)
+            - latest_closed_time.to_pydatetime()
+        ).total_seconds()
+
+        return (
+            confirmation_time == latest_closed_time
+            and 0 <= age_seconds <= 11 * 60
+        )
+    except Exception:
+        return False
+
+
+def evaluate_5m_late_entry_guard(data_5m, result, side, setup_level, five_m_entry, symbol):
+    normalized_symbol = normalize_symbol(symbol)
+    pip_size = 0.0001 if normalized_symbol == "EURUSD" else 0.1
+    max_setup_distance = 8 if normalized_symbol == "EURUSD" else 120
+    min_rr = 1.0
+    max_moved_to_tp1 = 0.75
+    small_body_ratio = 0.35
+
+    debug = {
+        "symbol": normalized_symbol,
+        "side": side,
+        "entry_price": None,
+        "setup_level": setup_level,
+        "distance_from_setup": None,
+        "distance_from_setup_pips": None,
+        "candle_body": None,
+        "candle_range": None,
+        "body_ratio": None,
+        "impulse_before_entry": False,
+        "risk_reward": None,
+        "already_moved_percent_to_tp1": None,
+        "late_entry": False,
+        "late_entry_reason": None,
+    }
+
+    try:
+        entry_price = float(five_m_entry.get("close"))
+        open_price = float(five_m_entry.get("open"))
+        high_price = float(five_m_entry.get("high"))
+        low_price = float(five_m_entry.get("low"))
+    except (TypeError, ValueError):
+        debug["late_entry"] = True
+        debug["late_entry_reason"] = "5m entry candle price invalid"
+        return debug
+
+    setup_level = setup_level if setup_level is not None else result.get("entry_confirm_level")
+
+    try:
+        setup_level = float(setup_level)
+    except (TypeError, ValueError):
+        setup_level = entry_price
+
+    candle_body = abs(entry_price - open_price)
+    candle_range = max(abs(high_price - low_price), pip_size)
+    body_ratio = candle_body / candle_range
+
+    distance_from_setup = (
+        entry_price - setup_level
+        if side == "BUY"
+        else setup_level - entry_price
+    )
+    distance_from_setup_pips = distance_from_setup / pip_size
+
+    impulse_before_entry = False
+
+    if data_5m is not None and len(data_5m) >= 4:
+        prev = data_5m.iloc[-4:-1]
+        prev_ranges = [
+            abs(float(row["High"]) - float(row["Low"])) / pip_size
+            for _, row in prev.iterrows()
+        ]
+        impulse_before_entry = max(prev_ranges or [0]) >= (
+            10 if normalized_symbol == "EURUSD" else 140
+        )
+
+    try:
+        sl = float(result.get("stop_loss"))
+        tp1 = float(result.get("tp1"))
+        risk = abs(entry_price - sl)
+        reward = abs(tp1 - entry_price)
+        risk_reward = reward / risk if risk > 0 else 0
+    except (TypeError, ValueError):
+        tp1 = None
+        risk_reward = None
+
+    moved_to_tp1 = None
+
+    if tp1 is not None:
+        total_to_tp1 = abs(tp1 - setup_level)
+        moved = abs(entry_price - setup_level)
+        moved_to_tp1 = moved / total_to_tp1 if total_to_tp1 > 0 else 1
+
+    reasons = []
+
+    if distance_from_setup_pips > max_setup_distance:
+        reasons.append("price too far from 15m setup level")
+    if body_ratio <= small_body_ratio and impulse_before_entry:
+        reasons.append("small 5m candle after impulse")
+    if moved_to_tp1 is not None and moved_to_tp1 >= max_moved_to_tp1:
+        reasons.append("price already close to TP1")
+
+    debug.update({
+        "entry_price": entry_price,
+        "setup_level": setup_level,
+        "distance_from_setup": round(distance_from_setup, 6),
+        "distance_from_setup_pips": round(distance_from_setup_pips, 1),
+        "candle_body": round(candle_body, 6),
+        "candle_range": round(candle_range, 6),
+        "body_ratio": round(body_ratio, 3),
+        "impulse_before_entry": impulse_before_entry,
+        "risk_reward": round(risk_reward, 2) if risk_reward is not None else None,
+        "already_moved_percent_to_tp1": round(moved_to_tp1, 3) if moved_to_tp1 is not None else None,
+        "late_entry": bool(reasons),
+        "late_entry_reason": "; ".join(reasons) if reasons else None,
+    })
+
+    return debug
+
+def is_valid_15m_entry(result, side):
+    if not isinstance(result, dict):
+        return False
+
+    side = str(side or "").upper()
+    structure = str(result.get("structure_type") or "").upper()
+    plan_type = str(result.get("plan_type") or "").upper()
+    entry_timing = str(result.get("entry_timing") or "").upper()
+
+    if not result.get("strategy_setup_complete"):
+        return False
+
+    has_structure = (
+        f"CHOCH {side}" in structure
+        or f"BOS {side}" in structure
+        or f"SMC {side}" in plan_type
+        or f"BOS {side}" in plan_type
+        or f"FVG {side}" in plan_type
+    )
+    valid_timing = (
+        entry_timing == f"GOOD_{side}"
+        or "RETEST" in entry_timing
+        or entry_timing in [f"FVG {side} ENTRY", f"BOS {side} ENTRY"]
+    )
+
+    return has_structure and valid_timing
+
+def clear_trade_plan(result, reason):
+    print(
+        "PRE_WAIT",
+        result.get("buy_pct"),
+        result.get("sell_pct"),
+        result.get("confidence"),
+    )
+    result["signal"] = "WAIT"
+    result["entry_price"] = "--"
+    result["stop_loss"] = "--"
+    result["tp1"] = "--"
+    result["tp2"] = "--"
+    result["risk_reward"] = "--"
+    result["plan_bias"] = "WAIT"
+    result["plan_type"] = "WAIT FOR STRATEGY CONFIRMATION"
+    result["entry_quality"] = "WAIT"
+    result["entry_timing"] = "WAIT"
+    result["signal_text"] = "WAIT ⚪ (strategy filter)"
+    result["plan_reason"] = reason
+    result.setdefault("debug_reasons", [])
+    result["debug_reasons"] = (result["debug_reasons"] + [reason])[-14:]
+    print(
+        "POST_WAIT",
+        result.get("buy_pct"),
+        result.get("sell_pct"),
+        result.get("confidence"),
+    )
+    return result
+
+def mark_signal_blocker(result, blocked_by, blocked_reason, blocker_rule_name, signal_before_filters=None):
+    result["blocked_by"] = blocked_by
+    result["blocked_reason"] = blocked_reason
+    result["signal_before_filters"] = signal_before_filters or result.get("signal_before_filters") or result.get("signal") or "WAIT"
+    result["blocker_rule_name"] = blocker_rule_name
+    trace = list(result.get("blocker_trace") or [])
+    diagnostic = {
+        "blocked_by": blocked_by,
+        "blocked_reason": blocked_reason,
+        "blocker_rule_name": blocker_rule_name,
+        "signal_before_filters": result["signal_before_filters"],
+    }
+    if not trace or trace[-1] != diagnostic:
+        trace.append(diagnostic)
+    result["blocker_trace"] = trace[-20:]
+    print(f"BLOCKED BY: {blocker_rule_name}")
+    return result
+
+def enforce_15m_entry_requirements(
+    result,
+    side,
+    fifteen_m_setup,
+    fifteen_m_swing_break,
+    pullback_block_active=False,
+    pullback_block_reason=None,
+):
+    side = str(side or "").upper()
+    fifteen_m_setup = str(fifteen_m_setup or "WAIT").upper()
+    swing_break = fifteen_m_swing_break or {}
+    break_confirmed = bool(
+        swing_break.get("confirmed")
+        or (
+            swing_break.get("break_happened")
+            and swing_break.get("close_confirmed")
+        )
+    )
+
+    if side not in ["BUY", "SELL"]:
+        return result
+
+    if pullback_block_active:
+        reason = pullback_block_reason or (
+            f"WAIT_{side}_PULLBACK_REQUIRES_NEW_15M_BOS"
+        )
+        result = clear_trade_plan(result, reason)
+        return mark_signal_blocker(
+            result,
+            "pullback_without_new_15m_bos",
+            reason,
+            "new_15m_bos_required_after_pullback",
+            side,
+        )
+
+    if fifteen_m_setup != side or not break_confirmed:
+        reason = swing_break.get("reason") or (
+            f"WAIT_{side}_REQUIRES_15M_SWING_BREAK_CLOSE"
+        )
+        result = clear_trade_plan(result, reason)
+        return mark_signal_blocker(
+            result,
+            "missing_15m_swing_break",
+            reason,
+            "fifteen_m_closed_swing_break_required",
+            side,
+        )
+
+    return result
+
+def get_breakout_entry_allowed(result, side):
+    side = str(side or "").upper()
+    for item in result.get("smc_breakout_debug") or []:
+        if (
+            isinstance(item, dict)
+            and str(item.get("side") or "").upper() == side
+        ):
+            return bool(item.get("breakout_entry_allowed"))
+    return False
+
+def evaluate_smc_15m_momentum(
+    result,
+    one_h,
+    closed_data_15m,
+    fifteen_m_setup,
+    symbol,
+    side,
+):
+    side = str(side or "").upper()
+    setup_side = str(fifteen_m_setup or "").upper()
+    side_rules = {
+        "BUY": {
+            "htf": "BULLISH",
+            "pattern": "HH_HL",
+            "opposite": "SELL",
+        },
+        "SELL": {
+            "htf": "BEARISH",
+            "pattern": "LH_LL",
+            "opposite": "BUY",
+        },
+    }
+    rules = side_rules.get(side)
+    context_15m = _closed_frame_score_context(closed_data_15m, symbol)
+    score_debug = result.get("score_contribution_debug") or {}
+    structure_text = str(result.get("structure_type") or "").upper()
+    one_h_bias = str(one_h.get("bias") or "").upper()
+    one_h_shift = str(one_h.get("shift") or "").upper()
+    htf_structure = (
+        one_h_bias
+        if one_h_bias in ["BULLISH", "BEARISH"]
+        else one_h_shift
+        if one_h_shift in ["BULLISH", "BEARISH"]
+        else str(result.get("structure_trend") or "").upper()
+    )
+    structure_flags = {
+        candidate_side: {
+            "choch": bool(
+                score_debug.get(f"{direction.lower()}_choch")
+                or f"CHOCH {candidate_side}" in structure_text
+            ),
+            "bos": bool(
+                score_debug.get(f"{direction.lower()}_bos")
+                or f"BOS {candidate_side}" in structure_text
+            ),
+        }
+        for candidate_side, direction in [
+            ("BUY", "BULLISH"),
+            ("SELL", "BEARISH"),
+        ]
+    }
+    explicit_structure_sides = {
+        candidate_side
+        for candidate_side in ["BUY", "SELL"]
+        if (
+            f"CHOCH {candidate_side}" in structure_text
+            or f"BOS {candidate_side}" in structure_text
+        )
+    }
+
+    if side in explicit_structure_sides:
+        # The latest explicit 15m CHOCH/BOS is authoritative. Score debug can
+        # still contain an older opposite-side flag from the preceding leg;
+        # that stale flag must not pin the pair to the prior trade direction.
+        structure_flags[side]["choch"] = (
+            structure_flags[side]["choch"]
+            or f"CHOCH {side}" in structure_text
+        )
+        structure_flags[side]["bos"] = (
+            structure_flags[side]["bos"]
+            or f"BOS {side}" in structure_text
+        )
+        structure_flags[rules["opposite"]]["choch"] = False
+
+    try:
+        sell_score = float(result.get("sell_pct") or 0)
+    except (TypeError, ValueError):
+        sell_score = 0
+    try:
+        buy_score = float(result.get("buy_pct") or 0)
+    except (TypeError, ValueError):
+        buy_score = 0
+    try:
+        confidence = float(result.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0
+
+    directional_score = buy_score if side == "BUY" else sell_score if side == "SELL" else 0
+    price = context_15m.get("price")
+    direction = rules["htf"] if rules else None
+    direction_label = str(direction or "").lower()
+    opposite_side = rules["opposite"] if rules else None
+    opposite_direction = (
+        side_rules[opposite_side]["htf"].lower()
+        if opposite_side
+        else "opposite"
+    )
+    fifteen_m_side_ok = bool(
+        rules
+        and (
+            str(context_15m.get("structure") or "").upper() == direction
+            or side in structure_text
+            or str(result.get("fifteen_m_pattern") or "").upper()
+            == rules["pattern"]
+        )
+    )
+    structural_conditions = {
+        "actionable_side": rules is not None,
+        "fifteen_m_setup_required_side": setup_side == side,
+        f"htf_{direction_label}": bool(rules and htf_structure == direction),
+        f"fifteen_m_{direction_label}": fifteen_m_side_ok,
+        f"{direction_label}_choch_or_bos": bool(
+            rules
+            and (
+                structure_flags[side]["choch"]
+                or structure_flags[side]["bos"]
+            )
+        ),
+        f"{side.lower()}_score_at_least_75": directional_score >= 75,
+        f"no_{opposite_direction}_choch": bool(
+            rules and not structure_flags[opposite_side]["choch"]
+        ),
+        "entry_confirmation_available": bool(
+            result.get("current_5m_entry_confirmation")
+            or get_breakout_entry_allowed(result, side)
+        ),
+    }
+    structurally_qualified = all(structural_conditions.values())
+    momentum_confidence = confidence
+
+    if structurally_qualified:
+        # The legacy retest/holding branches reduce confidence because a
+        # pullback did not occur. That penalty is not applicable to the
+        # explicit no-retest momentum continuation model. Rebuild confidence
+        # from directional separation while keeping it capped below 90.
+        momentum_confidence = max(
+            confidence,
+            min(88, directional_score - 10),
+        )
+
+    conditions = {
+        **structural_conditions,
+        "confidence_at_least_70": momentum_confidence >= 70,
+    }
+    rule_names = {
+        "actionable_side": "continuation_side_required",
+        "fifteen_m_setup_required_side": "fifteen_m_setup_required_side",
+        f"htf_{direction_label}": "htf_required_side",
+        f"fifteen_m_{direction_label}": "fifteen_m_structure_required_side",
+        f"{direction_label}_choch_or_bos": "choch_or_bos_required_side",
+        f"{side.lower()}_score_at_least_75": "continuation_score_threshold",
+        "confidence_at_least_70": "continuation_confidence_threshold",
+        f"no_{opposite_direction}_choch": "opposing_choch_absent",
+        "entry_confirmation_available": "current_entry_confirmation_required",
+    }
+    failed_condition = next(
+        (name for name, passed in conditions.items() if not passed),
+        None,
+    )
+    blocker_rule_name = rule_names.get(failed_condition)
+    allowed = failed_condition is None
+    reason = (
+        f"{side} 15m momentum continuation allowed"
+        if allowed
+        else f"{side or 'UNKNOWN'} 15m momentum continuation blocked by "
+        f"{blocker_rule_name or failed_condition}"
+    )
+
+    return {
+        "allowed": allowed,
+        "conditions": conditions,
+        "side": side,
+        "blocked_by": None if allowed else "15m_momentum_continuation",
+        "blocker_rule_name": blocker_rule_name,
+        "reason": reason,
+        "buy_score": buy_score,
+        "sell_score": sell_score,
+        "raw_confidence": confidence,
+        "confidence": momentum_confidence,
+        "bullish_displacement": (
+            "BULLISH" in str(context_15m.get("displacement") or "").upper()
+            or bool(score_debug.get("bullish_displacement"))
+        ),
+        "bearish_displacement": (
+            "BEARISH" in str(context_15m.get("displacement") or "").upper()
+            or bool(score_debug.get("bearish_displacement"))
+        ),
+        "bearish_choch": structure_flags["SELL"]["choch"],
+        "bearish_bos": structure_flags["SELL"]["bos"],
+        "bullish_choch": structure_flags["BUY"]["choch"],
+        "bullish_bos": structure_flags["BUY"]["bos"],
+        "htf_structure": htf_structure,
+        "fifteen_m_structure": context_15m.get("structure"),
+        "price": price,
+        "breakout_entry_allowed": get_breakout_entry_allowed(result, side),
+    }
+
+def get_15m_structure_side(result):
+    structure = str(result.get("structure_type") or "").upper()
+    plan_type = str(result.get("plan_type") or "").upper()
+
+    if "BUY" in structure or "BUY" in plan_type:
+        return "BULLISH"
+    if "SELL" in structure or "SELL" in plan_type:
+        return "BEARISH"
+
+    return "NEUTRAL"
+
+def _score_direction_value(direction):
+    normalized = str(direction or "NEUTRAL").upper()
+
+    # Display scoring should show directional bias, not absolute certainty.
+    # Using 100/0 made one bearish or bullish context push the UI to extreme
+    # values like SELL 100% even when the actual trade confidence was low.
+    # Keep fully aligned directional bias strong, but never mathematically
+    # perfect unless another engine explicitly sets a live trade.
+    if normalized in ["BULLISH", "BUY"]:
+        return 90.0
+    if normalized in ["BEARISH", "SELL"]:
+        return 10.0
+    return 50.0
+
+def _closed_frame_score_context(data, symbol):
+    context = {
+        "price": None,
+        "displacement": "NONE",
+        "displacement_score": 0,
+        "pressure": "NEUTRAL",
+        "structure": "NEUTRAL",
+        "pattern": "NEUTRAL",
+        "last_high": None,
+        "last_low": None,
+    }
+    if data is None or data.empty or len(data) < 3:
+        return context
+
+    try:
+        close = data["Close"]
+        price = float(close.iloc[-1])
+        displacement, displacement_score = detect_displacement(data, symbol)
+        pressure, _pressure_score = detect_recent_pressure(data, symbol)
+        swing_structure = detect_hh_hl_lh_ll_structure(data)
+        pattern = str(swing_structure.get("structure") or "NEUTRAL").upper()
+        structural_bias = detect_htf_structure(data)
+
+        if pattern == "HH_HL":
+            structural_bias = "BULLISH"
+        elif pattern == "LH_LL":
+            structural_bias = "BEARISH"
+
+        context.update({
+            "price": price,
+            "displacement": displacement,
+            "displacement_score": displacement_score,
+            "pressure": pressure,
+            "structure": structural_bias,
+            "pattern": pattern,
+            "last_high": swing_structure.get("last_high"),
+            "last_low": swing_structure.get("last_low"),
+        })
+    except Exception as exc:
+        context["error"] = str(exc)
+
+    return context
+
+def apply_weighted_timeframe_scores(
+    result,
+    one_h,
+    closed_data_1h,
+    closed_data_15m,
+    closed_data_5m,
+    five_m_signal,
+    symbol,
+):
+    weights = {
+        "one_h_bias": 0.20,
+        "fifteen_m_structure": 0.65,
+        "five_m_confirmation": 0.10,
+        "momentum_displacement": 0.05,
+    }
+    one_h_context = _closed_frame_score_context(closed_data_1h, symbol)
+    fifteen_m_context = _closed_frame_score_context(closed_data_15m, symbol)
+    five_m_context = _closed_frame_score_context(closed_data_5m, symbol)
+
+    one_h_direction = str(
+        one_h.get("shift")
+        if one_h.get("shift") in ["BULLISH", "BEARISH"]
+        else one_h.get("bias") or one_h_context.get("structure") or "NEUTRAL"
+    ).upper()
+    fifteen_m_direction = str(
+        fifteen_m_context.get("structure") or "NEUTRAL"
+    ).upper()
+    five_m_direction = (
+        str(five_m_signal).upper()
+        if str(five_m_signal).upper() in ["BUY", "SELL"]
+        else str(five_m_context.get("pressure") or "NEUTRAL").upper()
+    )
+
+    one_h_displacement = str(one_h_context.get("displacement") or "NONE").upper()
+    fifteen_m_displacement = str(
+        fifteen_m_context.get("displacement") or "NONE"
+    ).upper()
+    bearish_impulse = (
+        "BEARISH" in one_h_displacement
+        or "BEARISH" in fifteen_m_displacement
+    )
+    bullish_impulse = (
+        "BULLISH" in one_h_displacement
+        or "BULLISH" in fifteen_m_displacement
+    )
+    if bearish_impulse and not bullish_impulse:
+        momentum_direction = "BEARISH"
+    elif bullish_impulse and not bearish_impulse:
+        momentum_direction = "BULLISH"
+    else:
+        momentum_direction = "NEUTRAL"
+
+    components = {
+        "one_h_bias": _score_direction_value(one_h_direction),
+        "fifteen_m_structure": _score_direction_value(fifteen_m_direction),
+        "five_m_confirmation": _score_direction_value(five_m_direction),
+        "momentum_displacement": _score_direction_value(momentum_direction),
+    }
+    raw_buy_score = sum(
+        components[name] * weights[name]
+        for name in weights
+    )
+    raw_sell_score = 100.0 - raw_buy_score
+    buy_score = int(round(raw_buy_score))
+    sell_score = int(round(raw_sell_score))
+    caps = []
+    score_reason = None
+
+    bullish_choch = "CHOCH BUY" in str(result.get("structure_type") or "").upper()
+    bearish_choch = "CHOCH SELL" in str(result.get("structure_type") or "").upper()
+    bullish_15m_reversal = (
+        fifteen_m_direction == "BULLISH"
+        or bullish_choch
+        or str(result.get("signal") or "").upper() == "BUY"
+    )
+    bearish_15m_reversal = (
+        fifteen_m_direction == "BEARISH"
+        or bearish_choch
+        or str(result.get("signal") or "").upper() == "SELL"
+    )
+    key_level = (
+        result.get("structure_resistance")
+        or result.get("entry_confirm_level")
+    )
+    try:
+        close_above_key_level = (
+            fifteen_m_context.get("price") is not None
+            and key_level not in [None, "--"]
+            and float(fifteen_m_context.get("price")) > float(key_level)
+        )
+    except (TypeError, ValueError):
+        close_above_key_level = False
+
+    bullish_recovery_complete = (
+        bullish_choch
+        and close_above_key_level
+        and "BULLISH" in fifteen_m_displacement
+    )
+
+    def cap_buy(maximum, rule, reason):
+        nonlocal buy_score, sell_score, score_reason
+        before = buy_score
+        if buy_score > maximum:
+            buy_score = maximum
+            sell_score = max(sell_score, 100 - maximum)
+            score_reason = score_reason or reason
+            caps.append({
+                "side": "BUY",
+                "rule": rule,
+                "before": before,
+                "after": buy_score,
+                "reason": reason,
+            })
+
+    def cap_sell(maximum, rule, reason):
+        nonlocal buy_score, sell_score, score_reason
+        before = sell_score
+        if sell_score > maximum:
+            sell_score = maximum
+            buy_score = max(buy_score, 100 - maximum)
+            score_reason = score_reason or reason
+            caps.append({
+                "side": "SELL",
+                "rule": rule,
+                "before": before,
+                "after": sell_score,
+                "reason": reason,
+            })
+
+    if fifteen_m_direction == "BEARISH":
+        cap_buy(45, "15m_bearish_buy_cap", "BUY capped: 15m structure bearish")
+    if (
+        fifteen_m_direction == "NEUTRAL"
+        and "BEARISH" in one_h_displacement
+        and not bullish_15m_reversal
+    ):
+        cap_buy(
+            55,
+            "15m_neutral_1h_bearish_displacement_buy_cap",
+            "BUY capped: 15m neutral + bearish impulse",
+        )
+    if bearish_impulse and not bullish_recovery_complete and not bullish_15m_reversal:
+        cap_buy(
+            45,
+            "bearish_dump_recovery_requirements_buy_cap",
+            "BUY capped: bearish impulse needs SMC reversal + key-level close",
+        )
+    if fifteen_m_direction == "BULLISH":
+        cap_sell(45, "15m_bullish_sell_cap", "SELL capped: 15m structure bullish")
+
+    sell_favored = (
+        bearish_impulse
+        and fifteen_m_direction == "BEARISH"
+        and not bullish_15m_reversal
+    )
+    if sell_favored and score_reason is None:
+        score_reason = "SELL favored: bearish SMC displacement"
+
+    one_h_fifteen_m_disagree = (
+        one_h_direction in ["BULLISH", "BEARISH"]
+        and fifteen_m_direction in ["BULLISH", "BEARISH"]
+        and one_h_direction != fifteen_m_direction
+    )
+    before_confidence = result.get("confidence")
+    if one_h_fifteen_m_disagree:
+        try:
+            result["confidence"] = min(65, int(round(float(before_confidence or 0))))
+        except (TypeError, ValueError):
+            result["confidence"] = 0
+
+    # Confidence must follow separation.
+    # Example: 55/45 should never display 60%+ confidence because the market
+    # is balanced. High confidence requires a clear directional gap.
+    score_gap_for_confidence = abs(int(round(buy_score)) - int(round(sell_score)))
+    confidence_before_alignment = result.get("confidence")
+    confidence_cap_reason = None
+
+    if score_gap_for_confidence < 15:
+        confidence_cap = 40
+        confidence_cap_reason = "confidence capped: buy/sell nearly balanced"
+    elif score_gap_for_confidence < 25:
+        confidence_cap = 55
+        confidence_cap_reason = "confidence capped: weak directional separation"
+    elif score_gap_for_confidence < 35:
+        confidence_cap = 65
+        confidence_cap_reason = "confidence capped: moderate directional separation"
+    elif score_gap_for_confidence < 50:
+        confidence_cap = 75
+        confidence_cap_reason = "confidence capped: direction not dominant enough"
+    else:
+        confidence_cap = 88
+
+    try:
+        result["confidence"] = min(
+            confidence_cap,
+            max(0, int(round(float(result.get("confidence") or 0))))
+        )
+    except (TypeError, ValueError):
+        result["confidence"] = 0
+
+    confidence_alignment_debug = {
+        "buy_score": int(round(buy_score)),
+        "sell_score": int(round(sell_score)),
+        "score_gap": score_gap_for_confidence,
+        "confidence_before_alignment": confidence_before_alignment,
+        "confidence_cap": confidence_cap,
+        "confidence_after_alignment": result.get("confidence"),
+        "confidence_cap_reason": confidence_cap_reason,
+    }
+
+    if confidence_cap_reason:
+        result["debug_reasons"] = (
+            list(result.get("debug_reasons") or []) + [confidence_cap_reason]
+        )[-14:]
+
+    result["buy_pct"] = max(0, min(100, int(round(buy_score))))
+    result["sell_pct"] = max(0, min(100, int(round(sell_score))))
+    result["score_cap_reason"] = score_reason
+    result["score_weight_debug"] = {
+        "weights": weights,
+        "directions": {
+            "one_h": one_h_direction,
+            "fifteen_m": fifteen_m_direction,
+            "five_m": five_m_direction,
+            "momentum": momentum_direction,
+        },
+        "components": components,
+        "raw_buy_score": round(raw_buy_score, 2),
+        "raw_sell_score": round(raw_sell_score, 2),
+        "final_buy_score": result["buy_pct"],
+        "final_sell_score": result["sell_pct"],
+    }
+    result["score_cap_debug"] = {
+        "caps": caps,
+        "score_cap_reason": score_reason,
+        "bearish_impulse": bearish_impulse,
+        "bullish_recovery_complete": bullish_recovery_complete,
+        "bullish_recovery_requirements": {
+            "choch_up": bullish_choch,
+            "close_above_key_level": close_above_key_level,
+            "bullish_displacement": "BULLISH" in fifteen_m_displacement,
+        },
+        "sell_favored_bearish_displacement": sell_favored,
+    }
+
+    def strip_ema_debug(context):
+        return {
+            key: value
+            for key, value in dict(context or {}).items()
+            if "ema" not in str(key).lower()
+        }
+
+    result["timeframe_alignment_debug"] = {
+        "one_h": strip_ema_debug(one_h_context),
+        "fifteen_m": strip_ema_debug(fifteen_m_context),
+        "five_m": strip_ema_debug(five_m_context),
+        "one_h_fifteen_m_disagree": one_h_fifteen_m_disagree,
+        "confidence_before_cap": before_confidence,
+        "confidence_after_cap": result.get("confidence"),
+        "confidence_alignment": confidence_alignment_debug,
+    }
+    if score_reason:
+        result["debug_reasons"] = (
+            list(result.get("debug_reasons") or []) + [score_reason]
+        )[-14:]
+
+    print("SCORE_WEIGHT_DEBUG =", result["score_weight_debug"])
+    print("SCORE_CAP_DEBUG =", result["score_cap_debug"])
+    print("TIMEFRAME_ALIGNMENT_DEBUG =", result["timeframe_alignment_debug"])
+    print("CONFIDENCE_ALIGNMENT_DEBUG =", confidence_alignment_debug)
+    return result
+
+def apply_directional_wait_bias(result, one_h, symbol):
+    bias = one_h.get("bias")
+    shift = one_h.get("shift")
+    structure_15m = get_15m_structure_side(result)
+    one_h_directional_bias = bias or shift or "NEUTRAL"
+    directional_bias_strength = 0
+
+    if bias in ["BULLISH", "BEARISH"]:
+        directional_bias_strength = 62
+    elif shift in ["BULLISH", "BEARISH"]:
+        one_h_directional_bias = shift
+        directional_bias_strength = 55
+
+    result["one_h_directional_bias"] = one_h_directional_bias
+    result["directional_bias_strength"] = directional_bias_strength
+    result["wait_reason"] = result.get("plan_reason") or "Waiting for BOS"
+
+    if one_h_directional_bias in ["BULLISH", "BEARISH"]:
+        result.setdefault("debug_reasons", [])
+        result["debug_reasons"] = (list(result.get("debug_reasons") or []) + [
+            f"1h directional bias: {one_h_directional_bias} ({directional_bias_strength})"
+        ])[-14:]
+
+    print("DIRECTIONAL_PERCENT_DEBUG =", {
+        "symbol": symbol,
+        "trend_1h": bias,
+        "shift_1h": shift,
+        "structure_15m": structure_15m,
+        "buy_percentage_source": "real_15m_score",
+        "sell_percentage_source": "real_15m_score",
+        "final_buy_pct": result.get("buy_pct"),
+        "final_sell_pct": result.get("sell_pct"),
+        "final_confidence": result.get("confidence"),
+        "one_h_directional_bias": result.get("one_h_directional_bias"),
+        "directional_bias_strength": result.get("directional_bias_strength"),
+    })
+
+    return result
+
+def release_signal_if_weighted_scores_reverse(result, symbol):
+    weighted_signal = str(result.get("signal") or "WAIT").upper()
+
+    try:
+        weighted_buy_score = float(result.get("buy_pct") or 0)
+        weighted_sell_score = float(result.get("sell_pct") or 0)
+    except (TypeError, ValueError):
+        weighted_buy_score = 0
+        weighted_sell_score = 0
+
+    score_reversed = (
+        weighted_signal == "BUY"
+        and weighted_sell_score > weighted_buy_score
+    ) or (
+        weighted_signal == "SELL"
+        and weighted_buy_score > weighted_sell_score
+    )
+
+    if not score_reversed:
+        return result
+
+    setup_type = str(result.get("strategy_setup_type") or "").upper()
+    if weighted_signal in ["BUY", "SELL"] and (
+        setup_type.startswith("SMC_")
+        or setup_type.endswith("_5M_ENTRY")
+        or "15M_SWING" in setup_type
+    ):
+        result["score_conflict_advisory"] = (
+            f"Weighted scores currently oppose {weighted_signal}, but SMC "
+            "structure remains authoritative"
+        )
+        result["debug_reasons"] = (
+            list(result.get("debug_reasons") or [])
+            + [result["score_conflict_advisory"]]
+        )[-14:]
+        return result
+
+    setup_type = str(result.get("strategy_setup_type") or "").upper()
+    if setup_type.endswith("_5M_ENTRY") or "15M_MOMENTUM_DIRECT" in setup_type:
+        result["score_conflict_advisory"] = (
+            f"Weighted scores currently oppose {weighted_signal}, but the "
+            "completed 15m breakout remains authoritative"
+        )
+        result["debug_reasons"] = (
+            list(result.get("debug_reasons") or [])
+            + [result["score_conflict_advisory"]]
+        )[-14:]
+        return result
+
+    reversed_reason = (
+        f"{weighted_signal} setup released because current weighted scores "
+        "now favor the opposite side"
+    )
+    result = clear_trade_plan(result, reversed_reason)
+    result = mark_signal_blocker(
+        result,
+        "score_direction_reversed",
+        reversed_reason,
+        "current_weighted_score_must_favor_signal",
+        weighted_signal,
+    )
+    FINAL_SIGNAL_HOLD.pop(get_final_signal_hold_key(symbol), None)
+    save_final_signal_hold()
+    return result
+
+def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
+    closed_data_5m = remove_current_forming_candle(data_5m, 5)
+    closed_data_15m = remove_current_forming_candle(data_15m, 15)
+    closed_data_1h = remove_current_forming_candle(data_1h, 60)
+
+    setup_result_15m = get_signal(
+        closed_data_15m,
+        closed_data_1h,
+        symbol,
+        state_key=f"{symbol}_15M_ENTRY"
+    )
+    one_h = detect_1h_trend_filter(closed_data_1h, symbol)
+    lightweight_5m_signal = detect_lightweight_5m_confirmation(closed_data_5m, closed_data_15m, symbol)
+    detected_15m_setup = get_15m_setup_side(setup_result_15m)
+    swing_breaks = {
+        side: evaluate_closed_15m_swing_break(
+            closed_data_15m,
+            side,
+            symbol,
+        )
+        for side in ["BUY", "SELL"]
+    }
+    clean_15m_candidates = []
+    clean_15m_rejections = []
+
+    for side, swing_break in swing_breaks.items():
+        if swing_break.get("confirmed"):
+            clean_15m_candidates.append({
+                "side": side,
+                "swing_break": swing_break,
+                "closed_candle_time": swing_break.get("closed_candle_time"),
+            })
+        else:
+            clean_15m_rejections.append({
+                "side": side,
+                "swing_break": swing_break,
+                "reason": swing_break.get("reason") or "WAIT_NO_15M_BREAK",
+            })
+
+    def clean_15m_candidate_time(item):
+        try:
+            return pd.Timestamp(item.get("closed_candle_time"))
+        except Exception:
+            return pd.Timestamp.min
+
+    clean_15m_entry = (
+        max(clean_15m_candidates, key=clean_15m_candidate_time)
+        if clean_15m_candidates
+        else None
+    )
+    pending_15m_setup = get_pending_15m_swing_setup(
+        symbol,
+        closed_data_5m,
+    )
+    if clean_15m_entry:
+        clean_break = clean_15m_entry["swing_break"]
+        pending_15m_setup = {
+            "symbol": normalize_symbol(symbol),
+            "side": clean_15m_entry["side"],
+            "swing_level": clean_break.get("swing_level"),
+            "break_candle_time": clean_break.get("closed_candle_time"),
+            "break_close": clean_break.get("closed_candle_close"),
+            "status": "DIRECT_15M_ENTRY",
+            "expires_after_5m_candles": None,
+            "candles_remaining": None,
+            "direct_15m_entry": True,
+        }
+    if not pending_15m_setup:
+        fallback_break = swing_breaks.get(detected_15m_setup) or {}
+        fallback_key = get_15m_swing_watch_key(symbol, detected_15m_setup)
+        if (
+            detected_15m_setup in ["BUY", "SELL"]
+            and fallback_break.get("confirmed")
+            and fallback_key not in FIFTEEN_M_SWING_WATCH
+        ):
+            pending_15m_setup = {
+                "symbol": normalize_symbol(symbol),
+                "side": detected_15m_setup,
+                "swing_level": fallback_break.get("swing_level"),
+                "break_candle_time": fallback_break.get(
+                    "closed_candle_time"
+                ),
+                "break_close": fallback_break.get(
+                    "closed_candle_close"
+                ),
+                "status": "PENDING",
+                "expires_after_5m_candles": (
+                    FIFTEEN_M_PENDING_MAX_5M_CANDLES
+                ),
+            }
+    fifteen_m_setup = (
+        str(pending_15m_setup.get("side")).upper()
+        if pending_15m_setup
+        else "WAIT"
+    )
+    fifteen_m_swing_break = (
+        {
+            **swing_breaks.get(fifteen_m_setup, {}),
+            "confirmed": True,
+            "swing_level": pending_15m_setup.get("swing_level"),
+            "closed_candle_time": pending_15m_setup.get("break_candle_time"),
+            "closed_candle_close": pending_15m_setup.get("break_close"),
+            "reason": (
+                f"Pending {fifteen_m_setup} from completed 15m swing break"
+            ),
+            "pending_setup": copy.deepcopy(pending_15m_setup),
+        }
+        if pending_15m_setup
+        else swing_breaks.get(detected_15m_setup, {
+            "confirmed": False,
+            "reason": "WAIT_NO_15M_BREAK",
+        })
+    )
+    fifteen_m_bos_level = (
+        pending_15m_setup.get("swing_level")
+        if pending_15m_setup
+        else get_15m_setup_level(setup_result_15m, detected_15m_setup)
+    )
+    fifteen_m_entry_level = (
+        fifteen_m_swing_break.get("swing_level")
+        if fifteen_m_swing_break.get("swing_level") is not None
+        else fifteen_m_bos_level
+    )
+    fifteen_m_bos_level = fifteen_m_entry_level
+    momentum_breakout_setup = str(
+        setup_result_15m.get("strategy_setup_type") or ""
+    ).upper() in [
+        "BUY_MOMENTUM_BREAKOUT",
+        "SELL_MOMENTUM_BREAKOUT",
+    ]
+    preliminary_five_m_entry = confirm_5m_entry_from_15m_setup(
+        closed_data_5m,
+        fifteen_m_setup,
+        fifteen_m_entry_level,
+        symbol,
+        momentum_breakout=momentum_breakout_setup,
+    )
+    current_5m_entry_confirmation = is_current_5m_entry_confirmation(
+        closed_data_5m,
+        preliminary_five_m_entry,
+        fifteen_m_setup,
+    )
+    fifteen_m_breakout_candle_time = (
+        pending_15m_setup.get("break_candle_time")
+        if pending_15m_setup
+        else None
+    )
+    five_m_entry = confirm_5m_close_after_15m_break(
+        closed_data_5m,
+        fifteen_m_setup,
+        fifteen_m_entry_level,
+        fifteen_m_breakout_candle_time,
+        symbol,
+    )
+    if pending_15m_setup and (
+        five_m_entry.get("invalidated")
+        or five_m_entry.get("expired")
+    ):
+        pending_key = get_15m_swing_watch_key(symbol, fifteen_m_setup)
+        watched = FIFTEEN_M_SWING_WATCH.get(pending_key)
+        if isinstance(watched, dict):
+            if five_m_entry.get("invalidated"):
+                watched["status"] = "INVALIDATED"
+                watched["invalidated_at"] = five_m_entry.get(
+                    "closed_candle_time"
+                )
+                watched["invalidation_close"] = five_m_entry.get("close")
+            else:
+                watched["status"] = "EXPIRED"
+                watched["expired_at"] = five_m_entry.get(
+                    "closed_candle_time"
+                )
+            save_fifteen_m_swing_watch()
+    five_m_signal = five_m_entry.get("side") or "WAIT"
+    pullback_block_active = bool(
+        fifteen_m_setup in ["BUY", "SELL"]
+        and (
+            five_m_entry.get("invalidated")
+            or five_m_entry.get("expired")
+        )
+    )
+    pullback_block_reason = (
+        f"{fifteen_m_setup} blocked: pullback/expiry invalidated the 15m break; "
+        f"wait for a new 15m {fifteen_m_setup} swing break"
+        if pullback_block_active
+        else None
+    )
+    setup_candle_time = setup_result_15m.get("setup_candle_time")
+    confirmation_anchor_time = fifteen_m_breakout_candle_time or setup_candle_time
+    five_m_after_setup = True
+
+    try:
+        if confirmation_anchor_time and five_m_entry.get("closed_candle_time"):
+            setup_ts = pd.Timestamp(confirmation_anchor_time)
+            five_ts = pd.Timestamp(five_m_entry.get("closed_candle_time"))
+
+            if setup_ts.tzinfo is None:
+                setup_ts = setup_ts.tz_localize("UTC")
+            else:
+                setup_ts = setup_ts.tz_convert("UTC")
+
+            if five_ts.tzinfo is None:
+                five_ts = five_ts.tz_localize("UTC")
+            else:
+                five_ts = five_ts.tz_convert("UTC")
+
+            five_m_after_setup = five_ts > setup_ts
+    except Exception:
+        five_m_after_setup = False
+
+    print("STRICT_CANDLE_CLOSE_DEBUG =", {
+        "symbol": symbol,
+        "raw_5m_rows": len(data_5m) if data_5m is not None else 0,
+        "closed_5m_rows": len(closed_data_5m) if closed_data_5m is not None else 0,
+        "raw_15m_rows": len(data_15m) if data_15m is not None else 0,
+        "closed_15m_rows": len(closed_data_15m) if closed_data_15m is not None else 0,
+        "raw_1h_rows": len(data_1h) if data_1h is not None else 0,
+        "closed_1h_rows": len(closed_data_1h) if closed_data_1h is not None else 0,
+        "setup_candle_time": setup_candle_time,
+        "fifteen_m_breakout_candle_time": fifteen_m_breakout_candle_time,
+        "five_m_closed_candle_time": five_m_entry.get("closed_candle_time"),
+        "five_m_after_setup": five_m_after_setup,
+        "preliminary_5m_confirmation": preliminary_five_m_entry,
+    })
+    original_15m_signal = str(setup_result_15m.get("signal") or "WAIT").upper()
+    signal_before_mtf_filters = (
+        fifteen_m_setup
+        if fifteen_m_setup in ["BUY", "SELL"]
+        else original_15m_signal
+    )
+    result = setup_result_15m
+
+    # 15m structure is the only entry trigger. Older momentum text can still
+    # affect confidence, but it must not create BUY/SELL without the explicit
+    # closed 15m swing break below.
+    plan_text_for_setup = " ".join([
+        str(result.get("plan_type") or ""),
+        str(result.get("plan_reason") or ""),
+        str(result.get("strategy_setup_type") or ""),
+        str(result.get("entry_timing") or ""),
+    ]).upper()
+    if (
+        fifteen_m_setup not in ["BUY", "SELL"]
+        and original_15m_signal in ["BUY", "SELL"]
+        and swing_breaks.get(original_15m_signal, {}).get("confirmed")
+        and (
+            "MOMENTUM_BREAKOUT" in plan_text_for_setup
+            or "MOMENTUM BREAKOUT" in plan_text_for_setup
+            or "WITHOUT RETEST" in plan_text_for_setup
+        )
+    ):
+        fifteen_m_setup = original_15m_signal
+        signal_before_mtf_filters = original_15m_signal
+        fifteen_m_swing_break = {
+            **(fifteen_m_swing_break or {}),
+            "confirmed": True,
+            "break_happened": True,
+            "close_confirmed": True,
+            "reason": f"{original_15m_signal} 15m swing break accepted without retest",
+            "retest_required": False,
+        }
+        result["blocked_by"] = None
+        result["blocked_reason"] = None
+        result["blocker_rule_name"] = None
+        result["strategy_setup_complete"] = True
+        result["strategy_setup_type"] = f"{original_15m_signal}_15M_SWING_BREAK"
+        result["entry_timing"] = f"{original_15m_signal} 15M SWING CLOSE"
+        result["plan_reason"] = (
+            f"{original_15m_signal} accepted: "
+            "15m swing break and close confirmed. Retest is not required."
+        )
+        print("NO_RETEST_15M_SETUP_ACCEPTED =", {
+            "symbol": symbol,
+            "side": original_15m_signal,
+            "original_plan": plan_text_for_setup,
+        })
+
+    blocked_reason = None
+
+    result["strategy_model"] = "1h trend / 15m setup / 5m entry"
+    result["strategy_trend_timeframe"] = "1h"
+    result["strategy_entry_timeframe"] = "5m"
+    result["strategy_setup_timeframe"] = "15m"
+    result["strategy_confirmation_timeframe"] = "5m closed candle"
+    result["confirmation_5m"] = five_m_signal
+    result["confirmation_5m_raw"] = lightweight_5m_signal
+    result["current_5m_entry_confirmation"] = (
+        current_5m_entry_confirmation
+    )
+    result["one_h_bias"] = one_h.get("bias")
+    result["one_h_shift"] = one_h.get("shift")
+    result["one_h_conflict_advisory"] = (
+        fifteen_m_setup == "BUY"
+        and not one_h.get("buy_allowed")
+    ) or (
+        fifteen_m_setup == "SELL"
+        and not one_h.get("sell_allowed")
+    )
+    result["setup_timeframe_used"] = "15m"
+    result["final_signal_source"] = "get_mtf_signal"
+    result["fifteen_m_swing_break"] = fifteen_m_swing_break
+    result["fifteen_m_swing_break_confirmed"] = bool(
+        fifteen_m_swing_break.get("confirmed")
+    )
+    result["fifteen_m_swing_level"] = fifteen_m_swing_break.get("swing_level")
+    result["fifteen_m_closed_candle_close"] = fifteen_m_swing_break.get(
+        "closed_candle_close"
+    )
+    inherited_blocked_by = result.get("blocked_by")
+    inherited_blocker_rule_name = result.get("blocker_rule_name")
+    inherited_blocked_reason = result.get("blocked_reason")
+    inherited_blocker_debug = None
+    late_entry_debug = None
+
+    print("ONE_H_CONFLICT_ADVISORY_DEBUG =", {
+        "symbol": symbol,
+        "fifteen_m_setup": fifteen_m_setup,
+        "one_h_bias": one_h.get("bias"),
+        "one_h_shift": one_h.get("shift"),
+        "buy_allowed": one_h.get("buy_allowed"),
+        "sell_allowed": one_h.get("sell_allowed"),
+        "conflict_advisory": result["one_h_conflict_advisory"],
+        "blocks_entry": False,
+    })
+
+    def score_favors_setup():
+        try:
+            buy_pct = float(result.get("buy_pct") or 0)
+            sell_pct = float(result.get("sell_pct") or 0)
+        except (TypeError, ValueError):
+            buy_pct = 0
+            sell_pct = 0
+
+        if fifteen_m_setup == "BUY":
+            return buy_pct > sell_pct
+        if fifteen_m_setup == "SELL":
+            return sell_pct > buy_pct
+
+        return False
+
+    def confidence_value():
+        try:
+            return float(result.get("confidence") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def apply_5m_confirmed_signal():
+        nonlocal late_entry_debug
+
+        if not fifteen_m_swing_break.get("confirmed"):
+            reason = fifteen_m_swing_break.get("reason") or "WAIT_NO_15M_CLOSE_CONFIRMATION"
+            clear_trade_plan(result, reason)
+            mark_signal_blocker(
+                result,
+                "missing_15m_swing_break",
+                reason,
+                "fifteen_m_closed_swing_break_required",
+                fifteen_m_setup,
+            )
+            result["entry_timing"] = f"WAIT 15M {fifteen_m_setup} SWING CLOSE"
+            return False
+
+        if pullback_block_active:
+            clear_trade_plan(result, pullback_block_reason)
+            mark_signal_blocker(
+                result,
+                "pullback_without_new_15m_bos",
+                pullback_block_reason,
+                "new_15m_bos_required_after_pullback",
+                fifteen_m_setup,
+            )
+            result["entry_timing"] = f"WAIT NEW 15M {fifteen_m_setup} BOS"
+            return False
+
+        risk_levels = build_15m_swing_risk_levels(
+            closed_data_15m,
+            five_m_entry.get("close")
+            or fifteen_m_swing_break.get("closed_candle_close"),
+            fifteen_m_setup,
+            symbol,
+        )
+        print("SWING_SL_RR_DEBUG =", risk_levels)
+
+        if not risk_levels.get("ok"):
+            reason = risk_levels.get("reason") or "WAIT_INVALID_SWING_SL"
+            clear_trade_plan(result, reason)
+            mark_signal_blocker(
+                result,
+                "invalid_swing_sl" if reason == "WAIT_INVALID_SWING_SL" else "invalid_risk_reward",
+                reason,
+                "swing_sl_rr_required",
+                fifteen_m_setup,
+            )
+            result["entry_timing"] = "WAIT VALID SWING SL"
+            result["swing_sl_debug"] = risk_levels
+            return False
+
+        result["signal"] = fifteen_m_setup
+        result["signal_before_filters"] = fifteen_m_setup
+        result["plan_bias"] = fifteen_m_setup
+        result["entry_quality"] = "SMC"
+        result["entry_timing"] = (
+            "5M CLOSED CONFIRMATION"
+            if five_m_entry.get("close_confirmed")
+            else "15M SWING CLOSE"
+        )
+        result["plan_type"] = (
+            f"SMC {fifteen_m_setup} 5M CONFIRMED"
+            if five_m_entry.get("close_confirmed")
+            else f"SMC {fifteen_m_setup} 15M CONFIRMED"
+        )
+        result["plan_reason"] = (
+            five_m_entry.get("reason")
+            if five_m_entry.get("close_confirmed")
+            else f"{fifteen_m_setup} after 15m swing break and close confirmation"
+        )
+        result["strategy_setup_complete"] = True
+        result["strategy_setup_type"] = (
+            f"{fifteen_m_setup}_5M_ENTRY"
+            if five_m_entry.get("close_confirmed")
+            else f"{fifteen_m_setup}_15M_SWING_ENTRY"
+        )
+        result["blocker_rule_name"] = None
+        result["blocked_by"] = None
+        result["blocked_reason"] = None
+
+        try:
+            normalized_symbol = normalize_symbol(symbol)
+            decimals = get_strategy_decimals(normalized_symbol)
+            entry_price = risk_levels["entry"]
+            result["entry_price"] = entry_price
+            result["price"] = entry_price
+            result["stop_loss"] = risk_levels["stop_loss"]
+            result["tp1"] = risk_levels["tp1"]
+            result["tp2"] = risk_levels["tp2"]
+            result["protected_sl_price"] = round(
+                calculate_protected_sl_from_tp2_price(
+                    entry_price,
+                    risk_levels["tp2"],
+                    fifteen_m_setup,
+                ),
+                decimals,
+            )
+            result["risk_reward"] = "1:2"
+            result["swing_sl_debug"] = risk_levels
+
+            result["level_source"] = "15m swing"
+            result["tp1_rule"] = "80% of entry-to-TP2"
+            result["tp2_rule"] = "2R from entry"
+            result["protected_sl_rule"] = "50% of entry-to-TP2 after TP1"
+        except Exception as exc:
+            print("TIMEFRAME_ENTRY_LEVEL_WARNING =", {
+                "symbol": symbol,
+                "error": str(exc),
+            })
+
+        timing_label = "5m close" if five_m_entry.get("close_confirmed") else "15m close"
+        result["signal_text"] = f"{fifteen_m_setup} {'🟢' if fifteen_m_setup == 'BUY' else '🔴'} ({result.get('confidence', 0)}% | {timing_label})"
+        result["debug_reasons"] = (list(result.get("debug_reasons") or []) + [
+            f"{fifteen_m_setup} allowed: 15m swing break + close confirmed"
+        ])[-14:]
+        return True
+
+    momentum_15m = evaluate_smc_15m_momentum(
+        result,
+        one_h,
+        closed_data_15m,
+        fifteen_m_setup,
+        symbol,
+        fifteen_m_setup,
+    )
+    result["momentum_15m_debug"] = momentum_15m
+    continuation_debug = {
+        "blocked_by": momentum_15m.get("blocked_by"),
+        "blocker_rule_name": momentum_15m.get("blocker_rule_name"),
+        "side": momentum_15m.get("side"),
+        "reason": momentum_15m.get("reason"),
+    }
+    result["CONTINUATION_DEBUG"] = continuation_debug
+    print("CONTINUATION_DEBUG =", continuation_debug)
+    strong_momentum_entry = False
+
+    # SIMPLE ENTRY MODEL:
+    # If 15m structure says BUY/SELL and the 15m swing break closed,
+    # keep structure authoritative. Confidence, score, and HTF are descriptive
+    # only; they must not turn a clean 15m entry back into WAIT.
+    fifteen_m_break_confirmed = bool(
+        fifteen_m_swing_break.get("confirmed")
+        or (
+            fifteen_m_swing_break.get("break_happened")
+            and fifteen_m_swing_break.get("close_confirmed")
+        )
+    )
+    direct_15m_momentum_entry = (
+        SIMPLE_MOMENTUM_DIRECT_15M_ENTRY
+        and fifteen_m_setup in ["BUY", "SELL"]
+        and fifteen_m_break_confirmed
+        and str(result.get("fake_breakout") or "NONE").upper() == "NONE"
+    )
+    print("SIMPLE_15M_ENTRY_GATE_DEBUG =", {
+        "symbol": symbol,
+        "fifteen_m_setup": fifteen_m_setup,
+        "break_happened": fifteen_m_swing_break.get("break_happened"),
+        "close_confirmed": fifteen_m_swing_break.get("close_confirmed"),
+        "confirmed": fifteen_m_swing_break.get("confirmed"),
+        "fake_breakout": result.get("fake_breakout"),
+        "score_favors_setup_warning_only": score_favors_setup(),
+        "confidence_warning_only": confidence_value(),
+        "five_m_confirmation_warning_only": current_5m_entry_confirmation,
+        "allowed": direct_15m_momentum_entry,
+    })
+
+    if strong_momentum_entry:
+        momentum_side = fifteen_m_setup
+        momentum_direction = "bullish" if momentum_side == "BUY" else "bearish"
+        result["confidence"] = int(round(momentum_15m["confidence"]))
+        momentum_entry = momentum_15m.get("price")
+        risk_levels = build_15m_swing_risk_levels(
+            closed_data_15m,
+            momentum_entry,
+            momentum_side,
+            symbol,
+        )
+
+        if not risk_levels.get("ok"):
+            held_setup = FINAL_SIGNAL_HOLD.get(
+                get_final_signal_hold_key(symbol)
+            ) or {}
+            held_fields = held_setup.get("fields") or {}
+            held_levels = {
+                "entry_price": held_fields.get("entry_price") or held_setup.get("entry"),
+                "stop_loss": held_fields.get("stop_loss") or held_setup.get("sl"),
+                "tp1": held_fields.get("tp1") or held_setup.get("tp1"),
+                "tp2": held_fields.get("tp2") or held_setup.get("tp2"),
+            }
+            held_levels_ok, _held_reason = validate_trade_levels_1_to_2(
+                held_levels,
+                momentum_side,
+            )
+            if (
+                str(held_setup.get("signal") or "").upper() == momentum_side
+                and held_levels_ok
+            ):
+                risk_levels = {
+                    "ok": True,
+                    "reason": None,
+                    "entry": float(held_levels["entry_price"]),
+                    "stop_loss": float(held_levels["stop_loss"]),
+                    "tp1": float(held_levels["tp1"]),
+                    "tp2": float(held_levels["tp2"]),
+                    "risk_reward": "1:2",
+                    "level_source": f"validated held {momentum_side} setup",
+                }
+                print(f"SMC_{momentum_side}_MOMENTUM_HELD_LEVELS_REUSED =", {
+                    "symbol": symbol,
+                    **risk_levels,
+                })
+
+        if risk_levels.get("ok"):
+            result["signal"] = momentum_side
+            result["signal_before_filters"] = momentum_side
+            result["plan_bias"] = momentum_side
+            result["entry_quality"] = "SMC"
+            result["entry_timing"] = "15M MOMENTUM ENTRY"
+            result["plan_type"] = f"SMC {momentum_side} 15M MOMENTUM"
+            result["plan_reason"] = (
+                f"Strong {momentum_direction} continuation: HTF and 15m "
+                f"{momentum_direction} with CHOCH/BOS confirmation"
+            )
+            result["strategy_setup_complete"] = True
+            result["strategy_setup_type"] = (
+                f"SMC_{momentum_side}_15M_MOMENTUM"
+            )
+            result["blocked_by"] = None
+            result["blocked_reason"] = None
+            result["blocker_rule_name"] = None
+            result["blocker_trace"] = []
+            result["entry_price"] = risk_levels["entry"]
+            result["price"] = risk_levels["entry"]
+            result["stop_loss"] = risk_levels["stop_loss"]
+            result["tp1"] = risk_levels["tp1"]
+            result["tp2"] = risk_levels["tp2"]
+            result["risk_reward"] = "1:2"
+            result["swing_sl_debug"] = risk_levels
+            result["signal_text"] = (
+                f"{momentum_side} "
+                f"{'🟢' if momentum_side == 'BUY' else '🔴'} "
+                f"({result.get('confidence', 0)}% | 15m momentum)"
+            )
+            result["debug_reasons"] = (
+                list(result.get("debug_reasons") or [])
+                + [f"SMC_{momentum_side}_15M_MOMENTUM: retest not required"]
+            )[-14:]
+            print(
+                f"SMC_{momentum_side}_15M_MOMENTUM_DEBUG =",
+                momentum_15m,
+            )
+        else:
+            blocked_reason = risk_levels.get("reason") or "WAIT_INVALID_SWING_SL"
+            result = clear_trade_plan(result, blocked_reason)
+            result = mark_signal_blocker(
+                result,
+                "invalid_swing_sl",
+                blocked_reason,
+                "swing_sl_rr_required",
+                momentum_side,
+            )
+
+    elif direct_15m_momentum_entry:
+        momentum_entry = momentum_15m.get("price") or result.get("price")
+        risk_levels = build_15m_swing_risk_levels(
+            closed_data_15m,
+            momentum_entry,
+            fifteen_m_setup,
+            symbol,
+        )
+        print("DIRECT_15M_MOMENTUM_RISK_DEBUG =", {
+            "symbol": symbol,
+            "side": fifteen_m_setup,
+            "entry": momentum_entry,
+            **risk_levels,
+        })
+
+        if not risk_levels.get("ok"):
+            blocked_reason = risk_levels.get("reason") or "WAIT_INVALID_SWING_SL"
+            result = clear_trade_plan(result, blocked_reason)
+            result = mark_signal_blocker(
+                result,
+                "invalid_swing_sl",
+                blocked_reason,
+                "direct_15m_momentum_swing_sl_rr_required",
+                fifteen_m_setup,
+            )
+            result["entry_timing"] = "WAIT VALID 15M MOMENTUM SL"
+            result["swing_sl_debug"] = risk_levels
+        else:
+            result["signal"] = fifteen_m_setup
+            result["signal_before_filters"] = fifteen_m_setup
+            result["plan_bias"] = fifteen_m_setup
+            result["entry_quality"] = "SIMPLE_MOMENTUM"
+            result["entry_timing"] = "15M MOMENTUM ENTRY"
+            result["plan_type"] = f"SMC {fifteen_m_setup} 15M MOMENTUM"
+            result["plan_reason"] = (
+                f"{fifteen_m_setup} allowed from simple 15m structure: "
+                "15m swing break + 15m close confirmed. 5m/score/confidence are warnings only."
+            )
+            result["strategy_setup_complete"] = True
+            result["strategy_setup_type"] = f"SMC_{fifteen_m_setup}_15M_MOMENTUM_DIRECT"
+            result["blocked_by"] = None
+            result["blocked_reason"] = None
+            result["blocker_rule_name"] = None
+            result["blocker_trace"] = []
+            result["entry_price"] = risk_levels["entry"]
+            result["price"] = risk_levels["entry"]
+            result["stop_loss"] = risk_levels["stop_loss"]
+            result["tp1"] = risk_levels["tp1"]
+            result["tp2"] = risk_levels["tp2"]
+            result["risk_reward"] = "1:2"
+            result["risk_percent"] = 0.5
+            result["target_percent"] = 1.0
+            result["swing_sl_debug"] = risk_levels
+            result["level_source"] = "15m swing direct momentum"
+            result["signal_text"] = f"{fifteen_m_setup} {'🟢' if fifteen_m_setup == 'BUY' else '🔴'} ({result.get('confidence', 0)}% | 15m BOS)"
+            result["debug_reasons"] = (list(result.get("debug_reasons") or []) + [
+                f"{fifteen_m_setup} direct 15m momentum entry: 5m confirmation not required"
+            ])[-14:]
+            print("DIRECT_15M_MOMENTUM_ENTRY_DEBUG =", {
+                "symbol": symbol,
+                "side": fifteen_m_setup,
+                "original_15m_signal": original_15m_signal,
+                "swing_break_confirmed": fifteen_m_swing_break.get("confirmed"),
+                "fake_breakout": result.get("fake_breakout"),
+                "score_favors_setup": score_favors_setup(),
+                "confidence": confidence_value(),
+                "current_5m_entry_confirmation": current_5m_entry_confirmation,
+                "allowed": True,
+                "risk_levels": risk_levels,
+            })
+
+    elif (
+        fifteen_m_setup in ["BUY", "SELL"]
+        and not fifteen_m_swing_break.get("confirmed")
+    ):
+        blocked_reason = fifteen_m_swing_break.get("reason") or "WAIT_NO_15M_CLOSE_CONFIRMATION"
+        result = clear_trade_plan(result, blocked_reason)
+        result = mark_signal_blocker(
+            result,
+            "missing_15m_swing_break",
+            blocked_reason,
+            "fifteen_m_closed_swing_break_required",
+            fifteen_m_setup,
+        )
+        result["entry_timing"] = f"WAIT 15M {fifteen_m_setup} SWING CLOSE"
+
+    elif fifteen_m_setup not in ["BUY", "SELL"]:
+        existing_signal = str(result.get("signal") or "").upper()
+        blocked_reason = (
+            result.get("plan_reason")
+            if existing_signal in ["BUY", "SELL"]
+            else "Waiting for fresh 15m BOS/CHOCH setup"
+        )
+        result = clear_trade_plan(result, blocked_reason)
+        result = mark_signal_blocker(
+            result,
+            "missing_15m_setup",
+            blocked_reason,
+            "fifteen_m_setup_required",
+            signal_before_mtf_filters
+        )
+        result["entry_timing"] = "WAIT 15M SETUP"
+
+    elif five_m_signal != fifteen_m_setup or not five_m_after_setup:
+        apply_5m_confirmed_signal()
+
+    else:
+        inherited_blocker_debug = {
+            "symbol": symbol,
+            "fifteen_m_setup": fifteen_m_setup,
+            "five_m_signal": five_m_signal,
+            "five_m_closed_candle_confirmed": bool(
+                five_m_entry.get("close_confirmed")
+            ),
+            "inherited_blocked_by": inherited_blocked_by,
+            "inherited_blocker_rule_name": inherited_blocker_rule_name,
+            "inherited_blocked_reason": inherited_blocked_reason,
+            "override_allowed": True,
+            "override_denied_reason": None,
+            "final_signal": fifteen_m_setup,
+        }
+        print("INHERITED_BLOCKER_OVERRIDE_DEBUG =", inherited_blocker_debug)
+        apply_5m_confirmed_signal()
+
+    hold_key = get_final_signal_hold_key(symbol)
+    current_final_signal = str(result.get("signal") or "WAIT").upper()
+    freshness_candle_time = (
+        setup_candle_time
+        or five_m_entry.get("closed_candle_time")
+    )
+    signal_hold_debug = {
+        "symbol": hold_key,
+        "incoming_signal": current_final_signal,
+        "fifteen_m_setup": fifteen_m_setup,
+        "held_signal": None,
+        "hold_active": False,
+        "release_reason": None,
+    }
+
+    if current_final_signal in ["BUY", "SELL"]:
+        previous_setup = FINAL_SIGNAL_HOLD.get(hold_key)
+        clean_15m_direct_active = (
+            "15M_MOMENTUM_DIRECT" in str(
+                result.get("strategy_setup_type") or ""
+            ).upper()
+        )
+        momentum_continuation_active = (
+            current_final_signal in ["BUY", "SELL"]
+            and (
+                clean_15m_direct_active
+                or (
+                    result.get("strategy_setup_type")
+                    == f"SMC_{current_final_signal}_15M_MOMENTUM"
+                    and bool(
+                        (result.get("momentum_15m_debug") or {}).get("allowed")
+                    )
+                )
+            )
+        )
+        confirmed_15m_bos_active = (
+            current_final_signal in ["BUY", "SELL"]
+            and fifteen_m_setup == current_final_signal
+            and fifteen_m_break_confirmed
+        )
+
+        if momentum_continuation_active or confirmed_15m_bos_active:
+            freshness = {
+                "fresh": True,
+                "setup_freshness": "FRESH",
+                "reason": (
+                    f"{current_final_signal} 15m BOS setup is fresh; "
+                    "legacy retest/hold freshness does not override "
+                    f"{current_final_signal}"
+                ),
+            }
+        else:
+            freshness = evaluate_setup_freshness(
+                previous_setup,
+                current_final_signal,
+                fifteen_m_bos_level,
+                freshness_candle_time,
+                closed_data_5m,
+                setup_result_15m,
+            )
+        result["setup_freshness"] = freshness["setup_freshness"]
+        result["setup_freshness_reason"] = freshness["reason"]
+        signal_hold_debug["freshness"] = freshness
+
+        if freshness["fresh"]:
+            FINAL_SIGNAL_HOLD[hold_key] = {
+                "signal": current_final_signal,
+                "fifteen_m_setup": fifteen_m_setup,
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+                "symbol": hold_key,
+                "bos_level": fifteen_m_bos_level,
+                "setup_candle_time": freshness_candle_time,
+                "entry": result.get("entry_price"),
+                "sl": result.get("stop_loss"),
+                "tp1": result.get("tp1"),
+                "tp2": result.get("tp2"),
+                "setup_level": fifteen_m_bos_level,
+                "five_m_candle_time": five_m_entry.get("closed_candle_time"),
+                "setup_freshness": "ACTIVE",
+                "fields": {
+                    key: copy.deepcopy(result.get(key))
+                    for key in [
+                        "signal",
+                        "signal_text",
+                        "plan_bias",
+                        "plan_type",
+                        "entry_quality",
+                        "entry_timing",
+                        "plan_reason",
+                        "strategy_setup_complete",
+                        "strategy_setup_type",
+                        "entry_price",
+                        "stop_loss",
+                        "tp1",
+                        "tp2",
+                        "risk_reward",
+                        "price",
+                    ]
+                },
+            }
+            save_final_signal_hold()
+        else:
+            hold_expiration = evaluate_setup_hold_expiration(
+                previous_setup,
+                five_m_entry.get("closed_candle_time"),
+                five_m_entry.get("close") or result.get("price"),
+            )
+            signal_hold_debug["hold_expiration"] = hold_expiration
+
+            if hold_expiration["expired"]:
+                previous_setup["setup_freshness"] = "EXPIRED"
+                previous_setup["expired_at"] = datetime.now(timezone.utc).isoformat()
+                previous_setup["expiration_reason"] = hold_expiration["reason"]
+                FINAL_SIGNAL_HOLD[hold_key] = previous_setup
+                save_final_signal_hold()
+                result = clear_trade_plan(result, hold_expiration["reason"])
+                result["setup_freshness"] = "EXPIRED"
+                result["setup_freshness_reason"] = hold_expiration["reason"]
+                result["signal_before_filters"] = current_final_signal
+            else:
+                result["signal"] = f"HOLD {current_final_signal}"
+                result["signal_before_filters"] = current_final_signal
+                result["plan_bias"] = current_final_signal
+                result["plan_type"] = f"HOLD {current_final_signal}"
+                result["entry_timing"] = "WAIT FOR FRESH SETUP"
+                result["plan_reason"] = freshness["reason"]
+                result["strategy_setup_complete"] = False
+                result["strategy_setup_type"] = f"{current_final_signal}_SETUP_ACTIVE"
+                result["signal_text"] = f"HOLD {current_final_signal} ({result.get('confidence', 0)}% | no fresh setup)"
+                result["debug_reasons"] = (list(result.get("debug_reasons") or []) + [
+                    freshness["reason"]
+                ])[-14:]
+
+        signal_hold_debug["held_signal"] = current_final_signal
+        signal_hold_debug["hold_active"] = True
+
+    else:
+        persisted_hold = load_final_signal_hold()
+
+        if hold_key not in persisted_hold and hold_key in FINAL_SIGNAL_HOLD:
+            FINAL_SIGNAL_HOLD.pop(hold_key, None)
+
+        held = FINAL_SIGNAL_HOLD.get(hold_key)
+
+        if held:
+            held_signal = str(held.get("signal") or "").upper()
+            signal_hold_debug["held_signal"] = held_signal
+            signal_hold_debug["release_reason"] = (
+                "stale held setup ignored; waiting for a fresh 15m BOS"
+            )
+            FINAL_SIGNAL_HOLD.pop(hold_key, None)
+            save_final_signal_hold()
+            result["signal_hold_active"] = False
+            result["debug_reasons"] = (list(result.get("debug_reasons") or []) + [
+                f"Old HOLD {held_signal} cleared; fresh 15m BOS can create a new setup"
+            ])[-14:]
+
+    print("FINAL_SIGNAL_HOLD_DEBUG =", signal_hold_debug)
+
+    current_result_signal = str(result.get("signal") or "WAIT").upper()
+
+    if current_result_signal in ["BUY", "SELL"]:
+        levels_ok, level_reason = validate_trade_levels_1_to_2(
+            result,
+            current_result_signal,
+        )
+
+        if not levels_ok:
+            result = clear_trade_plan(result, level_reason)
+            result = mark_signal_blocker(
+                result,
+                "trade_levels_invalid",
+                level_reason,
+                "tp_sl_rr_required",
+                current_result_signal,
+            )
+        else:
+            result["risk_reward"] = "1:2"
+            result["risk_percent"] = 0.5
+            result["target_percent"] = 1.0
+
+    # Display scores are calculated only after execution decisions are complete.
+    # This keeps the existing WAIT/BUY/SELL gates authoritative.
+    result = apply_weighted_timeframe_scores(
+        result,
+        one_h,
+        closed_data_1h,
+        closed_data_15m,
+        closed_data_5m,
+        five_m_signal,
+        symbol,
+    )
+
+    result = release_signal_if_weighted_scores_reverse(result, symbol)
+
+    post_score_signal = str(result.get("signal") or "WAIT").upper()
+    if post_score_signal in ["BUY", "SELL"]:
+        result = enforce_15m_entry_requirements(
+            result,
+            post_score_signal,
+            fifteen_m_setup,
+            fifteen_m_swing_break,
+            pullback_block_active=pullback_block_active,
+            pullback_block_reason=pullback_block_reason,
+        )
+
+    if result.get("signal") not in ["BUY", "SELL", "HOLD BUY", "HOLD SELL"]:
+        result["signal"] = "WAIT"
+        result = apply_directional_wait_bias(result, one_h, symbol)
+        print(
+            "FINAL_WAIT",
+            result.get("buy_pct"),
+            result.get("sell_pct"),
+            result.get("confidence"),
+        )
+
+    result["structure_trend"] = f"1h {one_h.get('bias', 'NEUTRAL')}"
+    result["structure_type"] = f"15m {result.get('structure_type', 'NEUTRAL')}"
+    result["structure_next"] = f"5m confirmation: {five_m_signal}"
+    result["fifteen_m_setup"] = fifteen_m_setup
+    result["fifteen_m_bos_level"] = fifteen_m_entry_level
+    result["pending_15m_setup"] = copy.deepcopy(pending_15m_setup)
+    result["fifteen_m_breakout_candle_time"] = (
+        pending_15m_setup.get("break_candle_time")
+        if pending_15m_setup
+        else None
+    )
+    result["fifteen_m_setup_expiration"] = (
+        pending_15m_setup.get("expires_at")
+        if pending_15m_setup
+        else None
+    )
+    result["fifteen_m_setup_candles_remaining"] = (
+        pending_15m_setup.get("candles_remaining")
+        if pending_15m_setup
+        else None
+    )
+    result["fifteen_m_swing_break"] = fifteen_m_swing_break
+    result["fifteen_m_swing_break_confirmed"] = bool(
+        fifteen_m_swing_break.get("confirmed")
+    )
+    result["fifteen_m_swing_level"] = fifteen_m_swing_break.get("swing_level")
+    result["fifteen_m_closed_candle_close"] = fifteen_m_swing_break.get(
+        "closed_candle_close"
+    )
+    result["five_m_closed_candle_time"] = five_m_entry.get("closed_candle_time")
+    result["five_m_close_confirmed"] = five_m_entry.get("close_confirmed")
+    result["current_5m_entry_confirmation"] = (
+        current_5m_entry_confirmation
+    )
+    result["five_m_after_setup"] = five_m_after_setup
+    if (
+        result.get("signal") in ["BUY", "SELL"]
+        and "15M_MOMENTUM" in str(
+            result.get("strategy_setup_type") or ""
+        ).upper()
+    ):
+        result["entry_timeframe_used"] = "15m"
+    else:
+        result["entry_timeframe_used"] = (
+            "5m" if result.get("signal") in ["BUY", "SELL"] else None
+        )
+    result["setup_freshness"] = result.get("setup_freshness") or (
+        "FRESH" if result.get("signal") in ["BUY", "SELL"] else "EXPIRED"
+    )
+    result["debug_reasons"] = (list(result.get("debug_reasons") or []) + [
+        f"Model: 1h={one_h.get('bias')} shift={one_h.get('shift')}; 15m_setup={fifteen_m_setup}; 5m_entry={five_m_signal}"
+    ])[-14:]
+    result["signal_diagnostics"] = {
+        "final_signal": result.get("signal"),
+        "signal_before_filters": result.get("signal_before_filters"),
+        "blocked": result.get("signal") not in ["BUY", "SELL"],
+        "blocked_by": result.get("blocked_by"),
+        "blocked_reason": result.get("blocked_reason") or result.get("plan_reason"),
+        "blocker_rule_name": result.get("blocker_rule_name"),
+        "blocker_trace": list(result.get("blocker_trace") or []),
+        "one_h_bias": one_h.get("bias"),
+        "fifteen_m_setup": fifteen_m_setup,
+        "fifteen_m_swing_break_confirmed": bool(
+            fifteen_m_swing_break.get("confirmed")
+        ),
+        "five_m_signal": five_m_signal,
+        "five_m_close_confirmed": five_m_entry.get("close_confirmed"),
+        "five_m_after_setup": five_m_after_setup,
+        "confidence": result.get("confidence"),
+        "buy_pct": result.get("buy_pct"),
+        "sell_pct": result.get("sell_pct"),
+    }
+    normalized_final_signal = str(result.get("signal") or "WAIT").upper()
+    if normalized_final_signal not in ["BUY", "SELL"]:
+        normalized_final_signal = "WAIT"
+    bos_detected = bool(
+        fifteen_m_swing_break.get("break_happened")
+        or fifteen_m_swing_break.get("confirmed")
+    )
+    swing_structure_text = " ".join([
+        str(fifteen_m_swing_break.get("structure_type") or ""),
+        str(fifteen_m_swing_break.get("break_type") or ""),
+        str(fifteen_m_swing_break.get("type") or ""),
+        str(result.get("structure_type") or ""),
+        str(result.get("strategy_setup_type") or ""),
+    ]).upper()
+    choch_detected = "CHOCH" in swing_structure_text
+    smc_direction = (
+        fifteen_m_setup
+        if fifteen_m_setup in ["BUY", "SELL"] and bos_detected
+        else "WAIT"
+    )
+    trend_bias = str(one_h.get("bias") or "NEUTRAL").lower()
+    entry_reason = (
+        result.get("plan_reason")
+        if normalized_final_signal in ["BUY", "SELL"]
+        else None
+    )
+    block_reason = (
+        result.get("blocked_reason")
+        or result.get("setup_freshness_reason")
+        or result.get("plan_reason")
+        or "Waiting for fresh 15m BOS"
+    )
+    signal_after_filters = normalized_final_signal
+
+    result.update({
+        "final_signal": normalized_final_signal,
+        "signal_after_filters": signal_after_filters,
+        "blocked": normalized_final_signal not in ["BUY", "SELL"],
+        "blocked_by": result.get("blocked_by"),
+        "block_reason": (
+            None if normalized_final_signal in ["BUY", "SELL"] else block_reason
+        ),
+        "blocked_reason": (
+            None if normalized_final_signal in ["BUY", "SELL"] else block_reason
+        ),
+        "entry_reason": entry_reason,
+        "bos_detected": bos_detected,
+        "choch_detected": choch_detected,
+        "smc_direction": smc_direction,
+        "fifteen_m_close_confirmed": bool(
+            fifteen_m_swing_break.get("close_confirmed")
+            or fifteen_m_swing_break.get("confirmed")
+        ),
+        "five_m_confirmation": bool(
+            five_m_entry.get("close_confirmed")
+            and five_m_after_setup
+        ),
+        "pullback_block_active": pullback_block_active,
+        "trend_bias": trend_bias,
+        "entry": result.get("entry_price"),
+        "sl": result.get("stop_loss"),
+        "risk_percent": result.get("risk_percent") or (
+            0.5 if normalized_final_signal in ["BUY", "SELL"] else None
+        ),
+        "allowed_risk_percent": None,
+        "calculated_lots": None,
+        "rounded_lots": None,
+        "broker_min_volume": None,
+        "broker_volume_step": None,
+        "final_risk_percent": None,
+        "target_percent": result.get("target_percent") or (
+            1.0 if normalized_final_signal in ["BUY", "SELL"] else None
+        ),
+    })
+    result["signal_diagnostics"].update({
+        "final_signal": normalized_final_signal,
+        "blocked": result["blocked"],
+        "block_reason": result["block_reason"],
+        "entry_reason": result["entry_reason"],
+        "bos_detected": bos_detected,
+        "choch_detected": choch_detected,
+        "smc_direction": smc_direction,
+        "trend_bias": trend_bias,
+        "entry": result.get("entry_price"),
+        "sl": result.get("stop_loss"),
+        "tp1": result.get("tp1"),
+        "tp2": result.get("tp2"),
+    })
+
+    continuation_reasons = list(result.get("debug_reasons") or [])
+    for blocker in result.get("blocker_trace") or []:
+        blocker_reason = blocker.get("blocked_reason") if isinstance(blocker, dict) else None
+        if blocker_reason and blocker_reason not in continuation_reasons:
+            continuation_reasons.append(blocker_reason)
+    CONTINUATION_DEBUG = {
+        "final_signal": result.get("signal"),
+        "fifteen_m_setup": fifteen_m_setup,
+        "side": momentum_15m.get("side"),
+        "score": (
+            result.get("buy_pct")
+            if fifteen_m_setup == "BUY"
+            else result.get("sell_pct")
+        ),
+        "confidence": result.get("confidence"),
+        "conditions": momentum_15m.get("conditions"),
+        "htf_structure": momentum_15m.get("htf_structure") or one_h.get("bias"),
+        "breakout_entry_allowed": bool(
+            momentum_15m.get("breakout_entry_allowed")
+        ),
+        "reasons": continuation_reasons,
+        "blocked_by": (
+            momentum_15m.get("blocked_by")
+            or result.get("blocked_by")
+        ),
+        "blocker_rule_name": (
+            momentum_15m.get("blocker_rule_name")
+            or result.get("blocker_rule_name")
+        ),
+        "reason": (
+            momentum_15m.get("reason")
+            or result.get("blocked_reason")
+            or result.get("plan_reason")
+        ),
+    }
+    result["CONTINUATION_DEBUG"] = CONTINUATION_DEBUG
+    print("CONTINUATION_DEBUG =", CONTINUATION_DEBUG)
+
+    if (
+        fifteen_m_setup in ["BUY", "SELL"]
+        and result.get("signal")
+        not in [fifteen_m_setup, f"HOLD {fifteen_m_setup}"]
+    ):
+        print(
+            f"BLOCKED BY: "
+            f"{CONTINUATION_DEBUG.get('blocker_rule_name') or CONTINUATION_DEBUG.get('blocked_by') or 'unknown_continuation_wait'}"
+        )
+
+    print("TIMEFRAME_DECISION_DEBUG =", {
+        "symbol": symbol,
+        "one_h_bias": one_h.get("bias"),
+        "fifteen_m_setup": fifteen_m_setup,
+        "fifteen_m_bos_level": fifteen_m_bos_level,
+        "fifteen_m_swing_break": fifteen_m_swing_break,
+        "fifteen_m_fvg": result.get("fvg"),
+        "five_m_signal": five_m_signal,
+        "five_m_closed_candle_time": five_m_entry.get("closed_candle_time"),
+        "five_m_close_confirmed": five_m_entry.get("close_confirmed"),
+        "five_m_after_setup": five_m_after_setup,
+        "entry_timeframe_used": result.get("entry_timeframe_used"),
+        "final_signal": result.get("signal"),
+        "blocked_reason": result.get("blocked_reason") or blocked_reason,
+        "inherited_blocker_override": inherited_blocker_debug,
+        "signal_hold": signal_hold_debug,
+        "late_entry_guard": late_entry_debug,
+    })
+
+    final_entry_decision = str(result.get("signal") or "WAIT").upper()
+    if final_entry_decision not in ["BUY", "SELL"]:
+        final_entry_decision = "WAIT"
+
+    validation_side = (
+        final_entry_decision
+        if final_entry_decision in ["BUY", "SELL"]
+        else str(result.get("signal_before_filters") or fifteen_m_setup or "").upper()
+    )
+
+    def valid_strategy_price(value):
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError):
+            return False
+
+    entry_value = result.get("entry_price")
+    sl_value = result.get("stop_loss")
+    tp1_value = result.get("tp1")
+    tp2_value = result.get("tp2")
+    sl_valid = False
+    tp1_valid = False
+    tp2_valid = False
+
+    if all(valid_strategy_price(value) for value in [
+        entry_value,
+        sl_value,
+        tp1_value,
+        tp2_value,
+    ]):
+        entry_number = float(entry_value)
+        sl_number = float(sl_value)
+        tp1_number = float(tp1_value)
+        tp2_number = float(tp2_value)
+        if validation_side == "BUY":
+            sl_valid = sl_number < entry_number
+            tp1_valid = entry_number < tp1_number <= tp2_number
+            tp2_valid = tp2_number > entry_number
+        elif validation_side == "SELL":
+            sl_valid = sl_number > entry_number
+            tp1_valid = entry_number > tp1_number >= tp2_number
+            tp2_valid = tp2_number < entry_number
+
+    result["entry_strategy_debug"] = {
+        "symbol": normalize_symbol(symbol),
+        "final_signal": final_entry_decision,
+        "signal_before_filters": result.get("signal_before_filters") or validation_side,
+        "signal_after_filters": signal_after_filters,
+        "blocked_by": result.get("blocked_by"),
+        "blocked_reason": (
+            None if final_entry_decision in ["BUY", "SELL"] else (
+                result.get("blocked_reason")
+                or result.get("setup_freshness_reason")
+                or result.get("plan_reason")
+                or "Waiting for fresh 15m BOS"
+            )
+        ),
+        "smc_direction": smc_direction,
+        "bos_detected": bos_detected,
+        "choch_detected": choch_detected,
+        "fifteen_m_swing_break": bool(
+            fifteen_m_swing_break.get("break_happened")
+            or fifteen_m_swing_break.get("confirmed")
+        ),
+        "fifteen_m_close_confirmed": bool(
+            fifteen_m_swing_break.get("close_confirmed")
+            or fifteen_m_swing_break.get("confirmed")
+        ),
+        "fifteen_m_candle_close_confirmed": bool(
+            fifteen_m_swing_break.get("close_confirmed")
+            or fifteen_m_swing_break.get("confirmed")
+        ),
+        "fifteen_m_bos_level": (
+            (pending_15m_setup or {}).get("swing_level")
+            or fifteen_m_swing_break.get("swing_level")
+        ),
+        "saved_swing_level": (
+            (pending_15m_setup or {}).get("swing_level")
+            or fifteen_m_swing_break.get("swing_level")
+        ),
+        "five_m_confirmation": bool(
+            five_m_entry.get("close_confirmed")
+            and five_m_after_setup
+        ),
+        "selected_swing_sl": (result.get("swing_sl_debug") or {}).get("selected_swing_sl"),
+        "sl_source": (result.get("swing_sl_debug") or {}).get("sl_source"),
+        "pullback_block_active": pullback_block_active,
+        "trend_bias": trend_bias,
+        "entry": result.get("entry_price"),
+        "sl": result.get("stop_loss"),
+        "tp1": result.get("tp1"),
+        "tp2": result.get("tp2"),
+        "calculated_lots": result.get("calculated_lots"),
+        "rounded_lots": result.get("rounded_lots"),
+        "broker_min_volume": result.get("broker_min_volume"),
+        "broker_volume_step": result.get("broker_volume_step"),
+        "final_risk_percent": result.get("final_risk_percent"),
+        "allowed_risk_percent": result.get("allowed_risk_percent"),
+        "sl_valid": sl_valid,
+        "tp1_valid": tp1_valid,
+        "tp2_valid": tp2_valid,
+        "final_entry_decision": final_entry_decision,
+        "block_reason": (
+            result.get("blocked_reason")
+            or result.get("setup_freshness_reason")
+            or result.get("plan_reason")
+            or "None"
+        ),
+        "setup_freshness": result.get("setup_freshness"),
+        "pending_5m_candles_remaining": (
+            (pending_15m_setup or {}).get("candles_remaining")
+        ),
+    }
+    result["strategy_debug"] = copy.deepcopy(result["entry_strategy_debug"])
+    print("ENTRY_STRATEGY_UI_DEBUG =", {
+        "symbol": symbol,
+        **result["entry_strategy_debug"],
+    })
 
     return result
 
@@ -2711,6 +8311,206 @@ def _is_feed_stale(df, max_age_minutes=20):
         return True
     return age > max_age_minutes
 
+def _is_xauusd_daily_pause(now_utc=None):
+    current_time = now_utc or datetime.now(timezone.utc)
+    local_time = current_time.astimezone(MARKET_TIMEZONE)
+    local_minutes = local_time.hour * 60 + local_time.minute
+
+    return 17 * 60 <= local_minutes < 19 * 60 + 10
+
+def _is_ctrader_signal_frame_ready(symbol, timeframe, df):
+    if df is None or df.empty:
+        return False
+
+    settings = CTRADER_HEALTH_TIMEFRAMES.get(str(timeframe or "").lower())
+    last_timestamp = _get_last_candle_timestamp(df)
+
+    if not settings or last_timestamp is None:
+        return False
+
+    now_utc = datetime.now(timezone.utc)
+    age_seconds = (
+        now_utc - last_timestamp.to_pydatetime()
+    ).total_seconds()
+
+    if (
+        normalize_symbol(symbol) == "XAUUSD"
+        and _is_xauusd_daily_pause(now_utc)
+        and 0 <= age_seconds <= XAUUSD_DAILY_PAUSE_MAX_STALE_SECONDS
+    ):
+        print("XAUUSD_SESSION_PAUSE_FRESHNESS", {
+            "timeframe": timeframe,
+            "latest_candle_time": last_timestamp.isoformat(),
+            "age_minutes": round(age_seconds / 60, 1),
+            "market_time": now_utc.astimezone(MARKET_TIMEZONE).isoformat(),
+            "accepted": True,
+        })
+        return True
+
+    return age_seconds <= settings["stale_after"]
+
+def _get_ctrader_frame_source_label(symbol, timeframe, df):
+    if df is None or df.empty:
+        return "ctrader_unavailable"
+
+    if not _is_ctrader_signal_frame_ready(symbol, timeframe, df):
+        return "ctrader_stale"
+
+    health = get_ctrader_candle_health(symbol, timeframe)
+
+    if health.get("usable"):
+        return health.get("source") or "ctrader_cache"
+
+    return "ctrader_cache"
+
+def _get_ctrader_signal_wait_reason(source_state):
+    labels = [
+        source_state.get("tf_1h_source"),
+        source_state.get("tf_15m_source"),
+        source_state.get("tf_5m_source"),
+    ]
+
+    if all(label in ["ctrader", "ctrader_cache"] for label in labels):
+        return None
+
+    if "ctrader_unavailable" in labels:
+        return "cTrader candles unavailable"
+
+    if "ctrader_stale" in labels:
+        return "cTrader candles stale"
+
+    return "cTrader candles unavailable"
+
+def _has_ctrader_stale_candles(source_state):
+    return "ctrader_stale" in [
+        source_state.get("tf_1h_source"),
+        source_state.get("tf_15m_source"),
+        source_state.get("tf_5m_source"),
+    ]
+
+def _is_ctrader_signal_state_available(source_state):
+    return (
+        source_state.get("tf_1h_source") in ["ctrader", "ctrader_cache"]
+        and source_state.get("tf_15m_source") in ["ctrader", "ctrader_cache"]
+        and source_state.get("tf_5m_source") in ["ctrader", "ctrader_cache"]
+    )
+
+def _get_ctrader_signal_source_state(symbol, data_5m, data_15m, data_1h):
+    latest_5m = _get_last_candle_timestamp(data_5m)
+    latest_15m = _get_last_candle_timestamp(data_15m)
+    latest_1h = _get_last_candle_timestamp(data_1h)
+    stale_5m_minutes = _minutes_since_last_candle(data_5m)
+    stale_15m_minutes = _minutes_since_last_candle(data_15m)
+    stale_1h_minutes = _minutes_since_last_candle(data_1h)
+    health_5m = get_ctrader_candle_health(symbol, "5m")
+    health_15m = get_ctrader_candle_health(symbol, "15m")
+    health_1h = get_ctrader_candle_health(symbol, "1h")
+    state = {
+        "symbol": normalize_symbol(symbol),
+        "tf_1h_source": _get_ctrader_frame_source_label(symbol, "1h", data_1h),
+        "tf_15m_source": _get_ctrader_frame_source_label(symbol, "15m", data_15m),
+        "tf_5m_source": _get_ctrader_frame_source_label(symbol, "5m", data_5m),
+        "candles_5m_count": len(data_5m) if data_5m is not None else 0,
+        "candles_15m_count": len(data_15m) if data_15m is not None else 0,
+        "candles_1h_count": len(data_1h) if data_1h is not None else 0,
+        "latest_5m_time": latest_5m.isoformat() if latest_5m is not None else None,
+        "latest_15m_time": latest_15m.isoformat() if latest_15m is not None else None,
+        "latest_1h_time": latest_1h.isoformat() if latest_1h is not None else None,
+        "stale_minutes": stale_5m_minutes,
+        "stale_5m_minutes": stale_5m_minutes,
+        "stale_15m_minutes": stale_15m_minutes,
+        "stale_1h_minutes": stale_1h_minutes,
+        "used_for_signal": "ctrader",
+        "candle_source": None,
+        "last_successful_fetch": health_5m.get("last_successful_fetch"),
+        "missed_fetch_count": health_5m.get("missed_fetch_count", 0),
+        "timeframes": {
+            "5m": health_5m,
+            "15m": health_15m,
+            "1h": health_1h,
+        },
+    }
+    state["candle_source"] = state["tf_5m_source"]
+    state["available"] = _is_ctrader_signal_state_available(state)
+    state["reason"] = _get_ctrader_signal_wait_reason(state)
+    print("SIGNAL_DATA_SOURCE =", state)
+    print("CHART_CANDLE_DEBUG =", {
+        "symbol": state["symbol"],
+        "latest_5m_time": state["latest_5m_time"],
+        "candles_5m_count": state["candles_5m_count"],
+        "source": state["tf_5m_source"],
+        "missed_fetch_count": state["missed_fetch_count"],
+    })
+
+    if state["symbol"] == "XAUUSD":
+        print("XAUUSD_DATA_SOURCE_STATE", {
+            "available": state["available"],
+            "reason": state["reason"],
+            "candles_5m_count": state["candles_5m_count"],
+            "candles_15m_count": state["candles_15m_count"],
+            "candles_1h_count": state["candles_1h_count"],
+            "latest_5m_time": state["latest_5m_time"],
+            "latest_15m_time": state["latest_15m_time"],
+            "latest_1h_time": state["latest_1h_time"],
+            "stale_minutes": state["stale_minutes"],
+        })
+
+    return state
+
+def _make_ctrader_unavailable_result(symbol, source_state=None):
+    reason = (
+        (source_state or {}).get("reason")
+        or _get_ctrader_signal_wait_reason(source_state or {})
+    )
+    result = {
+        "signal": "WAIT",
+        "signal_text": f"WAIT ⚪ ({reason})",
+        "buy_pct": 0,
+        "sell_pct": 0,
+        "confidence": 0,
+        "market_condition": "CTRADER_UNAVAILABLE",
+        "entry_quality": "WAIT",
+        "entry_timing": "WAIT",
+        "entry_price": "--",
+        "stop_loss": "--",
+        "tp1": "--",
+        "tp2": "--",
+        "risk_reward": "--",
+        "plan_bias": "WAIT",
+        "plan_type": "WAIT",
+        "plan_reason": reason,
+        "blocked_by": "ctrader_data",
+        "blocked_reason": reason,
+        "signal_before_filters": "WAIT",
+        "blocker_rule_name": "ctrader_candles_required",
+        "structure_trend": "Trend: 1h unavailable",
+        "structure_type": "Entry: 15m unavailable",
+        "structure_next": "5m: confirmation unavailable",
+        "debug_reasons": [reason],
+        "signal_data_source": source_state or {},
+    }
+    result["signal_diagnostics"] = {
+        "final_signal": "WAIT",
+        "signal_before_filters": "WAIT",
+        "blocked": True,
+        "blocked_by": "ctrader_data",
+        "blocked_reason": reason,
+        "blocker_rule_name": "ctrader_candles_required",
+        "blocker_trace": [{
+            "blocked_by": "ctrader_data",
+            "blocked_reason": reason,
+            "blocker_rule_name": "ctrader_candles_required",
+            "signal_before_filters": "WAIT",
+        }],
+        "data_source": source_state or {},
+    }
+    print("SIGNAL_NO_DATA_DEBUG =", {
+        "symbol": normalize_symbol(symbol),
+        "reason": reason,
+        "source_state": source_state or {},
+    })
+    return result
+
 def _make_closed_result(symbol, base_result=None, stale_minutes=None):
     result = copy.deepcopy(base_result) if isinstance(base_result, dict) else {}
 
@@ -2721,6 +8521,10 @@ def _make_closed_result(symbol, base_result=None, stale_minutes=None):
     result["entry_timing"] = "CLOSED"
     result["market_closed"] = True
     result["stale_minutes"] = stale_minutes
+    result["blocked_by"] = "market_closed"
+    result["blocked_reason"] = "market closed"
+    result["signal_before_filters"] = result.get("signal_before_filters") or "WAIT"
+    result["blocker_rule_name"] = "market_closed"
 
      # market closed = no fake signal strength
     result["buy_pct"] = 0
@@ -2732,10 +8536,12 @@ def _make_closed_result(symbol, base_result=None, stale_minutes=None):
 
     return result
 
-def get_panel_data():
+def get_panel_data(force_refresh=False):
     run_weekly_paper_reset()
 
-    eurusd, gold, eurusd_htf, gold_htf, eurusd_1h, gold_1h = fetch_market_data()
+    eurusd, gold, eurusd_htf, gold_htf, eurusd_1h, gold_1h = fetch_market_data(
+        force_refresh=force_refresh
+    )
     if not hasattr(get_panel_data, "_last_open_payload"):
         get_panel_data._last_open_payload = None
 
@@ -2749,7 +8555,7 @@ def get_panel_data():
 
     print("Calendar closed:", calendar_closed)
     print("EURUSD closed:", eurusd_closed)
-    print("GOLD closed:", gold_closed)
+    print("XAUUSD closed:", gold_closed)
 
     all_closed = eurusd_closed and gold_closed
 
@@ -2764,9 +8570,9 @@ def get_panel_data():
             payload.get("EURUSD"),
             stale_minutes=eurusd_stale_minutes
         )
-        payload["GOLD"] = _make_closed_result(
-            "GOLD",
-            payload.get("GOLD"),
+        payload["XAUUSD"] = _make_closed_result(
+            "XAUUSD",
+            payload.get("XAUUSD"),
             stale_minutes=gold_stale_minutes
         )
 
@@ -2776,12 +8582,13 @@ def get_panel_data():
                 "market_closed": True,
                 "stale_minutes": eurusd_stale_minutes,
             },
-            "GOLD": {
+            "XAUUSD": {
                 "market_closed": True,
                 "stale_minutes": gold_stale_minutes,
             },
         }
         payload["paper_trades"] = AUTO_TRADES
+        payload["paper_active_trades"] = PAPER_ACTIVE_TRADES
         payload["paper_trade_history"] = PAPER_TRADE_HISTORY[-20:]
         payload["paper_trade_stats"] = get_paper_trade_stats()
 
@@ -2790,10 +8597,57 @@ def get_panel_data():
     # =========================
     # NORMAL LIVE MODE
     # =========================
-    eurusd_result = get_signal(eurusd, eurusd_htf, "EURUSD")
-    gold_result = get_signal(gold, gold_htf, "GOLD")
+    eurusd_source_state = _get_ctrader_signal_source_state(
+        "EURUSD",
+        eurusd,
+        eurusd_htf,
+        eurusd_1h
+    )
+    gold_source_state = _get_ctrader_signal_source_state(
+        "XAUUSD",
+        gold,
+        gold_htf,
+        gold_1h
+    )
 
-    if not eurusd.empty:
+    if eurusd_source_state.get("available"):
+        eurusd_result = get_mtf_signal(eurusd, eurusd_htf, eurusd_1h, "EURUSD")
+        eurusd_result["signal_data_source"] = eurusd_source_state
+    else:
+        eurusd_result = _make_ctrader_unavailable_result(
+            "EURUSD",
+            eurusd_source_state
+        )
+
+    if gold_source_state.get("available"):
+        gold_result = get_mtf_signal(gold, gold_htf, gold_1h, "XAUUSD")
+        gold_result["signal_data_source"] = gold_source_state
+    else:
+        gold_result = _make_ctrader_unavailable_result(
+            "XAUUSD",
+            gold_source_state
+        )
+
+    for decision_symbol, decision_result, decision_source in [
+        ("EURUSD", eurusd_result, eurusd_source_state),
+        ("XAUUSD", gold_result, gold_source_state),
+    ]:
+        print("SIGNAL_DECISION_DEBUG =", {
+            "symbol": decision_symbol,
+            "signal": decision_result.get("signal"),
+            "buy_pct": decision_result.get("buy_pct"),
+            "sell_pct": decision_result.get("sell_pct"),
+            "confidence": decision_result.get("confidence"),
+            "blocked_by": decision_result.get("blocked_by"),
+            "blocked_reason": decision_result.get("blocked_reason"),
+            "blocker_rule_name": decision_result.get("blocker_rule_name"),
+            "candle_source": decision_source.get("candle_source"),
+            "last_candle_time": decision_source.get("latest_5m_time"),
+            "last_successful_fetch": decision_source.get("last_successful_fetch"),
+            "missed_fetch_count": decision_source.get("missed_fetch_count"),
+        })
+
+    if eurusd_source_state.get("available") and not eurusd.empty:
        update_paper_trade(
            "EURUSD",
            eurusd_result,
@@ -2802,9 +8656,9 @@ def get_panel_data():
            eurusd["High"].iloc[-1].item()
        )
 
-    if not gold.empty:
+    if gold_source_state.get("available") and not gold.empty:
         update_paper_trade(
-            "GOLD",
+            "XAUUSD",
             gold_result,
             gold["Close"].iloc[-1].item(),
             gold["Low"].iloc[-1].item(),
@@ -2823,7 +8677,7 @@ def get_panel_data():
 
     if gold_closed:
         gold_result = _make_closed_result(
-            "GOLD",
+            "XAUUSD",
             gold_result,
             stale_minutes=gold_stale_minutes
         )
@@ -2834,24 +8688,48 @@ def get_panel_data():
     # only update history/results when that symbol feed is live
     if not eurusd_closed:
         update_signal_history("EURUSD", eurusd_result)
+
+    if not eurusd_closed and eurusd_source_state.get("available"):
         update_trade_results(eurusd, "EURUSD")
 
     if not gold_closed:
-        update_signal_history("GOLD", gold_result)
-        update_trade_results(gold, "GOLD")
+        update_signal_history("XAUUSD", gold_result)
 
-        create_test_live_trade()
+    if not gold_closed and gold_source_state.get("available"):
+        update_trade_results(gold, "XAUUSD")
+
+    print("XAUUSD_RESULT_DEBUG", {
+        "source_available": gold_source_state.get("available"),
+        "source_reason": gold_source_state.get("reason"),
+        "result_source": (
+            "get_mtf_signal"
+            if gold_source_state.get("available")
+            else "_make_ctrader_unavailable_result"
+        ),
+        "signal": gold_result.get("signal"),
+        "buy_percentage": gold_result.get("buy_pct"),
+        "sell_percentage": gold_result.get("sell_pct"),
+        "confidence": gold_result.get("confidence"),
+        "strategy_setup_complete": gold_result.get("strategy_setup_complete"),
+        "plan_reason": gold_result.get("plan_reason"),
+        "blocked_by": gold_result.get("blocked_by"),
+        "market_condition": gold_result.get("market_condition"),
+        "debug_reasons": gold_result.get("debug_reasons"),
+        "candles_5m_count": gold_source_state.get("candles_5m_count"),
+        "candles_15m_count": gold_source_state.get("candles_15m_count"),
+        "candles_1h_count": gold_source_state.get("candles_1h_count"),
+    })
 
     payload = {
         "EURUSD": eurusd_result,
-        "GOLD": gold_result,
+        "XAUUSD": gold_result,
         "candles": {
             "EURUSD": {
                 "5m": _df_to_candles(eurusd, limit=5000),
                 "15m": _df_to_candles(eurusd_htf, limit=5000),
                 "1h": _df_to_candles(eurusd_1h, limit=5000),
             },
-            "GOLD": {
+            "XAUUSD": {
                 "5m": _df_to_candles(gold, limit=5000),
                 "15m": _df_to_candles(gold_htf, limit=5000),
                 "1h": _df_to_candles(gold_1h, limit=5000),
@@ -2859,6 +8737,7 @@ def get_panel_data():
         },
         "history": SIGNAL_HISTORY[-20:],
         "paper_trades": AUTO_TRADES,
+        "paper_active_trades": PAPER_ACTIVE_TRADES,
         "paper_trade_history": PAPER_TRADE_HISTORY[-20:],
         "paper_trade_stats": get_paper_trade_stats(),
         "live_trades": LIVE_TRADES,
@@ -2869,13 +8748,30 @@ def get_panel_data():
             "EURUSD": {
                 "market_closed": eurusd_closed,
                 "stale_minutes": eurusd_stale_minutes,
+                "signal_data_source": eurusd_source_state,
             },
-            "GOLD": {
+            "XAUUSD": {
                 "market_closed": gold_closed,
                 "stale_minutes": gold_stale_minutes,
+                "signal_data_source": gold_source_state,
             },
         }
     }
+
+    print("CANONICAL_SYMBOL_CHECK", {
+        "raw_symbol": "XAUUSD",
+        "normalized_symbol": normalize_symbol("XAUUSD"),
+        "payload_keys": [
+            key for key in payload.keys()
+            if key in ["EURUSD", "XAUUSD"]
+        ],
+        "paper_symbol": (
+            AUTO_TRADES.get("XAUUSD", {}).get("symbol")
+            if AUTO_TRADES.get("XAUUSD")
+            else "XAUUSD"
+        ),
+        "live_symbol": "XAUUSD",
+    })
 
     # save last valid fully-live payload
     if not all_closed:
@@ -2893,10 +8789,16 @@ def update_signal_history(symbol, result):
 
     global SIGNAL_HISTORY
 
+    symbol = normalize_symbol(symbol)
     entry = {
         "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "symbol": symbol,
-        "signal": result.get("signal", "WAIT"),
+        "signal": str(
+            result.get("history_signal")
+            or result.get("display_signal")
+            or result.get("signal_display_state")
+            or result.get("signal", "WAIT")
+        ).upper(),
         "signal_text": result.get("signal_text", ""),
         "buy_pct": result.get("buy_pct", 0),
         "sell_pct": result.get("sell_pct", 0),
@@ -2912,19 +8814,21 @@ def update_signal_history(symbol, result):
     }
 
 
-    if SIGNAL_HISTORY:
-        last = SIGNAL_HISTORY[-1]
-        same_entry = (
-            last["symbol"] == entry["symbol"]
-            and last["signal"] == entry["signal"]
-            and last["buy_pct"] == entry["buy_pct"]
-            and last["sell_pct"] == entry["sell_pct"]
-            and last["confidence"] == entry["confidence"]
-            and last["entry_quality"] == entry["entry_quality"]
-            and last["entry_timing"] == entry["entry_timing"]
-        )
-        if same_entry:
-            return
+    previous_symbol_entry = next(
+        (
+            history_entry
+            for history_entry in reversed(SIGNAL_HISTORY)
+            if normalize_symbol(history_entry.get("symbol")) == symbol
+        ),
+        None
+    )
+
+    if (
+        previous_symbol_entry
+        and str(previous_symbol_entry.get("signal", "WAIT")).upper()
+        == entry["signal"]
+    ):
+        return
 
     SIGNAL_HISTORY.append(entry)
     if entry["signal"] in ["BUY", "SELL"]:
@@ -2975,7 +8879,7 @@ if __name__ == "__main__":
     panel_data = get_panel_data()
 
     print("===== SIGNALS =====")
-    for symbol in ["EURUSD", "GOLD"]:
+    for symbol in ["EURUSD", "XAUUSD"]:
         result = panel_data[symbol]
         print(f"{symbol}: {result['signal_text']}")
         print(f"Buy: {result['buy_pct']}%")

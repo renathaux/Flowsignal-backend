@@ -1,0 +1,17 @@
+{
+  "risk": {
+    "riskPerTradePct": 1.0,
+    "maxDailyLoss": null,
+    "maxWeeklyLoss": null,
+    "maxOpenTrades": 1,
+    "tp1PercentOfTp2": 80,
+    "protectedSlPercentOfTp2": 50,
+    "breakEvenEnabled": true,
+    "allowedSymbols": [
+      "EURUSD",
+      "XAUUSD"
+    ],
+    "defaultTradingMode": "PAPER"
+  },
+  "updatedAt": "2026-06-23T12:08:17.674911+00:00"
+}
