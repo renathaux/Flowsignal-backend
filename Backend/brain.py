@@ -8526,10 +8526,13 @@ def _make_closed_result(symbol, base_result=None, stale_minutes=None):
     result["signal_before_filters"] = result.get("signal_before_filters") or "WAIT"
     result["blocker_rule_name"] = "market_closed"
 
-     # market closed = no fake signal strength
-    result["buy_pct"] = 0
-    result["sell_pct"] = 0
-    result["confidence"] = 0
+    # Keep the last/calculated pressure visible in the UI bars. The WAIT signal
+    # and market_closed blocker still prevent treating these as tradable setups.
+    for score_key in ("buy_pct", "sell_pct", "confidence"):
+        try:
+            result[score_key] = max(0, min(100, int(round(float(result.get(score_key) or 0)))))
+        except (TypeError, ValueError):
+            result[score_key] = 0
 
     result.setdefault("debug_reasons", [])
     result["debug_reasons"] = list(result["debug_reasons"]) + ["Market closed / stale feed"]

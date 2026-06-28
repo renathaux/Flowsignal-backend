@@ -476,6 +476,7 @@ def refresh_panel_cache_direct(reason, force_refresh=True):
             reason,
             force_refresh=force_refresh,
         )
+        refresh_live_panel_meta(data)
         validity = _panel_cache_validity(data)
         if validity["valid"]:
             update_panel_cache(data, reason)
@@ -1137,6 +1138,16 @@ def panel_data(force: int = 0):
         live_pl_sync["monthly_start_ts"] = expected_month_start
 
     live_recent_history = LIVE_PANEL_META_CACHE.get("live_recent_history") or []
+
+    if not live_pl_sync.get("pl_calculation_version"):
+        live_pl_sync = calculate_live_pl_sync()
+        live_recent_history = get_live_recent_history_for_panel()
+        LIVE_PANEL_META_CACHE.update({
+            "live_pl_sync": live_pl_sync or {},
+            "live_recent_history": live_recent_history or [],
+            "live_trade_stats": calculate_live_trade_stats() or {},
+            "last_update": time.time(),
+        })
 
     print("LIVE_PL_SYNC:", live_pl_sync)
 
@@ -5477,75 +5488,17 @@ def sync_live_positions():
             reason="Live Auto paused — broker disconnected"
         )
 
-        removed = []
-
-        for symbol, trade in list(LIVE_ACTIVE_ORDERS.items()):
-            if not trade:
-                continue
-
-            status = get_live_trade_status(trade)
-
-            if status in ["RUNNING", "OPEN"]:
-                removed.append({
-                    "symbol": symbol,
-                    "order_id": trade.get("order_id"),
-                    "position_id": trade.get("position_id")
-                        or trade.get("broker_position_id"),
-                    "reason": "broker disconnected"
-                })
-                move_live_trade_to_history_once({
-                    **trade,
-                    "symbol": symbol,
-                    "trade_id": get_live_trade_identity(trade),
-                    "status": "DISCONNECTED",
-                    "result": "DISCONNECTED",
-                    "closed_at": time.time(),
-                    "note": "Live Auto paused — broker disconnected"
-                })
-                log_live_trade_audit(
-                    "broker_disconnected_to_history",
-                    trade,
-                    symbol=symbol,
-                    reason="Live Auto paused — broker disconnected"
-                )
-                LIVE_ACTIVE_ORDERS[symbol] = None
-
-        stale_history = []
-        cleaned_history = []
-
-        for item in LIVE_TRADE_HISTORY:
-            result = str(
-                item.get("result")
-                or item.get("status")
-                or ""
-            ).upper()
-
-            if result in ["RUNNING", "OPEN"]:
-                stale_history.append({
-                    "symbol": item.get("symbol"),
-                    "order_id": item.get("order_id"),
-                    "position_id": item.get("position_id")
-                        or item.get("broker_position_id"),
-                    "reason": "broker disconnected history cleanup"
-                })
-                continue
-
-            cleaned_history.append(item)
-
-        LIVE_TRADE_HISTORY[:] = cleaned_history
-        removed.extend(stale_history)
-
-        if removed:
-            print("LIVE_STALE_RUNNING_REMOVED:", removed)
-            save_live_backup()
-
         print("LIVE_POSITION_SYNC:", {
             "connected": False,
             "positions": [],
             "active_orders": get_persistable_live_active_orders()
         })
 
-        return []
+        return [
+            trade
+            for trade in LIVE_ACTIVE_ORDERS.values()
+            if trade and get_live_trade_status(trade) in ["RUNNING", "OPEN", "TP1 HIT"]
+        ]
 
     if not LIVE_ACCOUNT_STATE.get("connected"):
         return []
@@ -5561,6 +5514,11 @@ def sync_live_positions():
         if position_fetch_error:
             print("LIVE_POSITION_SYNC_ERROR:", position_fetch_error)
             LIVE_POSITION_SYNC_STATUS["last_error"] = position_fetch_error
+            return [
+                trade
+                for trade in LIVE_ACTIVE_ORDERS.values()
+                if trade and get_live_trade_status(trade) in ["RUNNING", "OPEN", "TP1 HIT"]
+            ]
         else:
             LIVE_POSITION_SYNC_STATUS["last_success"] = time.time()
             LIVE_POSITION_SYNC_STATUS["last_error"] = None
