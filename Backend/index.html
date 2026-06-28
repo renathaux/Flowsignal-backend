@@ -1,0 +1,1186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>nathaux.Fx</title>
+  <link rel="stylesheet" href="style.css?v=47" />
+</head>
+<body class="fit-mode">
+  <div id="landingPage" class="landing-page landing-pro">
+  <nav class="landing-nav">
+    <div class="landing-logo">
+      <span class="logo-wave">≋</span>
+      <span>FlowSignal</span>
+    </div>
+
+    <div class="landing-links">
+  <a id="linkContact" href="mailto:renathauxfx@outlook.com">Contact</a>
+  <a id="linkSupport" href="mailto:flowsignal.contact@gmail.com">Support</a>
+  <a id="linkFacebook" href="https://www.facebook.com/profile.php?id=61569229928465" target="_blank">Facebook</a>
+</div>
+
+    <div class="landing-nav-actions">
+      <select id="landingLang">
+       <option value="EN">EN</option>
+       <option value="FR">FR</option>
+       <option value="ES">ES</option>
+      </select>
+
+      <button id="openAdminLoginBtn" class="landing-login-btn">Login</button>
+      <button id="openAccessBtn" class="landing-get-btn">Get Started</button>
+    </div>
+  </nav>
+
+  <section class="hero-section">
+    <div class="hero-left">
+      <div class="hero-pill">
+        <span>● LIVE</span>
+        Real-time signals • Smart money concepts • Built for traders
+      </div>
+
+      <h1>
+        Smarter Signals.<br>
+        <span>Stronger Trades.</span>
+      </h1>
+
+      <p>
+        FlowSignal provides real-time trading signals, market structure analysis,
+        and smart money insights to help you trade with confidence.
+      </p>
+
+      <div class="hero-actions">
+        <button id="openAccessBtnHero" class="hero-primary">Start Trading Now →</button>
+        <button class="hero-secondary">View Features</button>
+      </div>
+
+      <div class="hero-badges">
+        <span>⚡ Real-time Alerts</span>
+        <span>◎ High Accuracy</span>
+        <span>🛡 Risk Managed</span>
+      </div>
+    </div>
+
+ <div class="hero-right">
+  <img src="dashboard-preview.png" class="hero-dashboard-img" alt="FlowSignal Dashboard">
+</div>
+
+</section>
+
+  <section class="hero-stats">
+    <div><strong>15K+</strong><span>Active Traders</span></div>
+    <div><strong>98.6%</strong><span>Signal Accuracy</span></div>
+    <div><strong>24/7</strong><span>Real-time Alerts</span></div>
+    <div><strong>Risk</strong><span>Managed Signals</span></div>
+  </section>
+
+  <div class="trusted-text">
+  Built for real traders • No fake metrics • No hype
+</div>
+
+<div class="mobile-footer">
+  <a href="mailto:renathauxfx@outlook.com">Contact</a>
+  <a href="mailto:flowsignal.contact@gmail.com">Support</a>
+  <a href="https://www.facebook.com/profile.php?id=61569229928465" target="_blank">Facebook</a>
+</div>
+
+</div> <!-- landingPage END -->
+
+<div id="authScreen" class="auth-screen hidden">
+  <div class="auth-box">
+    <button id="closeLoginBtn" class="auth-close">×</button>
+
+    <h2>Login</h2>
+
+    <input type="email" placeholder="Email">
+    <input type="password" placeholder="Password">
+
+    <div class="auth-actions">
+      <button>Login</button>
+      <button id="cancelLoginBtn">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div class="login-box hidden" id="accessBox">
+  <h2>FlowSignal Access</h2>
+
+  <input type="text" id="accessCode" placeholder="Enter access code" />
+
+  <div class="auth-actions">
+    <button id="accessBtn">Enter</button>
+    <button id="closeAccessBtn">Back</button>
+  </div>
+
+  <div id="authMsg" class="auth-msg"></div>
+</div>
+
+<div class="login-box hidden" id="adminLoginBox">
+  <h2>Admin Login</h2>
+
+  <input type="email" id="adminEmailInput" placeholder="Admin email" />
+  <input type="password" id="adminPasswordInput" placeholder="Password" />
+
+  <div class="auth-actions">
+    <button id="adminLoginBtn">Login</button>
+    <button id="closeAdminLoginBtn">Back</button>
+  </div>
+
+  <div id="adminLoginMsg" class="auth-msg"></div>
+</div>
+<!-- APP START -->
+<div class="app locked hidden" id="mainApp">
+   <div id="sideMenu" class="side-menu app-sidebar hidden" aria-hidden="true">
+  <div class="side-menu-inner">
+    <button id="menuDashboardBtn" class="menu-row" title="Dashboard">
+      <span class="menu-row-icon">⌂</span>
+      <span class="menu-row-text">Dashboard</span>
+    </button>
+
+    <button id="menuAssistantBtn" class="menu-row" title="Flow Assistant">
+      <span class="menu-row-icon">◉</span>
+      <span class="menu-row-text">Flow Assistant</span>
+    </button>
+
+    <button id="menuPaperBtn" class="menu-row" title="Live Trading">
+      <span class="menu-row-icon">↗</span>
+      <span class="menu-row-text">Live Trading</span>
+    </button>
+
+    <button id="menuFeedbackBtn" class="menu-row" title="Feedback">
+      <span class="menu-row-icon">💬</span>
+      <span class="menu-row-text">Feedback</span>
+    </button>
+
+    <button id="menuHistoryBtn" class="menu-row" title="History">
+      <span class="menu-row-icon">◷</span>
+      <span class="menu-row-text">History</span>
+    </button>
+
+    <button id="menuStatsBtn" class="menu-row" title="Performance">
+      <span class="menu-row-icon">▤</span>
+      <span class="menu-row-text">Performance</span>
+    </button>
+
+    <div class="menu-settings-group">
+      <button id="menuSettingsBtn" class="menu-row" title="Settings" aria-expanded="false">
+        <span class="menu-row-icon">⚙</span>
+        <span class="menu-row-text">Settings</span>
+        <span class="menu-row-caret">⌄</span>
+      </button>
+      <div id="settingsSubmenu" class="menu-submenu hidden">
+        <button id="menuGeneralSettingsBtn" class="menu-subrow">General</button>
+        <button id="menuRiskSettingsBtn" class="menu-subrow">Risk Management</button>
+        <button id="menuBrokerAccountsBtn" class="menu-subrow">Broker Accounts</button>
+        <button id="menuNotificationsSettingsBtn" class="menu-subrow">Notifications</button>
+        <button id="menuStrategySettingsBtn" class="menu-subrow">Strategy</button>
+      </div>
+    </div>
+
+    <button id="logoutBtn" class="menu-row menu-logout-row" title="Logout">
+      <span class="menu-row-icon">←</span>
+      <span class="menu-row-text">Logout</span>
+    </button>
+  </div>
+</div>
+    <div class="header-frame top-header">
+      <button id="menuToggleBtn" class="menu-toggle">☰</button>
+      <div class="brand-left"><span class="app-logo-wave" aria-hidden="true">≋</span>FlowSignal</div>
+      <div class="header">nathaux.Fx</div>
+
+      <div class="header-actions">
+        <div class="voice-controls" aria-label="Voice announcer controls">
+          <button id="voiceToggleBtn" class="voice-toggle" type="button" aria-pressed="true">
+            Voice ON
+          </button>
+        </div>
+        <select id="langSelect">
+          <option value="en">EN</option>
+          <option value="fr">FR</option>
+          <option value="es">ES</option>
+        </select>
+        <button id="adminUnlockBtn" style="display:none;">Admin Lock</button>
+      </div>
+    </div>
+
+    <div class="divider"></div>
+    <section class="performance-strip" aria-label="Live trading performance">
+      <article class="performance-card performance-weekly">
+        <div class="performance-icon" aria-hidden="true">
+          <svg viewBox="0 0 32 32">
+            <rect x="5" y="7" width="22" height="20" rx="3"></rect>
+            <path d="M10 4v6M22 4v6M5 13h22"></path>
+          </svg>
+        </div>
+        <div class="performance-copy">
+          <span>WEEKLY P/L</span>
+          <strong id="dashboardWeeklyPnl">+$0.00</strong>
+        </div>
+        <svg class="performance-sparkline" viewBox="0 0 86 40" aria-hidden="true">
+          <polyline points="2,34 13,20 21,27 29,15 39,22 49,6 58,14 68,4 76,10 84,2"></polyline>
+        </svg>
+      </article>
+
+      <article class="performance-card performance-monthly">
+        <div class="performance-icon" aria-hidden="true">
+          <svg viewBox="0 0 32 32">
+            <rect x="5" y="7" width="22" height="20" rx="3"></rect>
+            <path d="M10 4v6M22 4v6M5 13h22M10 18h4M18 18h4M10 23h4"></path>
+          </svg>
+        </div>
+        <div class="performance-copy">
+          <span>MONTHLY P/L</span>
+          <strong id="dashboardMonthlyPnl">$0.00</strong>
+        </div>
+      </article>
+
+      <article class="performance-card performance-floating">
+        <div class="performance-icon" aria-hidden="true">
+          <svg viewBox="0 0 32 32">
+            <path d="M3 17h5l3-9 5 17 4-13 3 7h6"></path>
+          </svg>
+        </div>
+        <div class="performance-copy">
+          <span>LIVE P/L (FLOATING)</span>
+          <strong id="dashboardFloatingPnl">+$0.00</strong>
+        </div>
+        <svg class="performance-sparkline" viewBox="0 0 86 40" aria-hidden="true">
+          <polyline points="2,34 12,22 21,24 31,17 42,18 50,5 59,13 68,2 76,11 84,4"></polyline>
+        </svg>
+      </article>
+
+      <article class="performance-card performance-trades">
+        <div class="performance-icon" aria-hidden="true">
+          <svg viewBox="0 0 32 32">
+            <rect x="4" y="10" width="24" height="17" rx="3"></rect>
+            <path d="M11 10V6h10v4M4 17h9v3h6v-3h9"></path>
+          </svg>
+        </div>
+        <div class="performance-copy">
+          <span>OPEN TRADES</span>
+          <strong id="dashboardOpenTrades">0</strong>
+        </div>
+      </article>
+    </section>
+
+    <div class="topbar">
+      <div id="status" class="status status-loading" title="LIVE loading..." data-mobile-label="● LIVE loading...">● LIVE loading...</div>
+
+      <div class="controls">
+  <label class="switch-wrap">
+    <input type="checkbox" id="alertsToggle" checked />
+    <span>Alerts</span>
+  </label>
+
+  <label class="switch-wrap">
+    <input type="checkbox" id="strongToggle" />
+    <span>Strong</span>
+  </label>
+</div>
+    </div>
+
+    <div class="dashboard-grid">
+      <!-- LEFT SIDE -->
+      <div class="signals-panel">
+        <div class="content-grid">
+          <!-- EURUSD -->
+          <section class="symbol-card eurusd-card" id="eurusd-card">
+            <div class="card-outer-glow"></div>
+            <div class="top-cap"></div>
+
+            <div class="card-header">
+              <div class="title-wrap">
+                <div class="card-title eurusd-title">EURUSD</div>
+                <img src="eurusd.png" alt="EURUSD" class="symbol-icon eurusd-icon" />
+              </div>
+            </div>
+
+            <div class="signal-shell signal-wait" id="eurusd-signal-shell">
+              <div class="signal-box signal-border-wait" id="eurusd-signal-box">
+                <div class="signal-text wait-text" id="eurusd-signal">WAIT</div>
+              </div>
+            </div>
+            <div id="eurusd-signal-note" class="signal-freshness-note hidden">Trend active · no fresh entry</div>
+
+            <div class="metric-label" id="eurusd-buy-label">Buy: 0%</div>
+            <div class="bar-wrap">
+              <div class="glow-bar">
+                <div class="glow-fill buy-glow" id="eurusd-buy-fill-glow"></div>
+                <div class="main-fill buy-main" id="eurusd-buy-fill"></div>
+              </div>
+            </div>
+
+            <div class="metric-label" id="eurusd-sell-label">Sell: 0%</div>
+            <div class="bar-wrap">
+              <div class="glow-bar">
+                <div class="glow-fill sell-glow" id="eurusd-sell-fill-glow"></div>
+                <div class="main-fill sell-main" id="eurusd-sell-fill"></div>
+              </div>
+            </div>
+
+          <div class="metric-label conf-label" id="eurusd-conf-label">Confidence: 0%</div>
+            <div class="bar-wrap conf-wrap">
+              <div class="glow-bar conf-bar">
+                <div class="glow-fill conf-glow" id="eurusd-conf-fill-glow"></div>
+                <div class="main-fill conf-main" id="eurusd-conf-fill"></div>
+              </div>
+            </div>
+
+            <div class="tags-row">
+              <div class="glow-tag neutral" id="eurusd-market-tag">UNKNOWN</div>
+              <div class="glow-tag gray" id="eurusd-quality-tag">WEAK</div>
+               <div class="glow-tag gray" id="eurusd-timing-tag">NEUTRAL</div>
+            </div>
+          </section>
+
+          <!-- GOLD -->
+          <section class="symbol-card gold-card" id="gold-card">
+            <div class="card-outer-glow"></div>
+            <div class="top-cap"></div>
+
+            <div class="card-header">
+              <div class="title-wrap">
+               <div class="card-title gold-title" id="gold-title">XAUUSD</div>
+                <img src="gold.png" alt="GOLD" class="symbol-icon gold-icon" />
+              </div>
+            </div>
+
+            <div class="signal-shell signal-wait" id="gold-signal-shell">
+              <div class="signal-box signal-border-wait" id="gold-signal-box">
+                <div class="signal-text wait-text" id="gold-signal">WAIT</div>
+              </div>
+            </div>
+            <div id="gold-signal-note" class="signal-freshness-note hidden">Trend active · no fresh entry</div>
+
+            <div class="metric-label" id="gold-buy-label">Buy: 0%</div>
+            <div class="bar-wrap">
+              <div class="glow-bar">
+                <div class="glow-fill buy-glow" id="gold-buy-fill-glow"></div>
+                <div class="main-fill buy-main" id="gold-buy-fill"></div>
+              </div>
+            </div>
+
+            <div class="metric-label" id="gold-sell-label">Sell: 0%</div>
+            <div class="bar-wrap">
+              <div class="glow-bar">
+                <div class="glow-fill sell-glow" id="gold-sell-fill-glow"></div>
+                <div class="main-fill sell-main" id="gold-sell-fill"></div>
+              </div>
+            </div>
+
+            <div class="metric-label conf-label" id="gold-conf-label">Confidence: 0%</div>
+            <div class="bar-wrap conf-wrap">
+              <div class="glow-bar conf-bar">
+                <div class="glow-fill conf-glow" id="gold-conf-fill-glow"></div>
+                <div class="main-fill conf-main" id="gold-conf-fill"></div>
+              </div>
+            </div>
+
+            <div class="tags-row">
+              <div class="glow-tag neutral" id="gold-market-tag">UNKNOWN</div>
+              <div class="glow-tag gray" id="gold-quality-tag">WEAK</div>
+              <div class="glow-tag gray" id="gold-timing-tag">NEUTRAL</div>
+            </div>
+            </section>
+        </div>
+      </div>
+
+      <!-- CENTER TRADE PANEL -->
+<div class="main-trade-panel">
+  <div class="main-trade-card">
+    <div class="main-trade-header">
+  <div>
+    <div class="main-symbol" id="main-symbol-title">EURUSD 🇪🇺🇺🇸</div>
+    <div id="main-live-price" class="main-live-price">--</div>
+
+    <div class="main-live">• LIVE</div>
+    <div id="main-candle-debug" class="main-candle-debug">
+      Candle: -- · Source: -- · Last fetch: -- · Misses: 0
+    </div>
+  </div>
+</div>
+
+    <div class="main-signal-box">
+      <span id="main-signal">WAIT</span>
+    </div>
+    <div id="main-signal-note" class="signal-freshness-note main-signal-note hidden">Trend active · no fresh entry</div>
+
+    <div class="main-metrics">
+      <div><span>Buy</span><strong id="main-buy">--%</strong></div>
+      <div><span>Sell</span><strong id="main-sell">--%</strong></div>
+      <div><span>Confidence</span><strong id="main-confidence">--%</strong></div>
+    </div>
+
+    <div class="smc-panel main-smc-panel">
+      <div class="smc-header">⚡ SMC PLAN</div>
+      <div class="smc-row"><span>Type</span><span id="main-plan-type">--</span></div>
+      <div class="smc-row"><span>Entry</span><span id="main-entry-price">--</span></div>
+      <div class="smc-row"><span>SL</span><span id="main-sl">--</span></div>
+      <div class="smc-row"><span>TP1</span><span id="main-tp1">--</span></div>
+      <div class="smc-row"><span>TP2</span><span id="main-tp2">--</span></div>
+      <div class="smc-row"><span>Risk/Reward</span><span id="main-rr">--</span></div>
+      <div class="smc-row signal-blocker-row hidden" id="main-blocked-reason-row"><span>Block Reason</span><span id="main-blocked-reason">--</span></div>
+    </div>
+
+    <details class="entry-strategy-debug" open>
+      <summary>ENTRY STRATEGY CHECKS</summary>
+      <div class="entry-strategy-debug-grid">
+        <span>15m BOS/CHOCH</span><strong id="strategy-debug-smc">NO</strong>
+        <span>Swing break</span><strong id="strategy-debug-swing-break">NO</strong>
+        <span>15m close</span><strong id="strategy-debug-15m-close">NO</strong>
+        <span>5m confirm</span><strong id="strategy-debug-5m-confirm">NO</strong>
+        <span>Swing SL</span><strong id="strategy-debug-swing-sl">NO</strong>
+        <span>Signal</span><strong id="strategy-debug-decision">WAIT</strong>
+        <span class="strategy-debug-reason-label">Reason</span><strong id="strategy-debug-block-reason">--</strong>
+      </div>
+    </details>
+
+    <div class="buttons-row main-buttons-row">
+  <div class="button-shell buy-shell">
+    <button class="glow-button buy-button" onclick="confirmTrade(currentChartSymbol, 'BUY')">Buy</button>
+  </div>
+  <div class="button-shell sell-shell">
+    <button class="glow-button sell-button" onclick="confirmTrade(currentChartSymbol, 'SELL')">Sell</button>
+  </div>
+</div>
+
+<!-- ✅ MOVE INSIDE THE CARD -->
+<div class="main-bottom-row">
+  <span id="main-last-signal">Last Signal: WAIT</span>
+  <span id="main-local-time">--:--:--</span>
+</div>
+
+</div> <!-- main-trade-card -->
+</div> <!-- main-trade-panel -->
+
+<!-- RIGHT SIDE -->
+<div class="chart-panel">
+        <div class="chart-wrap">
+          <div class="chart-section">
+
+  <div class="chart-controls">
+    <div class="chart-symbols">
+      <button onclick="switchChart('EURUSD', currentChartTimeframe)">EURUSD</button>
+      <button onclick="switchChart('XAUUSD', currentChartTimeframe)">GOLD</button>
+    </div>
+
+    <div class="chart-timeframes">
+      <button onclick="switchTimeframe('5m')">5m</button>
+      <button onclick="switchTimeframe('15m')">15m</button>
+      <button onclick="switchTimeframe('1h')">1h</button>
+    </div>
+  </div>
+
+  <div class="chart-box">
+  <div class="chart-overlay-header">
+    <div id="chartOverlayTitle">EURUSD · 5m</div>
+    <div id="chartOverlayOhlc">
+      O <span>--</span> H <span>--</span> L <span>--</span> C <span>--</span>
+    </div>
+  </div>
+
+  <div id="chartContainer"></div>
+  <div id="tradeLevelDragLayer" class="trade-level-drag-layer" aria-label="Draggable trade levels"></div>
+  <div id="tradeLevelPreview" class="trade-level-preview hidden" aria-live="polite"></div>
+</div>
+
+<div id="tradeLevelConfirmModal" class="trade-level-confirm-modal hidden">
+  <div class="trade-level-confirm-card" role="dialog" aria-modal="true" aria-labelledby="tradeLevelConfirmTitle">
+    <div class="trade-level-confirm-kicker">ORDER MANAGEMENT</div>
+    <h3 id="tradeLevelConfirmTitle">Apply changes?</h3>
+    <p id="tradeLevelConfirmSummary">Review the updated trade level.</p>
+    <div id="tradeLevelConfirmMetrics" class="trade-level-confirm-metrics"></div>
+    <div id="tradeLevelConfirmError" class="trade-level-confirm-error hidden"></div>
+    <div class="trade-level-confirm-actions">
+      <button id="cancelTradeLevelChangeBtn" type="button">CANCEL</button>
+      <button id="applyTradeLevelChangeBtn" type="button">YES</button>
+    </div>
+  </div>
+</div>
+
+<div class="news-impact-panel">
+  <div class="news-impact-card">
+    <div class="news-impact-header">
+      <div class="news-impact-title">
+        <span class="news-impact-title-icon" aria-hidden="true">▤</span>
+        <span id="news-impact-title">NEWS IMPACT • EURUSD</span>
+      </div>
+      <div class="news-impact-updated">
+        <span id="news-impact-updated">Last update: --</span>
+        <span class="news-impact-refresh" aria-hidden="true">↻</span>
+      </div>
+    </div>
+
+    <div id="news-impact-empty" class="news-impact-empty">
+      News unavailable.
+    </div>
+
+    <div id="news-impact-content" class="news-impact-content hidden">
+      <div class="news-impact-event">
+        <span>NEXT HIGH-IMPACT NEWS</span>
+        <strong id="news-impact-event-name">--</strong>
+        <em id="news-impact-currency">Currency affected: --</em>
+        <b id="news-impact-time">--</b>
+      </div>
+
+      <div class="news-impact-item">
+        <span>IMPACT</span>
+        <strong id="news-impact-level">--</strong>
+        <div class="news-impact-dots" aria-hidden="true">
+          <i></i><i></i><i></i>
+        </div>
+      </div>
+
+      <div class="news-impact-item">
+        <span>NEWS BIAS</span>
+        <strong id="news-impact-bias">--</strong>
+        <em id="news-impact-bias-note">Waiting for release</em>
+      </div>
+
+      <div class="news-impact-item">
+        <span id="news-impact-effect-label">EFFECT ON EURUSD</span>
+        <strong id="news-impact-effect">--</strong>
+        <em id="news-impact-effect-note">Normal SMC rules active</em>
+      </div>
+
+      <div class="news-impact-score">
+        <span>FINAL NEWS SCORE</span>
+        <strong id="news-impact-score">0</strong>
+        <em>-25 to +25</em>
+      </div>
+
+      <div class="news-impact-decision">
+        <span>TRADE DECISION</span>
+        <strong id="news-impact-decision">WAITING FOR ACTUAL DATA</strong>
+        <em id="news-impact-decision-note">Wait for news to pass</em>
+      </div>
+    </div>
+  </div>
+</div>
+<section class="history-section">
+    <div class="history-header">
+      <h2>Recent Signal History</h2>
+    </div>
+
+    <div class="history-table-wrap">
+      <table class="history-table">
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Symbol</th>
+            <th>Signal</th>
+            <th>Confidence</th>
+            <th>Result</th>
+            <th>Pips</th>
+          </tr>
+        </thead>
+        <tbody id="historyBody">
+          <tr>
+            <td colspan="6">No history yet</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+</div> <!-- END .chart-section -->
+        </div> <!-- END .chart-wrap -->
+      </div> <!-- END .chart-panel -->
+    </div> <!-- END .dashboard-grid -->
+
+    <div class="footer">
+      <div id="utcLabel" class="utc-label">UTC --:--:--</div>
+    </div>
+    <a class="mobile-domain-pill" href="https://flowsignalfx.com" target="_blank" rel="noopener">
+      <span aria-hidden="true">▣</span>
+      flowsignalfx.com
+    </a>
+  </div>
+
+  <div id="smartExplain" class="smart-explain hidden" role="dialog" aria-modal="false" aria-labelledby="smartExplainTitle">
+    <div class="smart-explain-head">
+      <div>
+        <strong id="smartExplainTitle">Flow Assistant</strong>
+        <span id="smartExplainSubtitle" class="smart-explain-kicker">Market Assistant</span>
+      </div>
+      <button id="smartExplainClose" class="smart-explain-close" type="button" aria-label="Close explanation">×</button>
+    </div>
+    <p id="smartExplainText">FlowSignal is ready.</p>
+    <div id="smartExplainDetails" class="smart-explain-details hidden"></div>
+    <div class="smart-explain-footer">
+      <div id="smartExplainState" class="smart-explain-state"></div>
+    </div>
+  </div>
+
+  <div id="tradeModal" class="trade-modal hidden">
+  <div class="trade-modal-box">
+    <div class="trade-modal-title" id="tradeModalTitle">Confirm Trade</div>
+    <div class="trade-modal-text" id="tradeModalText">Confirm BUY on EURUSD?</div>
+
+    <div class="trade-modal-actions">
+      <button id="tradeCancelBtn" class="trade-modal-btn cancel-btn">Cancel</button>
+      <button id="tradeConfirmBtn" class="trade-modal-btn confirm-btn">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<div id="adminModal" class="trade-modal hidden">
+  <div class="trade-modal-box admin-modal-box">
+    <div class="trade-modal-title" id="adminModalTitle">Admin Access</div>
+    <div class="trade-modal-text">Enter admin code to unlock BUY / SELL.</div>
+
+    <input
+      type="password"
+      id="adminCodeInput"
+      class="admin-code-input"
+      placeholder="Enter admin code"
+      autocomplete="off"
+    />
+
+    <div class="trade-modal-actions">
+      <button id="adminCancelBtn" class="trade-modal-btn cancel-btn">Cancel</button>
+      <button id="adminConfirmBtn" class="trade-modal-btn confirm-btn">Unlock</button>
+    </div>
+  </div>
+</div>
+
+<div id="feedbackModal" class="trade-modal hidden">
+  <div class="trade-modal-box feedback-modal-box">
+    <div class="trade-modal-title">Send Feedback</div>
+    <div class="trade-modal-text" id="feedbackHelpText">
+  Tell us what you want improved.
+</div>
+
+    <select id="feedbackType" class="feedback-type-select">
+      <option value="Bug report">Bug report</option>
+      <option value="Feature request">Feature request</option>
+    </select>
+
+    <textarea
+      id="feedbackInput"
+      class="feedback-textarea"
+      placeholder="Type your feedback here..."
+    ></textarea>
+
+    <div class="trade-modal-actions">
+      <button id="feedbackCancelBtn" class="trade-modal-btn cancel-btn">Cancel</button>
+      <button id="feedbackSendBtn" class="trade-modal-btn confirm-btn">Send</button>
+    </div>
+  </div>
+</div>
+
+<div id="feedbackToast" class="feedback-toast hidden">
+  Thank you! for your feedback ✨
+</div>
+
+<div id="statsModal" class="trade-modal hidden">
+  <div class="trade-modal-box performance-modal-box">
+    <div class="performance-pro-head">
+      <div class="performance-pro-title">
+        <span>↗</span>
+        <div>
+          <div class="trade-modal-title">Performance</div>
+          <p>Track your trading performance and platform analytics.</p>
+        </div>
+      </div>
+      <div class="performance-pro-actions">
+        <span id="perfLastUpdated">Last Updated: --</span>
+        <button id="closeStatsBtn" class="assistant-panel-close" type="button">×</button>
+      </div>
+    </div>
+
+    <div class="performance-pro-grid">
+      <article class="performance-metric green" data-metric-icon="◉"><span>Win Rate</span><strong id="perfWinRate">--</strong><small>▲ vs last 30 days</small><i></i></article>
+      <article class="performance-metric blue" data-metric-icon="▣"><span>Total Trades</span><strong id="perfTotalTrades">--</strong><small>▲ vs last 30 days</small><i></i></article>
+      <article class="performance-metric split" data-metric-icon="⚖"><span>Wins / Losses</span><strong id="perfWinsLosses">--</strong><small>▲ wins / ▼ losses</small><i></i></article>
+      <article class="performance-metric red" data-metric-icon="↗"><span>Weekly P/L</span><strong id="perfWeeklyPnl">--</strong><small>▼ vs last week</small><i></i></article>
+      <article class="performance-metric green" data-metric-icon="▦"><span>Monthly P/L</span><strong id="perfMonthlyPnl">--</strong><small>▲ vs last month</small><i></i></article>
+      <article class="performance-metric amber" data-metric-icon="♜"><span>Best Trade</span><strong id="perfBestTrade">--</strong><small>▲ vs last 30 days</small><i></i></article>
+      <article class="performance-metric red" data-metric-icon="△"><span>Worst Trade</span><strong id="perfWorstTrade">--</strong><small>▼ vs last 30 days</small><i></i></article>
+      <article class="performance-metric blue" data-metric-icon="◔"><span>Average RR</span><strong id="perfAverageRr">--</strong><small>▲ risk reward average</small><i></i></article>
+      <article class="performance-metric purple" data-metric-icon="Σ"><span>Profit Factor</span><strong id="perfProfitFactor">--</strong><small>▲ gross profit / loss</small><i></i></article>
+      <article class="performance-metric performance-symbol-metric blue"><span>EURUSD Performance</span><strong id="perfEurusd">--</strong><small>symbol summary</small><i></i></article>
+      <article class="performance-metric performance-symbol-metric amber"><span>XAUUSD Performance</span><strong id="perfXauusd">--</strong><small>symbol summary</small><i></i></article>
+    </div>
+
+    <div class="performance-pro-panels">
+      <section class="performance-pro-panel">
+        <h3><span>▥</span> App Analytics</h3>
+        <div data-panel-icon="♟"><span>Total Visits<small>All time visits to FlowSignal</small></span><strong id="totalVisitorsCount">0</strong></div>
+        <div data-panel-icon="♙"><span>Unique Visitors<small>All time unique visitors</small></span><strong id="uniqueVisitorsCount">0</strong></div>
+        <div data-panel-icon="▦"><span>Today Visits<small>Visits today</small></span><strong id="todayVisitsCount">0</strong></div>
+        <div data-panel-icon="◷"><span>Last Visit<small>Most recent visit</small></span><strong id="lastVisitTime">--</strong></div>
+        <div data-panel-icon="◎"><span>Countries<small>Top visitor location</small></span><strong id="countryStats">--</strong></div>
+      </section>
+      <section class="performance-pro-panel platform-panel">
+        <h3><span>◆</span> Platform Statistics</h3>
+        <div data-panel-icon="◉"><span>Total Trades<small>All trades recorded</small></span><strong id="perfTotalTradesSummary">--</strong></div>
+        <div data-panel-icon="↗"><span>Weekly P/L<small>Current trading week</small></span><strong id="perfWeeklyPnlSummary">--</strong></div>
+        <div data-panel-icon="▦"><span>Monthly P/L<small>Current trading month</small></span><strong id="perfMonthlyPnlSummary">--</strong></div>
+        <div data-panel-icon="⚖"><span>Wins / Losses<small>Completed trade outcomes</small></span><strong id="perfWinsLossesSummary">--</strong></div>
+        <div data-panel-icon="Σ"><span>Profit Factor<small>Gross profit divided by loss</small></span><strong id="perfProfitFactorSummary">--</strong></div>
+      </section>
+    </div>
+
+    <div class="performance-lower-grid">
+      <section class="performance-equity-card">
+        <div class="performance-section-head"><h3>Equity Curve</h3><span>30 Days⌄</span></div>
+        <div class="performance-equity-chart" aria-hidden="true">
+          <div class="equity-grid-lines"></div>
+          <svg viewBox="0 0 700 190" preserveAspectRatio="none">
+            <defs>
+              <linearGradient id="equityArea" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#7c3aed" stop-opacity=".42"/>
+                <stop offset="100%" stop-color="#7c3aed" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <path class="equity-area" d="M0 150 L42 136 L82 128 L124 130 L160 108 L205 98 L245 118 L284 137 L326 110 L365 88 L405 75 L446 78 L486 55 L528 72 L568 62 L610 70 L650 52 L700 45 L700 190 L0 190 Z"/>
+            <path class="equity-line" d="M0 150 L42 136 L82 128 L124 130 L160 108 L205 98 L245 118 L284 137 L326 110 L365 88 L405 75 L446 78 L486 55 L528 72 L568 62 L610 70 L650 52 L700 45"/>
+            <circle cx="700" cy="45" r="7"/>
+          </svg>
+          <div class="equity-axis"><span>30 days ago</span><span>Today</span></div>
+        </div>
+      </section>
+      <section class="performance-summary-card">
+        <h3>Performance Summary</h3>
+        <div><span>Total Trades</span><strong id="perfSummaryTrades">--</strong></div>
+        <div><span>Wins / Losses</span><strong id="perfSummaryWins">--</strong></div>
+        <div><span>Weekly P/L</span><strong id="perfSummaryWeekly">--</strong></div>
+        <div><span>Monthly P/L</span><strong id="perfSummaryMonthly">--</strong></div>
+        <div><span>Profit Factor</span><strong id="perfSummaryFactor">--</strong></div>
+      </section>
+    </div>
+
+    <div class="performance-footer">
+      <button id="performanceFooterCloseBtn" type="button">×&nbsp;&nbsp; Close</button>
+    </div>
+  </div>
+</div>
+
+<div id="settingsModal" class="trade-modal hidden">
+  <div class="trade-modal-box settings-modal-box">
+    <div class="settings-modal-header">
+      <div>
+        <div class="trade-modal-title" id="settingsModalTitle">General Settings</div>
+        <div class="trade-modal-text" id="settingsModalSubtitle">Control what appears on your dashboard.</div>
+      </div>
+      <button id="closeSettingsModalBtn" class="settings-close-btn" type="button">×</button>
+    </div>
+
+    <section id="generalSettingsPanel" class="settings-panel">
+      <div class="settings-grid">
+        <label><input type="checkbox" data-dashboard-pref="showWeeklyPnl"> Show Weekly P/L</label>
+        <label><input type="checkbox" data-dashboard-pref="showMonthlyPnl"> Show Monthly P/L</label>
+        <label><input type="checkbox" data-dashboard-pref="showFloatingPnl"> Show Floating P/L</label>
+        <label><input type="checkbox" data-dashboard-pref="showConfidence"> Show Confidence</label>
+        <label><input type="checkbox" data-dashboard-pref="showBuySellPct"> Show Buy/Sell %</label>
+        <label><input type="checkbox" data-dashboard-pref="showManualTradeButtons"> Show Buy/Sell Buttons</label>
+        <label><input type="checkbox" data-dashboard-pref="showOpenTradesCounter"> Show Open Trades Counter</label>
+        <label><input type="checkbox" data-dashboard-pref="showMarketStructurePanel"> Show News Impact Panel</label>
+        <label><input type="checkbox" data-dashboard-pref="showRecentSignalHistory"> Show Recent Signal History</label>
+        <label><input type="checkbox" data-dashboard-pref="showAccountBalance"> Show Account Balance</label>
+        <label><input type="checkbox" data-dashboard-pref="showAccountNumber"> Show Account Number</label>
+        <label><input type="checkbox" data-dashboard-pref="showBrokerInfo"> Show Broker Info</label>
+      </div>
+    </section>
+
+    <section id="riskSettingsPanel" class="settings-panel hidden">
+      <div class="risk-pro-alert"><span class="risk-info-icon">i</span> All risk settings apply to both EURUSD and Gold automatically.</div>
+      <div class="risk-pro-grid">
+        <article class="risk-pro-card" data-risk-card="riskPerTradePct">
+          <span class="risk-card-icon">◔</span>
+          <h3>Risk per trade</h3><p>% of account equity</p>
+          <div class="risk-stepper"><button type="button" data-risk-adjust="riskPerTradePct:-0.05">−</button><input type="number" step="0.01" min="0.05" max="1" data-risk-pref="riskPerTradePct"><button type="button" data-risk-adjust="riskPerTradePct:0.05">+</button></div>
+          <div class="risk-bar"><span style="width:48%"></span></div><small>Recommended: 0.25% – 1.00%</small>
+        </article>
+        <article class="risk-pro-card" data-risk-card="maxDailyLoss">
+          <span class="risk-card-icon">▣</span>
+          <h3>Max daily loss</h3><p>Maximum loss per day</p>
+          <div class="risk-stepper"><button type="button" data-risk-adjust="maxDailyLoss:-50">−</button><input type="number" step="0.01" min="0" data-risk-pref="maxDailyLoss"><button type="button" data-risk-adjust="maxDailyLoss:50">+</button></div>
+          <div class="risk-bar"><span style="width:46%"></span></div><small>Recommended: $300 – $600</small>
+        </article>
+        <article class="risk-pro-card" data-risk-card="maxWeeklyLoss">
+          <span class="risk-card-icon">▣</span>
+          <h3>Max weekly loss</h3><p>Maximum loss per week</p>
+          <div class="risk-stepper"><button type="button" data-risk-adjust="maxWeeklyLoss:-50">−</button><input type="number" step="0.01" min="0" data-risk-pref="maxWeeklyLoss"><button type="button" data-risk-adjust="maxWeeklyLoss:50">+</button></div>
+          <div class="risk-bar"><span style="width:48%"></span></div><small>Recommended: $500 – $1,200</small>
+        </article>
+        <article class="risk-pro-card" data-risk-card="maxOpenTrades">
+          <span class="risk-card-icon">◇</span>
+          <h3>Max open trades</h3><p>Maximum trades at the same time</p>
+          <div class="risk-stepper"><button type="button" data-risk-adjust="maxOpenTrades:-1">−</button><input type="number" step="1" min="0" data-risk-pref="maxOpenTrades"><button type="button" data-risk-adjust="maxOpenTrades:1">+</button></div>
+          <div class="risk-bar"><span style="width:43%"></span></div><small>Recommended: 1 – 5</small>
+        </article>
+        <article class="risk-pro-card" data-risk-card="tp1PercentOfTp2">
+          <span class="risk-card-icon">◎</span>
+          <h3>TP1 % of TP2</h3><p>Take Profit 1 as % of TP2</p>
+          <div class="risk-stepper"><button type="button" data-risk-adjust="tp1PercentOfTp2:-5">−</button><input type="number" step="1" min="0" max="100" data-risk-pref="tp1PercentOfTp2"><button type="button" data-risk-adjust="tp1PercentOfTp2:5">+</button></div>
+          <div class="risk-bar"><span style="width:56%"></span></div><small>Recommended: 50% – 90%</small>
+        </article>
+        <article class="risk-pro-card" data-risk-card="protectedSlPercentOfTp2">
+          <span class="risk-card-icon">♙</span>
+          <h3>Protected SL % of TP2</h3><p>Move SL to break-even after TP1</p>
+          <div class="risk-stepper"><button type="button" data-risk-adjust="protectedSlPercentOfTp2:-5">−</button><input type="number" step="1" min="0" max="100" data-risk-pref="protectedSlPercentOfTp2"><button type="button" data-risk-adjust="protectedSlPercentOfTp2:5">+</button></div>
+          <div class="risk-bar"><span style="width:57%"></span></div><small>Recommended: 30% – 60%</small>
+        </article>
+      </div>
+      <div class="risk-pro-extra">
+        <label class="settings-inline"><input type="checkbox" data-risk-pref="breakEvenEnabled"> Break-even rule</label>
+        <label>Allowed symbols <input type="text" data-risk-pref="allowedSymbols" placeholder="EURUSD,XAUUSD"></label>
+        <label>Default trading mode
+          <select data-risk-pref="defaultTradingMode">
+            <option value="PAPER">PAPER</option>
+            <option value="LIVE">LIVE</option>
+          </select>
+        </label>
+      </div>
+      <div id="riskSaveStatus" class="risk-save-status">Current risk: --%</div>
+      <div class="risk-pro-actions">
+        <button id="riskResetBtn" type="button">↻ Reset to Defaults</button>
+        <div class="risk-pro-actions-right">
+          <button id="riskCancelBtn" type="button">Cancel</button>
+          <button id="riskSaveBtn" type="button">✓ Save Changes</button>
+        </div>
+      </div>
+      <p class="risk-pro-footnote">These settings are saved locally and apply to all instruments.</p>
+    </section>
+
+    <section id="notificationsSettingsPanel" class="settings-panel hidden">
+      <div class="settings-placeholder">Notification settings will appear here when alert channels are connected.</div>
+    </section>
+
+    <section id="strategySettingsPanel" class="settings-panel hidden">
+      <div class="settings-placeholder">Strategy settings will appear here when editable strategy profiles are connected.</div>
+    </section>
+  </div>
+</div>
+
+<div id="brokerAccountsModal" class="trade-modal broker-settings-modal hidden">
+  <div class="broker-settings-shell">
+    <section class="broker-settings-content">
+      <div class="broker-settings-topbar">
+        <div></div>
+        <div class="broker-settings-top-actions">
+          <button class="broker-voice-chip" type="button">Voice ON</button>
+          <span class="broker-lang-chip">EN⌄</span>
+          <span class="broker-avatar-chip">●</span>
+        </div>
+      </div>
+
+      <header class="broker-settings-header">
+        <div>
+          <h2>Broker Accounts</h2>
+          <p>Manage your cTrader connection and accounts. Select which account FlowSignal should use for live trading.</p>
+        </div>
+        <button id="closeBrokerAccountsBtn" class="broker-mobile-close" type="button" aria-label="Close Broker Accounts">×</button>
+      </header>
+
+      <section class="broker-connection-card">
+        <div>
+          <div class="broker-section-title">
+            cTrader Connection
+            <span id="brokerConnectedBadge" class="broker-connected-badge">Checking</span>
+          </div>
+          <div class="broker-account-status" id="brokerAccountsStatus">
+            Connection Status: loading...
+          </div>
+          <div id="brokerAuthorizedText" class="broker-authorized-text">Authorized: --</div>
+        </div>
+
+        <div class="broker-account-actions">
+          <button id="connectCtraderBtn" class="broker-action-btn connect-btn">⌁ Connect cTrader</button>
+          <button id="disconnectCtraderBtn" class="broker-action-btn disconnect-btn">⌧ Disconnect cTrader</button>
+          <button id="refreshCtraderAccountsBtn" class="broker-action-btn refresh-btn">↻ Refresh Accounts</button>
+        </div>
+      </section>
+
+      <div class="broker-settings-main">
+        <main>
+          <section class="broker-accounts-card">
+            <div class="broker-accounts-heading">
+              <div class="broker-section-title">cTrader Accounts</div>
+              <span id="brokerAccountCount" class="broker-count-pill">0 Accounts Found</span>
+            </div>
+
+            <label class="broker-account-label" for="brokerAccountSelect">Account list</label>
+            <select id="brokerAccountSelect" class="broker-account-select"></select>
+
+            <div class="broker-account-table-wrap">
+              <table class="broker-account-table">
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>Number</th>
+                    <th>Broker</th>
+                    <th>Type</th>
+                    <th>Balance</th>
+                    <th>Currency</th>
+                    <th>Status</th>
+                    <th>Active</th>
+                  </tr>
+                </thead>
+                <tbody id="brokerAccountList">
+                  <tr><td colspan="8">No accounts loaded.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="broker-about-card">
+            <div class="broker-about-title">ⓘ About Accounts</div>
+            <p>Only one account can be active at a time. All signals, positions, and orders will use the selected active account.</p>
+            <p>If an account shows as unavailable, it may be expired or no longer authorized in cTrader.</p>
+          </section>
+        </main>
+
+        <aside class="broker-right-panel">
+          <section class="broker-active-card" id="activeBrokerAccountCard">
+            <div class="broker-active-title">● Active Account</div>
+            <strong>--</strong>
+            <span>No active account selected</span>
+            <button id="setActiveCtraderAccountBtn" class="broker-side-btn">Change Active Account</button>
+          </section>
+
+          <section class="broker-side-actions">
+            <h3>Account Actions</h3>
+            <button class="broker-side-action" id="forgetCtraderAccountBtn">
+              <strong>⌫ Forget Account</strong>
+              <span>Remove selected account from FlowSignal</span>
+            </button>
+            <button class="broker-side-action" id="clearAllBrokerAccountsBtn">
+              <strong>🗑 Clear All Accounts</strong>
+              <span>Remove all saved accounts from FlowSignal</span>
+            </button>
+          </section>
+        </aside>
+      </div>
+    </section>
+  </div>
+</div>
+
+<div id="paperModal" class="trade-modal hidden">
+  <div class="trade-modal-box">
+    <div class="auto-trade-attached-head">
+      <div>
+        <div class="trade-modal-title">Auto Trade</div>
+        <p>Manage paper and live automated trading.</p>
+      </div>
+      <button id="closePaperBtn" class="assistant-panel-close" type="button" aria-label="Close Auto Trade">×</button>
+    </div>
+  
+    <div id="paperAutoSection" class="trade-modal-text">
+      <button id="paperAutoToggleBtn" class="trade-modal-btn confirm-btn">
+        Paper Auto: OFF
+      </button>
+    </div>
+
+      <div id="liveAutoSection" class="trade-modal-text">
+        <button id="liveAutoToggleBtn" class="trade-modal-btn confirm-btn">
+          Live Auto: OFF
+        </button>
+      </div>
+      <div id="brokerConnectionStatus" class="broker-connection-status">
+        Live Broker: Disconnected
+      </div>
+<div class="execution-page-tabs">
+
+  <button
+    id="paperPageBtn"
+    class="execution-page-btn active"
+  >
+    PAPER TRADES
+  </button>
+
+  <button
+    id="livePageBtn"
+    class="execution-page-btn"
+  >
+    LIVE TRADES
+  </button>
+
+</div>
+
+<div id="liveActiveOrders" class="live-active-orders">
+
+        <div class="live-active-title">
+          ✦ ACTIVE STRATEGIES
+        </div>
+
+        <div
+          id="liveActiveList"
+          class="live-active-list"
+        >
+          No active live trades
+        </div>
+
+      </div>
+
+      <div
+      id="paperHistoryList"
+      class="trade-modal-text"
+      style="
+        margin-top: 8px;
+        padding-right: 4px;
+      "
+    >
+      No paper history yet
+    </div>
+
+<div
+  id="liveHistoryList"
+  class="trade-modal-text hidden"
+  style="
+    margin-top: 8px;
+    padding-right: 4px;
+  "
+>
+  No live trades yet
+</div>
+
+    <div id="liveAutoConfirmOverlay" class="live-auto-confirm-overlay hidden">
+      <div class="live-auto-confirm-card" role="dialog" aria-modal="true" aria-labelledby="liveAutoConfirmTitle">
+        <div id="liveAutoConfirmTitle" class="live-auto-confirm-title">
+          Live Auto Confirmation
+        </div>
+        <div id="liveAutoConfirmMessage" class="live-auto-confirm-message">
+          FlowSignal will place trades on your connected broker account.
+          Continue?
+        </div>
+        <div class="live-auto-confirm-actions">
+          <button id="liveAutoConfirmCancel" class="live-auto-confirm-btn cancel" type="button">
+            Cancel
+          </button>
+          <button id="liveAutoConfirmOk" class="live-auto-confirm-btn confirm confirm-on" type="button">
+            Confirm
+          </button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div id="assistantModal" class="trade-modal assistant-modal hidden">
+  <div class="trade-modal-box assistant-modal-box" role="dialog" aria-modal="true" aria-labelledby="assistantModalTitle">
+    <div class="assistant-panel-head">
+      <div class="assistant-pro-title">
+        <span>〽</span>
+        <div>
+          <span id="assistantPanelKicker">AI MARKET VOICE</span>
+          <div id="assistantModalTitle" class="trade-modal-title">Flow Assistant</div>
+          <p>Configure your AI assistant and market voice settings.</p>
+        </div>
+      </div>
+      <button id="closeAssistantPanelBtn" class="assistant-panel-close" type="button" aria-label="Close Flow Assistant">×</button>
+    </div>
+
+    <div class="assistant-pro-grid">
+      <section id="flowAssistantSettings" class="assistant-settings assistant-pro-card" aria-labelledby="flowAssistantSettingsTitle">
+        <div class="assistant-settings-heading">
+          <span>🎙</span>
+          <strong id="flowAssistantSettingsTitle">Voice Settings</strong>
+        </div>
+
+        <button id="menuVoiceToggleBtn" class="assistant-setting-toggle" type="button" aria-pressed="true">Voice ON</button>
+
+        <label class="assistant-setting-field">
+          <span id="assistantVoiceLabel">Voice</span>
+          <select id="voiceSelect" aria-label="Assistant voice"></select>
+        </label>
+
+        <button id="testVoiceBtn" class="assistant-test-voice" type="button">▷ Test Voice</button>
+
+        <label class="assistant-popup-setting">
+          <span id="assistantPopupLabel">Show text popup</span>
+          <input id="assistantPopupToggle" type="checkbox" checked>
+        </label>
+
+        <label class="assistant-setting-field">
+          <span><span id="assistantSpeedLabel">Voice speed</span> <output id="voiceSpeedValue">0.90</output></span>
+          <input id="voiceSpeed" type="range" min="0.6" max="1.3" step="0.05" value="0.9">
+        </label>
+
+        <label class="assistant-setting-field">
+          <span><span id="assistantPitchLabel">Voice pitch</span> <output id="voicePitchValue">1.05</output></span>
+          <input id="voicePitch" type="range" min="0.7" max="1.4" step="0.05" value="1.05">
+        </label>
+
+        <label class="assistant-setting-field">
+          <span>Voice volume <output>0.90</output></span>
+          <input type="range" min="0" max="1" step="0.05" value="0.9">
+        </label>
+
+        <label class="assistant-setting-field">
+          <span id="assistantStyleLabel">Assistant style</span>
+          <select id="assistantStyle">
+            <option value="calm">Calm & Professional</option>
+            <option value="confident">Confident</option>
+            <option value="hype">Hype</option>
+            <option value="professional">Professional</option>
+          </select>
+        </label>
+      </section>
+
+      <section id="streamerVoiceMenu" class="streamer-voice-menu assistant-pro-card" aria-labelledby="streamerVoiceTitle">
+        <button id="streamerVoiceToggle" class="assistant-settings-heading streamer-voice-toggle" type="button" aria-expanded="true">
+          <span>➤</span>
+          <strong id="streamerVoiceTitle">Streamer Voice</strong>
+        </button>
+        <p>Edit Streamer Voice Text</p>
+        <button id="streamerVoiceEditBtn" class="streamer-voice-edit-btn" type="button">✎ Edit Text</button>
+        <div class="assistant-preview">
+          Welcome to FlowSignal, let's watch the market.<br><br>
+          Please like the live if you enjoy the signals.<br><br>
+          Manage risk and stay disciplined.
+        </div>
+        <div id="streamerVoiceList" class="streamer-voice-list" aria-label="Streamer voice hotkeys"></div>
+      </section>
+
+      <section class="assistant-pro-card assistant-trigger-card">
+        <div class="assistant-settings-heading"><span>✦</span><strong>Market Voice Triggers</strong></div>
+        <label>Read on New Signal <input type="checkbox" checked></label>
+        <label>Read on Trade Open <input type="checkbox" checked></label>
+        <label>Read on Trade Close <input type="checkbox" checked></label>
+        <label>Read on Take Profit <input type="checkbox" checked></label>
+        <label>Read on Stop Loss <input type="checkbox" checked></label>
+        <label>Read on News <input type="checkbox" checked></label>
+        <label>Read on Market Update <input type="checkbox" checked></label>
+      </section>
+
+      <section class="assistant-pro-card assistant-behavior-card">
+        <div class="assistant-settings-heading"><span>♙</span><strong>Voice Behavior</strong></div>
+        <label class="assistant-setting-field"><span>Voice Expand <output>0.85 sec</output></span><input type="range" min="0" max="2" step="0.05" value="0.85"></label>
+        <label class="assistant-setting-field"><span>Voice Pause <output>1.20 sec</output></span><input type="range" min="0" max="3" step="0.05" value="1.2"></label>
+      </section>
+
+      <section class="assistant-pro-card assistant-advanced-card">
+        <div class="assistant-settings-heading"><span>⚙</span><strong>Advanced Settings</strong></div>
+        <label class="assistant-setting-field"><span>Language</span><select><option>English (UK)</option><option>English (US)</option></select></label>
+        <label class="assistant-setting-field"><span>Response Length</span><select><option>Normal</option><option>Short</option><option>Detailed</option></select></label>
+        <label class="assistant-setting-field"><span>AI Creativity</span><select><option>Balanced</option><option>More Accurate</option><option>More Creative</option></select></label>
+      </section>
+    </div>
+
+    <div class="assistant-pro-actions">
+      <button type="button">↻ Reset to Defaults</button>
+      <div class="assistant-pro-actions-right">
+        <button id="assistantCancelBtn" type="button">Cancel</button>
+        <button type="button" class="assistant-save-btn">✓ Save Changes</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="apiClient.js?v=1"></script>
+  <script src="state.js?v=1"></script>
+  <script src="settings.js?v=1"></script>
+  <script src="brokerAccounts.js?v=1"></script>
+  <script src="liveTrading.js?v=1"></script>
+  <script src="flowAssistant.js?v=1"></script>
+  <script src="performance.js?v=1"></script>
+  <script src="history.js?v=1"></script>
+  <script src="script.js?v=61"></script>
+</body>
+</html>
+  
