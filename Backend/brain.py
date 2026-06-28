@@ -8376,6 +8376,13 @@ def _get_ctrader_signal_wait_reason(source_state):
     if "ctrader_unavailable" in labels:
         return "cTrader candles unavailable"
 
+    if (
+        source_state.get("tf_1h_source") == "ctrader_stale"
+        and source_state.get("tf_15m_source") in ["ctrader", "ctrader_cache"]
+        and source_state.get("tf_5m_source") in ["ctrader", "ctrader_cache"]
+    ):
+        return None
+
     if "ctrader_stale" in labels:
         return "cTrader candles stale"
 
@@ -8389,6 +8396,13 @@ def _has_ctrader_stale_candles(source_state):
     ]
 
 def _is_ctrader_signal_state_available(source_state):
+    if (
+        source_state.get("tf_1h_source") == "ctrader_stale"
+        and source_state.get("tf_15m_source") in ["ctrader", "ctrader_cache"]
+        and source_state.get("tf_5m_source") in ["ctrader", "ctrader_cache"]
+    ):
+        return True
+
     return (
         source_state.get("tf_1h_source") in ["ctrader", "ctrader_cache"]
         and source_state.get("tf_15m_source") in ["ctrader", "ctrader_cache"]
