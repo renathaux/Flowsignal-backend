@@ -5345,31 +5345,32 @@ def prepare_ctrader_trade(payload, volume=0.01):
     symbol = normalize_symbol(raw_symbol)
     action = str(payload.get("action") or payload.get("side") or "").upper()
     plan = get_signal_trade_plan(symbol) or {}
-    # XAUUSD execution fix: when Auto passes an actionable BUY/SELL payload,
-    # do not let an old WAIT/late-entry plan value override it.
+    # Auto passes the current actionable panel signal. Do not let an older
+    # cached WAIT/late-entry plan value override it during execution.
     payload_signal = str(payload.get("signal") or "").upper()
     plan_signal = str(plan.get("signal") or "").upper()
-    if symbol == "XAUUSD" and payload_signal in ["BUY", "SELL"]:
+    if payload_signal in ["BUY", "SELL"]:
         signal = payload_signal
     else:
         signal = str(plan_signal or payload_signal or "WAIT").upper()
+    value_plan = {} if payload_signal in ["BUY", "SELL"] else plan
 
     entry, _ = choose_backend_trade_value(
-        plan,
+        value_plan,
         payload,
         "entry_price",
         "entry",
         "entry_price"
     )
     sl, _ = choose_backend_trade_value(
-        plan,
+        value_plan,
         payload,
         "stop_loss",
         "sl",
         "stop_loss"
     )
-    tp1, _ = choose_backend_trade_value(plan, payload, "tp1", "tp1")
-    tp2, _ = choose_backend_trade_value(plan, payload, "tp2", "tp2")
+    tp1, _ = choose_backend_trade_value(value_plan, payload, "tp1", "tp1")
+    tp2, _ = choose_backend_trade_value(value_plan, payload, "tp2", "tp2")
 
     try:
         decimals = 2 if symbol == "XAUUSD" else 5
