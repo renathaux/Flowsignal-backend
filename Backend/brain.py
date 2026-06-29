@@ -37,10 +37,11 @@ FIFTEEN_M_SWING_WATCH_FILE = os.path.join(
     "fifteen_m_swing_watch.json"
 )
 FINAL_SIGNAL_HOLD_EXPIRATION_SECONDS = 4 * 60 * 60
-FINAL_SIGNAL_HOLD_MAX_SETUP_CANDLES = 6
+FINAL_SIGNAL_HOLD_MAX_SETUP_CANDLES = 3
 FINAL_SIGNAL_HOLD_STALE_5M_CANDLES = 2
-FINAL_SIGNAL_HOLD_MAX_TP1_PROGRESS = 0.75
-FIFTEEN_M_PENDING_MAX_5M_CANDLES = 6
+FINAL_SIGNAL_HOLD_MAX_TP1_PROGRESS = 0.60
+FIFTEEN_M_PENDING_MAX_5M_CANDLES = 3
+MIN_LIVE_FRESHNESS_SCORE = 70
 # XAUUSD's final pre-maintenance H1 candle closes at 4 PM New York.
 # During the 5 PM maintenance break and the first post-reopen H1 candle,
 # that valid closed candle can be almost three hours old before the next
@@ -2223,6 +2224,128 @@ def calculate_final_signal_hold_tp1_progress(held, current_price):
 
     return max(0, moved / full_distance)
 
+def get_five_minute_candle_age(anchor_time, current_time):
+    anchor = parse_final_signal_hold_timestamp(anchor_time)
+    current = parse_final_signal_hold_timestamp(current_time)
+
+    if anchor is None or current is None:
+        return None
+
+    age_seconds = (current - anchor).total_seconds()
+
+    if pd.isna(age_seconds) or not math.isfinite(float(age_seconds)):
+        return None
+
+    return max(0, int(age_seconds // 300))
+
+def evaluate_entry_freshness(
+    side,
+    bos_time,
+    bos_price,
+    broken_swing_price,
+    confirmation_time,
+    current_candle_time,
+    entry_price,
+    tp1,
+    symbol,
+):
+    side = str(side or "").upper()
+    normalized_symbol = normalize_symbol(symbol)
+    pip_size = get_strategy_pip_size(normalized_symbol)
+    max_distance_pips = 8 if normalized_symbol == "EURUSD" else 120
+    setup_age_candles = get_five_minute_candle_age(bos_time, current_candle_time)
+    confirmation_age_candles = get_five_minute_candle_age(
+        confirmation_time,
+        current_candle_time,
+    )
+    score = 100
+    reasons = []
+    hard_expired = False
+
+    try:
+        entry_value = float(entry_price)
+        broken_swing_value = float(broken_swing_price)
+        distance_from_bos_pips = abs(entry_value - broken_swing_value) / pip_size
+    except (TypeError, ValueError):
+        entry_value = None
+        broken_swing_value = None
+        distance_from_bos_pips = None
+        score -= 30
+        reasons.append("broken swing or entry price unavailable")
+
+    tp1_progress = None
+
+    try:
+        tp1_value = float(tp1)
+        if entry_value is not None and broken_swing_value is not None:
+            total_to_tp1 = abs(tp1_value - broken_swing_value)
+            moved = abs(entry_value - broken_swing_value)
+            tp1_progress = moved / total_to_tp1 if total_to_tp1 > 0 else 1
+    except (TypeError, ValueError):
+        tp1_progress = None
+
+    if side not in ["BUY", "SELL"]:
+        score -= 100
+        hard_expired = True
+        reasons.append("no actionable setup direction")
+
+    if setup_age_candles is None:
+        score -= 20
+        hard_expired = True
+        reasons.append("15m BOS/CHOCH time unavailable")
+    elif setup_age_candles > FIFTEEN_M_PENDING_MAX_5M_CANDLES:
+        score -= 45
+        hard_expired = True
+        reasons.append("15m close confirmation is stale")
+
+    if confirmation_age_candles is None:
+        score -= 20
+        hard_expired = True
+        reasons.append("5m confirmation time unavailable")
+    elif confirmation_age_candles > FINAL_SIGNAL_HOLD_MAX_SETUP_CANDLES:
+        score -= 45
+        hard_expired = True
+        reasons.append("more than 3 x 5m candles passed after confirmation")
+    elif confirmation_age_candles > 0:
+        score -= confirmation_age_candles * 10
+        reasons.append("5m confirmation is not the latest closed candle")
+
+    if distance_from_bos_pips is not None and distance_from_bos_pips > max_distance_pips:
+        score -= 35
+        hard_expired = True
+        reasons.append("price moved too far from broken swing")
+
+    if tp1_progress is not None and tp1_progress >= FINAL_SIGNAL_HOLD_MAX_TP1_PROGRESS:
+        score -= 45
+        hard_expired = True
+        reasons.append("price already traveled more than 60% toward TP1")
+
+    score = max(0, min(100, int(round(score))))
+    fresh = score >= MIN_LIVE_FRESHNESS_SCORE and not hard_expired
+
+    return {
+        "fresh": fresh,
+        "expired": not fresh,
+        "setup_age_candles": setup_age_candles,
+        "confirmation_age_candles": confirmation_age_candles,
+        "distance_from_bos_pips": (
+            round(distance_from_bos_pips, 1)
+            if distance_from_bos_pips is not None
+            else None
+        ),
+        "freshness_score": score,
+        "freshness_reason": (
+            "Fresh BOS/CHOCH and current 5m confirmation"
+            if fresh and not reasons
+            else f"Freshness score ok: {'; '.join(reasons)}"
+            if fresh
+            else "; ".join(reasons) or "Setup expired / entry too late"
+        ),
+        "tp1_progress": round(tp1_progress, 3) if tp1_progress is not None else None,
+        "max_confirmation_age_candles": FINAL_SIGNAL_HOLD_MAX_SETUP_CANDLES,
+        "max_tp1_progress": FINAL_SIGNAL_HOLD_MAX_TP1_PROGRESS,
+    }
+
 def evaluate_setup_hold_expiration(held, current_candle_time, current_price):
     candle_age = get_final_signal_hold_candle_age(
         held.get("five_m_candle_time"),
@@ -2247,7 +2370,7 @@ def evaluate_setup_hold_expiration(held, current_candle_time, current_price):
     ):
         return {
             "expired": True,
-            "reason": "price reached 75% of TP1 without entry",
+            "reason": "price reached 60% of TP1 without entry",
             "candle_age": candle_age,
             "tp1_progress": tp1_progress,
         }
@@ -5535,6 +5658,10 @@ def evaluate_closed_15m_swing_break(closed_data_15m, side, symbol=None):
             FIFTEEN_M_SWING_WATCH[key] = {
                 **watched,
                 "break_confirmed": True,
+                "bos_time": candle_time,
+                "bos_price": close_price,
+                "broken_swing_price": swing_level,
+                "setup_direction": side,
                 "break_candle_time": candle_time,
                 "break_close": close_price,
                 "status": "PENDING",
@@ -5611,7 +5738,7 @@ def get_pending_15m_swing_setup(symbol, closed_data_5m):
             state_changed = True
             continue
 
-        # A pending setup must be evaluated while its six-candle window is
+        # A pending setup must be evaluated while its three-candle window is
         # active. Never resurrect an old breakout by scanning historical 5m
         # candles after that window has already passed.
         if len(following) > FIFTEEN_M_PENDING_MAX_5M_CANDLES:
@@ -5620,7 +5747,7 @@ def get_pending_15m_swing_setup(symbol, closed_data_5m):
                 FIFTEEN_M_PENDING_MAX_5M_CANDLES
             ][0].isoformat()
             watched["expiration_reason"] = (
-                "No 5m confirmation within six candles"
+                "No 5m confirmation within three candles"
             )
             state_changed = True
             continue
@@ -6087,7 +6214,7 @@ def evaluate_5m_late_entry_guard(data_5m, result, side, setup_level, five_m_entr
     pip_size = 0.0001 if normalized_symbol == "EURUSD" else 0.1
     max_setup_distance = 8 if normalized_symbol == "EURUSD" else 120
     min_rr = 1.0
-    max_moved_to_tp1 = 0.75
+    max_moved_to_tp1 = FINAL_SIGNAL_HOLD_MAX_TP1_PROGRESS
     small_body_ratio = 0.35
 
     debug = {
@@ -7044,6 +7171,10 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
                 "symbol": normalize_symbol(symbol),
                 "side": detected_15m_setup,
                 "swing_level": fallback_break.get("swing_level"),
+                "bos_time": fallback_break.get("closed_candle_time"),
+                "bos_price": fallback_break.get("closed_candle_close"),
+                "broken_swing_price": fallback_break.get("swing_level"),
+                "setup_direction": detected_15m_setup,
                 "break_candle_time": fallback_break.get(
                     "closed_candle_time"
                 ),
@@ -7360,6 +7491,63 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             )
             result["entry_timing"] = "WAIT VALID SWING SL"
             result["swing_sl_debug"] = risk_levels
+            return False
+
+        current_closed_5m_time = five_m_entry.get("closed_candle_time")
+
+        try:
+            if closed_data_5m is not None and not closed_data_5m.empty:
+                current_closed_5m_time = pd.Timestamp(
+                    closed_data_5m.index[-1]
+                ).isoformat()
+        except Exception:
+            pass
+
+        freshness_debug = evaluate_entry_freshness(
+            fifteen_m_setup,
+            (pending_15m_setup or {}).get("bos_time")
+            or fifteen_m_swing_break.get("closed_candle_time"),
+            (pending_15m_setup or {}).get("bos_price")
+            or fifteen_m_swing_break.get("closed_candle_close"),
+            (pending_15m_setup or {}).get("broken_swing_price")
+            or fifteen_m_swing_break.get("swing_level")
+            or fifteen_m_entry_level,
+            five_m_entry.get("closed_candle_time"),
+            current_closed_5m_time,
+            risk_levels.get("entry"),
+            risk_levels.get("tp1"),
+            symbol,
+        )
+        result.update({
+            "setup_age_candles": freshness_debug.get("setup_age_candles"),
+            "confirmation_age_candles": freshness_debug.get("confirmation_age_candles"),
+            "distance_from_bos_pips": freshness_debug.get("distance_from_bos_pips"),
+            "freshness_score": freshness_debug.get("freshness_score"),
+            "freshness_reason": freshness_debug.get("freshness_reason"),
+            "setup_freshness_debug": freshness_debug,
+        })
+
+        if freshness_debug.get("freshness_score", 0) < MIN_LIVE_FRESHNESS_SCORE:
+            reason = "Setup expired / entry too late. Waiting for new BOS/CHOCH."
+            clear_trade_plan(result, reason)
+            mark_signal_blocker(
+                result,
+                "setup_expired_entry_too_late",
+                reason,
+                "setup_freshness_score_required",
+                fifteen_m_setup,
+            )
+            result["setup_freshness"] = "EXPIRED"
+            result["setup_freshness_reason"] = reason
+            result["entry_timing"] = "WAIT NEW BOS/CHOCH"
+            result.update({
+                "setup_age_candles": freshness_debug.get("setup_age_candles"),
+                "confirmation_age_candles": freshness_debug.get("confirmation_age_candles"),
+                "distance_from_bos_pips": freshness_debug.get("distance_from_bos_pips"),
+                "freshness_score": freshness_debug.get("freshness_score"),
+                "freshness_reason": freshness_debug.get("freshness_reason"),
+                "setup_freshness_debug": freshness_debug,
+            })
             return False
 
         result["signal"] = fifteen_m_setup
@@ -8250,6 +8438,11 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             or "None"
         ),
         "setup_freshness": result.get("setup_freshness"),
+        "setup_age_candles": result.get("setup_age_candles"),
+        "confirmation_age_candles": result.get("confirmation_age_candles"),
+        "distance_from_bos_pips": result.get("distance_from_bos_pips"),
+        "freshness_score": result.get("freshness_score"),
+        "freshness_reason": result.get("freshness_reason"),
         "pending_5m_candles_remaining": (
             (pending_15m_setup or {}).get("candles_remaining")
         ),

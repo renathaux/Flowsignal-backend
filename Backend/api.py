@@ -2741,7 +2741,10 @@ def log_trade_visual_levels(trade):
     })
 
 def protect_live_trade_after_tp1(trade):
-    if not isinstance(trade, dict) or trade.get("hit_tp1"):
+    if not isinstance(trade, dict):
+        return trade
+
+    if trade.get("hit_tp1") and live_sl_protection_confirmed(trade):
         return trade
 
     try:
@@ -2928,6 +2931,9 @@ def update_live_trade_tp_protection(trade):
             "close_result": close_result,
         })
         return trade
+
+    if hit_tp1_before and not live_sl_protection_confirmed(trade):
+        trade = protect_live_trade_after_tp1(trade)
 
     if hit_tp1_before or tp1 is None or tp2 is None:
         print("LIVE_TP1_PROTECTION_DEBUG", {
