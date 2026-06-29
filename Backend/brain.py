@@ -5156,17 +5156,23 @@ def calculate_protected_sl_from_tp2_price(entry, tp2, side):
     return entry_value - ((entry_value - tp2_value) * 0.50)
 
 def get_strategy_pip_size(symbol):
-    return 0.0001 if normalize_symbol(symbol) == "EURUSD" else 0.1
+    return 0.0001 if normalize_symbol(symbol) == "EURUSD" else 0.01
 
 def get_strategy_decimals(symbol):
     return 5 if normalize_symbol(symbol) == "EURUSD" else 2
 
-def build_15m_swing_risk_levels(closed_data_15m, entry, side, symbol):
+def build_15m_swing_risk_levels(
+    closed_data_15m,
+    entry,
+    side,
+    symbol,
+    setup_candle_time=None,
+):
     side = str(side or "").upper()
     normalized_symbol = normalize_symbol(symbol)
     decimals = get_strategy_decimals(normalized_symbol)
     pip_size = get_strategy_pip_size(normalized_symbol)
-    buffer_pips = 1.5 if normalized_symbol == "EURUSD" else 30
+    buffer_pips = 5
     buffer = pip_size * buffer_pips
     max_swing_age_candles = 20
     broker_min_distance = 0.0008 if normalized_symbol == "EURUSD" else 1.5
@@ -5185,6 +5191,10 @@ def build_15m_swing_risk_levels(closed_data_15m, entry, side, symbol):
         "swing_high": None,
         "sl_buffer": round(buffer, decimals),
         "sl_buffer_pips": buffer_pips,
+        "sl_source_swing": None,
+        "sl_before_broker_adjustment": None,
+        "final_sl": None,
+        "sl_reason": None,
         "minimum_risk_pips": None,
         "selected_swing_sl": None,
         "selected_swing_time": None,
@@ -5195,7 +5205,6 @@ def build_15m_swing_risk_levels(closed_data_15m, entry, side, symbol):
         "broker_min_distance": broker_min_distance,
         "rejected_swing_candidates": [],
         "final_entry": None,
-        "final_sl": None,
         "final_tp1": None,
         "final_tp2": None,
     }
@@ -5205,7 +5214,35 @@ def build_15m_swing_risk_levels(closed_data_15m, entry, side, symbol):
 
     try:
         entry_price = float(entry)
-        swing_source = closed_data_15m.iloc[:-1].copy() if len(closed_data_15m) > 1 else closed_data_15m.copy()
+        structure_data = closed_data_15m.copy()
+
+        if setup_candle_time:
+            try:
+                setup_ts = pd.Timestamp(setup_candle_time)
+                if setup_ts.tzinfo is None:
+                    setup_ts = setup_ts.tz_localize("UTC")
+                else:
+                    setup_ts = setup_ts.tz_convert("UTC")
+
+                capped_rows = []
+                for candle_time, candle in structure_data.iterrows():
+                    candle_ts = pd.Timestamp(candle_time)
+                    if candle_ts.tzinfo is None:
+                        candle_ts = candle_ts.tz_localize("UTC")
+                    else:
+                        candle_ts = candle_ts.tz_convert("UTC")
+                    if candle_ts <= setup_ts:
+                        capped_rows.append((candle_time, candle))
+
+                if capped_rows:
+                    structure_data = pd.DataFrame(
+                        [row for _, row in capped_rows],
+                        index=[time for time, _ in capped_rows],
+                    )
+            except Exception:
+                structure_data = closed_data_15m.copy()
+
+        swing_source = structure_data.iloc[:-1].copy() if len(structure_data) > 1 else structure_data.copy()
         (
             swing_high,
             swing_low,
@@ -5353,6 +5390,7 @@ def build_15m_swing_risk_levels(closed_data_15m, entry, side, symbol):
                 swing_low = selected["price"]
                 stop_loss = swing_low - buffer
                 debug["sl_source"] = selected["source"]
+                debug["sl_reason"] = "BUY SL = last valid structure swing low - 5 pips"
             else:
                 mark_wait("WAIT_VALID_SWING_SL")
                 return debug
@@ -5394,6 +5432,7 @@ def build_15m_swing_risk_levels(closed_data_15m, entry, side, symbol):
                 swing_high = selected["price"]
                 stop_loss = swing_high + buffer
                 debug["sl_source"] = selected["source"]
+                debug["sl_reason"] = "SELL SL = last valid structure swing high + 5 pips"
             else:
                 mark_wait("WAIT_VALID_SWING_SL")
                 return debug
@@ -5431,16 +5470,23 @@ def build_15m_swing_risk_levels(closed_data_15m, entry, side, symbol):
                 swing_low if side == "BUY" else swing_high,
                 decimals,
             ),
+            "sl_source_swing": round(
+                swing_low if side == "BUY" else swing_high,
+                decimals,
+            ),
             "selected_swing_time": selected.get("time") if selected else None,
             "selected_swing_age_candles": selected.get("age_candles") if selected else None,
             "sl_source": debug.get("sl_source"),
             "sl_buffer": round(buffer, decimals),
+            "sl_buffer_pips": buffer_pips,
+            "sl_before_broker_adjustment": round(stop_loss, decimals),
+            "final_sl": round(stop_loss, decimals),
+            "sl_reason": debug.get("sl_reason"),
             "sl_distance": round(abs(stop_loss - entry_price), decimals),
             "sl_distance_pips": round(abs(stop_loss - entry_price) / pip_size, 2),
             "broker_min_distance": broker_min_distance,
             "rejected_swing_candidates": rejected_candidates,
             "final_entry": round(entry_price, decimals),
-            "final_sl": round(stop_loss, decimals),
             "final_tp1": round(tp1, decimals),
             "final_tp2": round(tp2, decimals),
         }
@@ -7476,6 +7522,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             or fifteen_m_swing_break.get("closed_candle_close"),
             fifteen_m_setup,
             symbol,
+            setup_candle_time=fifteen_m_swing_break.get("closed_candle_time"),
         )
         print("SWING_SL_RR_DEBUG =", risk_levels)
 
@@ -7675,6 +7722,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             momentum_entry,
             momentum_side,
             symbol,
+            setup_candle_time=fifteen_m_swing_break.get("closed_candle_time"),
         )
 
         if not risk_levels.get("ok"):
@@ -7768,6 +7816,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             momentum_entry,
             fifteen_m_setup,
             symbol,
+            setup_candle_time=fifteen_m_swing_break.get("closed_candle_time"),
         )
         print("DIRECT_15M_MOMENTUM_RISK_DEBUG =", {
             "symbol": symbol,
