@@ -63,6 +63,7 @@ SIMPLE_MOMENTUM_MIN_GAP = 10
 # erase the trade. The 5m confirmation can still improve the entry, but
 # it is not allowed to turn a completed 15m BUY/SELL back into WAIT.
 SIMPLE_MOMENTUM_DIRECT_15M_ENTRY = False
+SCORE_PERSISTENCE_MEMORY = {}
 
 def load_saved_market_data_source():
     if not os.path.exists(MARKET_DATA_SOURCE_FILE):
@@ -6762,6 +6763,205 @@ def _closed_frame_score_context(data, symbol):
 
     return context
 
+def get_score_side(buy_score, sell_score, neutral_gap=5):
+    try:
+        buy_value = float(buy_score)
+        sell_value = float(sell_score)
+    except (TypeError, ValueError):
+        return "NEUTRAL"
+
+    if buy_value - sell_value > neutral_gap:
+        return "BUY"
+    if sell_value - buy_value > neutral_gap:
+        return "SELL"
+
+    return "NEUTRAL"
+
+def clamp_score_delta(previous, target, max_delta):
+    try:
+        previous_value = float(previous)
+        target_value = float(target)
+    except (TypeError, ValueError):
+        return target
+
+    delta = target_value - previous_value
+
+    if abs(delta) <= max_delta:
+        return target_value
+
+    return previous_value + (max_delta if delta > 0 else -max_delta)
+
+def describe_largest_score_factors(components, weights):
+    factors = []
+
+    for name, value in dict(components or {}).items():
+        try:
+            weighted_buy_edge = (float(value) - 50.0) * float(weights.get(name, 0))
+        except (TypeError, ValueError):
+            continue
+        factors.append({
+            "factor": name,
+            "buy_edge": round(weighted_buy_edge, 2),
+        })
+
+    positive = [factor for factor in factors if factor["buy_edge"] > 0]
+    negative = [factor for factor in factors if factor["buy_edge"] < 0]
+    largest_positive = (
+        max(positive, key=lambda item: item["buy_edge"])
+        if positive
+        else None
+    )
+    largest_negative = (
+        min(negative, key=lambda item: item["buy_edge"])
+        if negative
+        else None
+    )
+
+    return largest_positive, largest_negative
+
+def apply_score_persistence(
+    result,
+    symbol,
+    target_buy_score,
+    target_sell_score,
+    components,
+    weights,
+    structure_debug,
+):
+    memory_key = normalize_symbol(symbol)
+    previous_memory = SCORE_PERSISTENCE_MEMORY.get(memory_key)
+
+    def numeric_score(value, fallback):
+        try:
+            return max(0.0, min(100.0, float(value)))
+        except (TypeError, ValueError):
+            return fallback
+
+    previous_buy = numeric_score(
+        (previous_memory or {}).get("buy_score"),
+        numeric_score(result.get("buy_pct"), target_buy_score),
+    )
+    previous_sell = numeric_score(
+        (previous_memory or {}).get("sell_score"),
+        numeric_score(result.get("sell_pct"), target_sell_score),
+    )
+    target_buy = numeric_score(target_buy_score, previous_buy)
+    target_sell = numeric_score(target_sell_score, previous_sell)
+    previous_side = get_score_side(previous_buy, previous_sell)
+    target_side = get_score_side(target_buy, target_sell)
+    structure_debug = structure_debug or {}
+    allowed_flip_reasons = []
+
+    for key, label in [
+        ("opposite_bos", "opposite BOS"),
+        ("opposite_choch", "opposite CHOCH"),
+        ("major_liquidity_grab", "major liquidity grab"),
+        ("structure_invalidation", "structure invalidation"),
+    ]:
+        if structure_debug.get(key):
+            allowed_flip_reasons.append(label)
+
+    if (
+        previous_side == "BUY"
+        and structure_debug.get("bearish_displacement")
+        and structure_debug.get("displacement_score", 0) >= 4
+    ) or (
+        previous_side == "SELL"
+        and structure_debug.get("bullish_displacement")
+        and structure_debug.get("displacement_score", 0) >= 4
+    ):
+        allowed_flip_reasons.append("strong displacement against current trend")
+
+    if (
+        previous_side == "BUY"
+        and structure_debug.get("bearish_15m_structure")
+    ) or (
+        previous_side == "SELL"
+        and structure_debug.get("bullish_15m_structure")
+    ):
+        allowed_flip_reasons.append("structure invalidation")
+
+    hard_bias_change = bool(allowed_flip_reasons)
+    bias_would_flip = (
+        previous_side in ["BUY", "SELL"]
+        and target_side in ["BUY", "SELL"]
+        and previous_side != target_side
+    )
+    smoothing = 1.0 if hard_bias_change else 0.08 if bias_would_flip else 0.35
+    max_delta = 100 if hard_bias_change else 12
+    smoothed_buy = previous_buy + ((target_buy - previous_buy) * smoothing)
+    smoothed_sell = 100.0 - smoothed_buy
+    capped_buy = clamp_score_delta(previous_buy, smoothed_buy, max_delta)
+    capped_sell = 100.0 - capped_buy
+    prevented_flip = False
+
+    if bias_would_flip and not hard_bias_change:
+        prevented_flip = True
+        if previous_side == "BUY":
+            capped_buy = max(capped_buy, 55.0)
+            capped_sell = 100.0 - capped_buy
+        elif previous_side == "SELL":
+            capped_sell = max(capped_sell, 55.0)
+            capped_buy = 100.0 - capped_sell
+
+    final_buy = max(0, min(100, int(round(capped_buy))))
+    final_sell = 100 - final_buy
+    final_side = get_score_side(final_buy, final_sell)
+    largest_positive, largest_negative = describe_largest_score_factors(
+        components,
+        weights,
+    )
+    bias_changed = (
+        previous_side in ["BUY", "SELL"]
+        and final_side in ["BUY", "SELL"]
+        and previous_side != final_side
+    )
+    reason_for_bias_change = None
+
+    if bias_changed:
+        reason_for_bias_change = (
+            "; ".join(allowed_flip_reasons)
+            if allowed_flip_reasons
+            else "Bias changed after score smoothing"
+        )
+    elif prevented_flip:
+        reason_for_bias_change = (
+            "Flip blocked: no opposite BOS/CHOCH, liquidity grab, "
+            "structure invalidation, or strong opposing displacement"
+        )
+    else:
+        reason_for_bias_change = "Bias persisted; no confirmed structure reversal"
+
+    debug = {
+        "buy_score_before": int(round(previous_buy)),
+        "sell_score_before": int(round(previous_sell)),
+        "target_buy_score": int(round(target_buy)),
+        "target_sell_score": int(round(target_sell)),
+        "buy_score_after": final_buy,
+        "sell_score_after": final_sell,
+        "score_delta": {
+            "buy": final_buy - int(round(previous_buy)),
+            "sell": final_sell - int(round(previous_sell)),
+        },
+        "largest_positive_factor": largest_positive,
+        "largest_negative_factor": largest_negative,
+        "bias_changed": bias_changed,
+        "bias_would_flip": bias_would_flip,
+        "flip_prevented": prevented_flip,
+        "reason_for_bias_change": reason_for_bias_change,
+        "smoothing": smoothing,
+        "max_delta": max_delta,
+        "structure_change_reasons": allowed_flip_reasons,
+    }
+    SCORE_PERSISTENCE_MEMORY[memory_key] = {
+        "buy_score": final_buy,
+        "sell_score": final_sell,
+        "side": final_side,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    return final_buy, final_sell, debug
+
 def apply_weighted_timeframe_scores(
     result,
     one_h,
@@ -6772,10 +6972,10 @@ def apply_weighted_timeframe_scores(
     symbol,
 ):
     weights = {
-        "one_h_bias": 0.20,
+        "one_h_bias": 0.22,
         "fifteen_m_structure": 0.65,
-        "five_m_confirmation": 0.10,
-        "momentum_displacement": 0.05,
+        "five_m_confirmation": 0.03,
+        "momentum_displacement": 0.10,
     }
     one_h_context = _closed_frame_score_context(closed_data_1h, symbol)
     fifteen_m_context = _closed_frame_score_context(closed_data_15m, symbol)
@@ -6832,6 +7032,9 @@ def apply_weighted_timeframe_scores(
 
     bullish_choch = "CHOCH BUY" in str(result.get("structure_type") or "").upper()
     bearish_choch = "CHOCH SELL" in str(result.get("structure_type") or "").upper()
+    bullish_bos = "BOS BUY" in str(result.get("structure_type") or "").upper()
+    bearish_bos = "BOS SELL" in str(result.get("structure_type") or "").upper()
+    score_debug = result.get("score_contribution_debug") or {}
     bullish_15m_reversal = (
         fifteen_m_direction == "BULLISH"
         or bullish_choch
@@ -6977,8 +7180,51 @@ def apply_weighted_timeframe_scores(
             list(result.get("debug_reasons") or []) + [confidence_cap_reason]
         )[-14:]
 
-    result["buy_pct"] = max(0, min(100, int(round(buy_score))))
-    result["sell_pct"] = max(0, min(100, int(round(sell_score))))
+    structure_debug = {
+        "opposite_bos": bullish_bos or bearish_bos,
+        "opposite_choch": bullish_choch or bearish_choch,
+        "major_liquidity_grab": bool(
+            score_debug.get("bullish_sweep")
+            or score_debug.get("bearish_sweep")
+            or result.get("liquidity_sweep")
+        ),
+        "structure_invalidation": bool(
+            result.get("structure_invalidated")
+            or result.get("pullback_block_active")
+        ),
+        "bullish_displacement": bullish_impulse,
+        "bearish_displacement": bearish_impulse,
+        "bullish_15m_structure": fifteen_m_direction == "BULLISH",
+        "bearish_15m_structure": fifteen_m_direction == "BEARISH",
+        "displacement_score": max(
+            float(one_h_context.get("displacement_score") or 0),
+            float(fifteen_m_context.get("displacement_score") or 0),
+        ),
+    }
+    buy_score, sell_score, score_persistence_debug = apply_score_persistence(
+        result,
+        symbol,
+        buy_score,
+        sell_score,
+        components,
+        weights,
+        structure_debug,
+    )
+
+    result["buy_pct"] = buy_score
+    result["sell_pct"] = sell_score
+    result["score_persistence_debug"] = score_persistence_debug
+    result.update({
+        "buy_score_before": score_persistence_debug["buy_score_before"],
+        "sell_score_before": score_persistence_debug["sell_score_before"],
+        "buy_score_after": score_persistence_debug["buy_score_after"],
+        "sell_score_after": score_persistence_debug["sell_score_after"],
+        "score_delta": score_persistence_debug["score_delta"],
+        "largest_positive_factor": score_persistence_debug["largest_positive_factor"],
+        "largest_negative_factor": score_persistence_debug["largest_negative_factor"],
+        "bias_changed": score_persistence_debug["bias_changed"],
+        "reason_for_bias_change": score_persistence_debug["reason_for_bias_change"],
+    })
     result["score_cap_reason"] = score_reason
     result["score_weight_debug"] = {
         "weights": weights,
@@ -6991,6 +7237,8 @@ def apply_weighted_timeframe_scores(
         "components": components,
         "raw_buy_score": round(raw_buy_score, 2),
         "raw_sell_score": round(raw_sell_score, 2),
+        "target_buy_score_after_caps": score_persistence_debug["target_buy_score"],
+        "target_sell_score_after_caps": score_persistence_debug["target_sell_score"],
         "final_buy_score": result["buy_pct"],
         "final_sell_score": result["sell_pct"],
     }
