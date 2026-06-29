@@ -579,7 +579,7 @@ def get_latest_consumed_signal_setup(symbol):
             continue
         if normalize_symbol(trade.get("symbol")) != normalized_symbol:
             continue
-        if get_live_trade_status(trade) in ["RUNNING", "OPEN", "TP1 HIT"]:
+        if get_live_trade_status(trade) in ["RUNNING", "OPEN", "TP1 HIT", "CLOSING", "TP2 HIT"]:
             continue
 
         setup_id = trade.get("signal_setup_id")
@@ -667,7 +667,7 @@ def apply_trade_signal_lifecycle(panel_data):
                 or ""
             ).upper()
 
-            if trade_status in ["RUNNING", "OPEN", "TP1 HIT"]:
+            if trade_status in ["RUNNING", "OPEN", "TP1 HIT", "CLOSING", "TP2 HIT"]:
                 if not active_trade.get("signal_setup_id") and current_setup_id:
                     active_trade["signal_setup_id"] = current_setup_id
 
@@ -2011,7 +2011,7 @@ def is_usable_local_live_history_trade(trade):
 
     status = get_live_trade_status(trade)
 
-    if status in ["RUNNING", "OPEN", "WAIT", "BLOCKED", "REJECTED", "NO_SIGNAL"]:
+    if status in ["RUNNING", "OPEN", "CLOSING", "WAIT", "BLOCKED", "REJECTED", "NO_SIGNAL"]:
         return False
 
     broker_pl, broker_pl_source = extract_broker_realized_pl(trade)
@@ -2132,7 +2132,7 @@ def run_weekly_live_reset(force=False):
         ).upper()
         match_key = str(get_live_trade_match_key(trade))
 
-        if match_key in active_ids or status in ["RUNNING", "OPEN", "TP1 HIT"]:
+        if match_key in active_ids or status in ["RUNNING", "OPEN", "TP1 HIT", "CLOSING", "TP2 HIT"]:
             kept_history.append(trade)
             continue
 
@@ -2894,6 +2894,9 @@ def update_live_trade_tp_protection(trade):
         )
     )
 
+    if tp2_hit_detected:
+        trade["tp2_hit"] = True
+
     if tp2_hit_detected and not trade.get("tp2_close_requested"):
         position_id = (
             trade.get("position_id")
@@ -2913,6 +2916,7 @@ def update_live_trade_tp_protection(trade):
             trade["result"] = "TP2 HIT"
             trade["exit_status"] = "CLOSING"
             trade["exit_reason"] = "TP2 hit; broker close requested"
+            trade["closed_reason"] = "TP2 hit"
         else:
             trade["tp2_close_failed"] = True
             trade["tp2_close_error"] = (
@@ -2929,6 +2933,21 @@ def update_live_trade_tp_protection(trade):
             "current_high": current_high,
             "current_low": current_low,
             "close_result": close_result,
+        })
+        return trade
+
+    if trade.get("tp2_close_requested"):
+        trade["status"] = "CLOSING"
+        trade["result"] = "TP2 HIT"
+        trade["exit_status"] = "CLOSING"
+        trade["exit_reason"] = trade.get("exit_reason") or "TP2 hit; waiting for broker close confirmation"
+        print("LIVE_TP2_CLOSE_PENDING_DEBUG =", {
+            "symbol": normalize_symbol(trade.get("symbol")),
+            "side": side,
+            "position_id": trade.get("position_id") or trade.get("broker_position_id"),
+            "tp2": tp2,
+            "current_high": current_high,
+            "current_low": current_low,
         })
         return trade
 
@@ -3013,7 +3032,7 @@ def calculate_live_trade_stats():
     for trade in today_history:
         status = get_live_trade_status(trade)
 
-        if status in ["RUNNING", "OPEN"]:
+        if status in ["RUNNING", "OPEN", "CLOSING", "TP2 HIT"]:
             continue
 
         closed += 1
@@ -3032,7 +3051,7 @@ def calculate_live_trade_stats():
     running = sum(
         1
         for trade in LIVE_ACTIVE_ORDERS.values()
-        if trade and get_live_trade_status(trade) in ["RUNNING", "OPEN"]
+        if trade and get_live_trade_status(trade) in ["RUNNING", "OPEN", "TP1 HIT", "CLOSING", "TP2 HIT"]
     )
 
     return {
@@ -3064,7 +3083,7 @@ def calculate_live_pl_sync():
         if (
             isinstance(trade, dict)
             and live_trade_has_broker_id(trade)
-            and get_live_trade_status(trade) in ["RUNNING", "OPEN", "TP1 HIT"]
+            and get_live_trade_status(trade) in ["RUNNING", "OPEN", "TP1 HIT", "CLOSING", "TP2 HIT"]
         )
     ]
     open_position_debug = []
@@ -3176,7 +3195,7 @@ def get_performance_data():
         if (
             isinstance(trade, dict)
             and get_live_trade_status(trade)
-            in ["RUNNING", "OPEN", "TP1 HIT"]
+            in ["RUNNING", "OPEN", "TP1 HIT", "CLOSING", "TP2 HIT"]
         )
     ]
     floating_pnl = sum(
@@ -3747,6 +3766,10 @@ def build_broker_closed_trade(trade, closed_at):
         pnl_source = "missing"
 
     realized_result = get_trade_result_from_pnl(pnl)
+    if trade.get("tp2_hit") or str(trade.get("result") or "").upper() == "TP2 HIT":
+        realized_result = "WIN"
+    elif trade.get("hit_tp1") or str(trade.get("result") or "").upper() == "TP1 HIT":
+        realized_result = "WIN" if pnl >= 0 else realized_result
 
     closed_trade = {
         **trade,
@@ -3760,6 +3783,11 @@ def build_broker_closed_trade(trade, closed_at):
         "broker_realized_source": pnl_source,
         "broker_pnl_source": pnl_source,
         "closed_at": closed_at,
+        "closed_reason": (
+            "TP2 hit"
+            if trade.get("tp2_hit") or str(trade.get("result") or "").upper() == "TP2 HIT"
+            else trade.get("closed_reason") or "Broker position closed"
+        ),
         "note": "Broker position no longer found in cTrader open positions."
     }
     ensure_live_trade_identity(closed_trade)
@@ -5504,7 +5532,7 @@ def sync_live_positions():
         return [
             trade
             for trade in LIVE_ACTIVE_ORDERS.values()
-            if trade and get_live_trade_status(trade) in ["RUNNING", "OPEN", "TP1 HIT"]
+            if trade and get_live_trade_status(trade) in ["RUNNING", "OPEN", "TP1 HIT", "CLOSING", "TP2 HIT"]
         ]
 
     if not LIVE_ACCOUNT_STATE.get("connected"):
@@ -5524,7 +5552,7 @@ def sync_live_positions():
             return [
                 trade
                 for trade in LIVE_ACTIVE_ORDERS.values()
-                if trade and get_live_trade_status(trade) in ["RUNNING", "OPEN", "TP1 HIT"]
+                if trade and get_live_trade_status(trade) in ["RUNNING", "OPEN", "TP1 HIT", "CLOSING", "TP2 HIT"]
             ]
         else:
             LIVE_POSITION_SYNC_STATUS["last_success"] = time.time()
@@ -5937,9 +5965,38 @@ def sync_live_positions():
                     "trade_id": get_live_trade_identity(current_order) or get_live_trade_identity(mirrored_order),
                     "opened_at": current_order.get("opened_at") or mirrored_order["opened_at"],
                     "result": (
+                        "TP2 HIT"
+                        if current_order.get("tp2_hit") or current_order.get("tp2_close_requested")
+                        else
                         current_order.get("result")
                         if current_order.get("hit_tp1")
                         else mirrored_order.get("result")
+                    ),
+                    "status": (
+                        "CLOSING"
+                        if current_order.get("tp2_hit") or current_order.get("tp2_close_requested")
+                        else mirrored_order.get("status")
+                    ),
+                    "tp2_hit": bool(
+                        current_order.get("tp2_hit")
+                        or mirrored_order.get("tp2_hit")
+                    ),
+                    "tp2_close_requested": bool(
+                        current_order.get("tp2_close_requested")
+                        or mirrored_order.get("tp2_close_requested")
+                    ),
+                    "tp2_close_result": (
+                        current_order.get("tp2_close_result")
+                        or mirrored_order.get("tp2_close_result")
+                    ),
+                    "exit_status": (
+                        "CLOSING"
+                        if current_order.get("tp2_hit") or current_order.get("tp2_close_requested")
+                        else current_order.get("exit_status") or mirrored_order.get("exit_status")
+                    ),
+                    "exit_reason": (
+                        current_order.get("exit_reason")
+                        or mirrored_order.get("exit_reason")
                     ),
                 })
                 ensure_live_trade_identity(rebuilt_active_orders[symbol], symbol)
@@ -6033,7 +6090,7 @@ def sync_live_positions():
                 or ""
             ).upper()
 
-            if result in ["RUNNING", "OPEN"] and not find_matching_broker_position(item, positions):
+            if result in ["RUNNING", "OPEN", "CLOSING", "TP2 HIT"] and not find_matching_broker_position(item, positions):
                 old_status = get_live_trade_status(item) or result
                 position_id = (
                     item.get("position_id")
@@ -6847,7 +6904,7 @@ def execute_live_order_core(payload: dict, source="manual"):
     active_order = LIVE_ACTIVE_ORDERS.get(symbol)
     active_status = get_live_trade_status(active_order)
 
-    if active_order and active_status in ["RUNNING", "OPEN"]:
+    if active_order and active_status in ["RUNNING", "OPEN", "TP1 HIT", "CLOSING", "TP2 HIT"]:
         active_side = str(
             active_order.get("side")
             or active_order.get("action")
@@ -7052,7 +7109,7 @@ def execute_live_order_core(payload: dict, source="manual"):
         active_order = LIVE_ACTIVE_ORDERS.get(symbol)
         active_status = get_live_trade_status(active_order)
 
-        if active_order and active_status in ["RUNNING", "OPEN"]:
+        if active_order and active_status in ["RUNNING", "OPEN", "TP1 HIT", "CLOSING", "TP2 HIT"]:
             active_side = str(
                 active_order.get("side")
                 or active_order.get("action")
