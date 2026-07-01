@@ -1,0 +1,38 @@
+{
+  "XAUUSD:BUY": {
+    "symbol": "XAUUSD",
+    "side": "BUY",
+    "swing_level": 4018.08,
+    "saved_at": "2026-07-01T00:00:28.676414+00:00",
+    "source_candle_time": "2026-06-30T23:45:00+00:00",
+    "break_confirmed": false,
+    "break_candle_time": null
+  },
+  "XAUUSD:SELL": {
+    "symbol": "XAUUSD",
+    "side": "SELL",
+    "swing_level": 3969.99,
+    "saved_at": "2026-07-01T03:00:27.242780+00:00",
+    "source_candle_time": "2026-07-01T02:45:00+00:00",
+    "break_confirmed": false,
+    "break_candle_time": null
+  },
+  "EURUSD:BUY": {
+    "symbol": "EURUSD",
+    "side": "BUY",
+    "swing_level": 1.14229,
+    "saved_at": "2026-06-30T23:00:04.418154+00:00",
+    "source_candle_time": "2026-06-30T22:45:00+00:00",
+    "break_confirmed": false,
+    "break_candle_time": null
+  },
+  "EURUSD:SELL": {
+    "symbol": "EURUSD",
+    "side": "SELL",
+    "swing_level": 1.14026,
+    "saved_at": "2026-07-01T02:45:36.008767+00:00",
+    "source_candle_time": "2026-07-01T02:30:00+00:00",
+    "break_confirmed": false,
+    "break_candle_time": null
+  }
+}

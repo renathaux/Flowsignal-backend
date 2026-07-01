@@ -1,0 +1,27 @@
+{
+  "active_account_id": "47644840",
+  "accounts": [
+    {
+      "account_id": "47644840",
+      "account_number": null,
+      "broker_name": "ftmo",
+      "balance": 107633.1,
+      "equity": null,
+      "currency": 15,
+      "mode": "live",
+      "status": "active",
+      "unavailable": false,
+      "expired": false,
+      "reason": null,
+      "money_digits": 2,
+      "raw": {
+        "brokerName": "ftmo",
+        "balance": 10763310,
+        "moneyDigits": 2,
+        "depositAssetId": 15
+      }
+    }
+  ],
+  "forgotten_account_ids": [],
+  "last_refresh": "2026-07-01T02:42:53.725863+00:00"
+}

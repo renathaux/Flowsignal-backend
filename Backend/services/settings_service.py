@@ -1,10 +1,10 @@
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from paths import DATA_DIR
 
-BASE_DIR = Path(__file__).resolve().parents[1]
-SETTINGS_PATH = BASE_DIR / "app_settings.json"
-FEATURE_FLAGS_PATH = BASE_DIR / "feature_flags.json"
+SETTINGS_PATH = DATA_DIR / "app_settings.json"
+FEATURE_FLAGS_PATH = DATA_DIR / "feature_flags.json"
 
 DEFAULT_RISK_SETTINGS = {
     "riskPerTradePct": 1.0,

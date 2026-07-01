@@ -1,8 +1,8 @@
 import json
 from pathlib import Path
+from paths import DATA_DIR
 
-BASE_DIR = Path(__file__).resolve().parents[1]
-TRADE_HISTORY_PATH = BASE_DIR / "trade_history_store.json"
+TRADE_HISTORY_PATH = DATA_DIR / "trade_history_store.json"
 
 
 def load_trade_history(path=TRADE_HISTORY_PATH):

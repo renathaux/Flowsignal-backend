@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from pathlib import Path
+from paths import CANDLE_CACHE_DIR, DATA_DIR
 
 try:
     from dotenv import load_dotenv
@@ -27,8 +28,8 @@ except ImportError:
         return False
 
 ENV_PATH = Path(__file__).resolve().parent / ".env"
-CTRADER_ACCOUNTS_PATH = Path(__file__).resolve().parent / "ctrader_accounts.json"
-CTRADER_CANDLE_CACHE_DIR = Path(__file__).resolve().parent / "candle_cache"
+CTRADER_ACCOUNTS_PATH = DATA_DIR / "ctrader_accounts.json"
+CTRADER_CANDLE_CACHE_DIR = CANDLE_CACHE_DIR
 load_dotenv(dotenv_path=ENV_PATH)
 
 def read_env_file_values():

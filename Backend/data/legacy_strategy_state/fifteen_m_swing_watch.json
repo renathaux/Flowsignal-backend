@@ -1,0 +1,51 @@
+{
+  "EURUSD:BUY": {
+    "symbol": "EURUSD",
+    "side": "BUY",
+    "swing_level": 1.14273,
+    "saved_at": "2026-06-30T21:01:08.033472+00:00",
+    "source_candle_time": "2026-06-30T20:45:00+00:00",
+    "break_confirmed": false,
+    "break_candle_time": null
+  },
+  "EURUSD:SELL": {
+    "symbol": "EURUSD",
+    "side": "SELL",
+    "swing_level": 1.14155,
+    "saved_at": "2026-06-30T20:30:19.009004+00:00",
+    "source_candle_time": "2026-06-30T20:15:00+00:00",
+    "break_confirmed": false,
+    "break_candle_time": null
+  },
+  "XAUUSD:BUY": {
+    "symbol": "XAUUSD",
+    "side": "BUY",
+    "swing_level": 4033.64,
+    "saved_at": "2026-06-30T20:28:57.419936+00:00",
+    "source_candle_time": "2026-06-30T20:00:00+00:00",
+    "break_confirmed": false,
+    "break_candle_time": null
+  },
+  "XAUUSD:SELL": {
+    "symbol": "XAUUSD",
+    "side": "SELL",
+    "swing_level": 4020.63,
+    "saved_at": "2026-06-30T20:28:58.443402+00:00",
+    "source_candle_time": "2026-06-30T20:00:00+00:00",
+    "break_confirmed": true,
+    "break_candle_time": "2026-06-30T20:00:00+00:00",
+    "bos_time": "2026-06-30T20:00:00+00:00",
+    "bos_price": 4019.79,
+    "broken_swing_price": 4020.63,
+    "setup_direction": "SELL",
+    "break_close": 4019.79,
+    "status": "CONFIRMED",
+    "expires_after_5m_candles": 3,
+    "expires_at": "2026-06-30T20:15:00+00:00",
+    "invalidated_at": null,
+    "confirmed_5m_time": "2026-06-30T20:15:00+00:00",
+    "expired_at": "2026-06-30T20:20:00+00:00",
+    "expiration_reason": "No 5m confirmation within three candles",
+    "confirmation_close": 4017.67
+  }
+}

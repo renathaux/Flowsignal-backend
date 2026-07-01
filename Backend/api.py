@@ -55,11 +55,12 @@ from routes.performance import (
 )
 from routes.settings import router as settings_router
 from routes.trading import router as trading_router
-from news_service import get_news_impact
+from services.news_service import get_news_impact
 from services.settings_service import load_feature_flags, load_risk_settings
+from paths import DATA_DIR
 
 FINAL_SIGNAL_HOLD_FILE = os.path.join(
-    os.path.dirname(__file__),
+    DATA_DIR,
     "final_signal_hold.json"
 )
 
@@ -220,7 +221,7 @@ LIVE_MONTHLY_HISTORY_CACHE = {
     "month_key": None,
 }
 LIVE_MONTHLY_HISTORY_FILE = os.path.join(
-    os.path.dirname(__file__),
+    DATA_DIR,
     "live_monthly_history.json",
 )
 
@@ -266,8 +267,8 @@ PANEL_REFRESH_STUCK_SECONDS = 45
 ADMIN_TOKEN = "N2415"
 FEEDBACK_EMAIL = "flowsignal.contact@gmail.com"
 FEEDBACK_APP_PASSWORD = "wwro vjjg grzt vpcp"
-USERS_FILE = "users.json"
-VISITS_FILE = "visits.json"
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+VISITS_FILE = os.path.join(DATA_DIR, "visits.json")
 SESSIONS = {}
 
 def load_users():
@@ -1521,7 +1522,7 @@ AUTO_TRADE_ENABLED = {
     "enabled": False
 }
 AUTO_TRADE_STATE_FILE = os.path.join(
-    os.path.dirname(__file__),
+    DATA_DIR,
     "auto_trade_state.json"
 )
 
@@ -1669,7 +1670,7 @@ LIVE_AUTO_STATUS_BY_SYMBOL = {
     },
 }
 LIVE_BACKUP_FILE = os.path.join(
-    os.path.dirname(__file__),
+    DATA_DIR,
     "live_backup.json"
 )
 
