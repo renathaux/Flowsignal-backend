@@ -20,6 +20,8 @@ DEFAULT_RISK_SETTINGS = {
 
 MIN_RISK_PER_TRADE_PCT = 0.05
 MAX_RISK_PER_TRADE_PCT = 1.0
+MIN_TP1_PERCENT_OF_TP2 = 1
+MAX_TP1_PERCENT_OF_TP2 = 100
 
 DEFAULT_FEATURE_FLAGS = {
     "brokerAccounts": True,
@@ -67,6 +69,27 @@ def load_risk_settings():
     }
 
 
+def get_tp1_percent_of_tp2():
+    try:
+        value = float(
+            load_risk_settings().get(
+                "tp1PercentOfTp2",
+                DEFAULT_RISK_SETTINGS["tp1PercentOfTp2"],
+            )
+        )
+    except (TypeError, ValueError):
+        return DEFAULT_RISK_SETTINGS["tp1PercentOfTp2"]
+
+    if not MIN_TP1_PERCENT_OF_TP2 <= value <= MAX_TP1_PERCENT_OF_TP2:
+        return DEFAULT_RISK_SETTINGS["tp1PercentOfTp2"]
+
+    return value
+
+
+def get_tp1_ratio_of_tp2():
+    return get_tp1_percent_of_tp2() / 100.0
+
+
 def save_risk_settings(payload):
     payload = dict(payload or {})
 
@@ -84,6 +107,21 @@ def save_risk_settings(payload):
             )
 
         payload["riskPerTradePct"] = risk_percent
+
+    if "tp1PercentOfTp2" in payload:
+        try:
+            tp1_percent = float(payload["tp1PercentOfTp2"])
+        except (TypeError, ValueError):
+            raise ValueError("TP1 percent of TP2 must be a number")
+
+        if not MIN_TP1_PERCENT_OF_TP2 <= tp1_percent <= MAX_TP1_PERCENT_OF_TP2:
+            raise ValueError(
+                f"TP1 percent of TP2 must be between "
+                f"{MIN_TP1_PERCENT_OF_TP2}% and "
+                f"{MAX_TP1_PERCENT_OF_TP2}%"
+            )
+
+        payload["tp1PercentOfTp2"] = tp1_percent
 
     current = _read_json(SETTINGS_PATH, {"risk": DEFAULT_RISK_SETTINGS})
     risk = {

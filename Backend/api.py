@@ -56,7 +56,11 @@ from routes.performance import (
 from routes.settings import router as settings_router
 from routes.trading import router as trading_router
 from services.news_service import get_news_impact
-from services.settings_service import load_feature_flags, load_risk_settings
+from services.settings_service import (
+    get_tp1_ratio_of_tp2,
+    load_feature_flags,
+    load_risk_settings,
+)
 from paths import DATA_DIR
 
 FINAL_SIGNAL_HOLD_FILE = os.path.join(
@@ -2695,11 +2699,12 @@ def get_trade_result_from_pnl(pnl):
 def calculate_tp1_from_tp2(entry, tp2, side):
     entry_value = float(entry)
     tp2_value = float(tp2)
+    tp1_ratio = get_tp1_ratio_of_tp2()
 
     if str(side or "").upper() == "BUY":
-        return entry_value + ((tp2_value - entry_value) * 0.80)
+        return entry_value + ((tp2_value - entry_value) * tp1_ratio)
 
-    return entry_value - ((entry_value - tp2_value) * 0.80)
+    return entry_value - ((entry_value - tp2_value) * tp1_ratio)
 
 def calculate_protected_sl_price(entry, tp2, side):
     entry_value = float(entry)

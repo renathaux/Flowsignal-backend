@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 from pathlib import Path
 from paths import CANDLE_CACHE_DIR, DATA_DIR
+from services.settings_service import get_tp1_ratio_of_tp2
 
 try:
     from dotenv import load_dotenv
@@ -1786,7 +1787,8 @@ def normalize_trade_levels(symbol, action, entry, sl, tp1, tp2):
             sl_value = round(entry_value + minimum_required_distance, precision)
 
     adjusted_sl_distance = abs(entry_value - sl_value)
-    minimum_tp2_distance = minimum_required_distance / 0.80
+    tp1_ratio = get_tp1_ratio_of_tp2()
+    minimum_tp2_distance = minimum_required_distance / tp1_ratio
     adjusted_tp2_distance = max(
         original_tp2_distance,
         minimum_tp2_distance,
@@ -1798,13 +1800,13 @@ def normalize_trade_levels(symbol, action, entry, sl, tp1, tp2):
     if normalized_action == "BUY":
         tp2_value = round(entry_value + adjusted_tp2_distance, precision)
         tp1_value = round(
-            entry_value + ((tp2_value - entry_value) * 0.80),
+            entry_value + ((tp2_value - entry_value) * tp1_ratio),
             precision,
         )
     else:
         tp2_value = round(entry_value - adjusted_tp2_distance, precision)
         tp1_value = round(
-            entry_value - ((entry_value - tp2_value) * 0.80),
+            entry_value - ((entry_value - tp2_value) * tp1_ratio),
             precision,
         )
 

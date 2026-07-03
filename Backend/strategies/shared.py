@@ -22,6 +22,7 @@ from ctrader_connector import (
     normalize_trade_levels
 )
 from paths import DATA_DIR
+from services.settings_service import get_tp1_ratio_of_tp2
 
 MARKET_DATA_SOURCES = ["ctrader"]
 MARKET_TIMEZONE = ZoneInfo("America/New_York")
@@ -3218,10 +3219,12 @@ def update_paper_trade(
             return round((entry - close_price) / pip_value, 1)
 
     def calculate_tp1(entry, tp2, side):
-        if side == "BUY":
-            return entry + ((tp2 - entry) * 0.80)
+        tp1_ratio = get_tp1_ratio_of_tp2()
 
-        return entry - ((entry - tp2) * 0.80)
+        if side == "BUY":
+            return entry + ((tp2 - entry) * tp1_ratio)
+
+        return entry - ((entry - tp2) * tp1_ratio)
 
     def calculate_protected_sl(entry, tp2, side):
         if side == "BUY":
@@ -4588,7 +4591,10 @@ def get_signal(data, htf_data, symbol, state_key=None):
         stop_loss = round(swing_low - buffer, decimals)
         risk = entry_price - stop_loss
         tp2 = round(entry_price + risk * 2.0, decimals)
-        tp1 = round(entry_price + ((tp2 - entry_price) * 0.80), decimals)
+        tp1 = round(
+            entry_price + ((tp2 - entry_price) * get_tp1_ratio_of_tp2()),
+            decimals,
+        )
         invalidation = "Exit if bearish CHOCH or break below SL"
         plan_reason = breakout_plan_reason or "BUY after 15m swing break and close confirmation"
 
@@ -4597,7 +4603,10 @@ def get_signal(data, htf_data, symbol, state_key=None):
         stop_loss = round(swing_high + buffer, decimals)
         risk = stop_loss - entry_price
         tp2 = round(entry_price - risk * 2.0, decimals)
-        tp1 = round(entry_price - ((entry_price - tp2) * 0.80), decimals)
+        tp1 = round(
+            entry_price - ((entry_price - tp2) * get_tp1_ratio_of_tp2()),
+            decimals,
+        )
         invalidation = "Exit if bullish CHOCH or break above SL"
         plan_reason = breakout_plan_reason or "SELL after 15m swing break and close confirmation"
 
@@ -5021,11 +5030,12 @@ def remove_current_forming_candle(data, timeframe_minutes):
 def calculate_tp1_from_tp2_price(entry, tp2, side):
     entry_value = float(entry)
     tp2_value = float(tp2)
+    tp1_ratio = get_tp1_ratio_of_tp2()
 
     if str(side or "").upper() == "BUY":
-        return entry_value + ((tp2_value - entry_value) * 0.80)
+        return entry_value + ((tp2_value - entry_value) * tp1_ratio)
 
-    return entry_value - ((entry_value - tp2_value) * 0.80)
+    return entry_value - ((entry_value - tp2_value) * tp1_ratio)
 
 def calculate_protected_sl_from_tp2_price(entry, tp2, side):
     entry_value = float(entry)
