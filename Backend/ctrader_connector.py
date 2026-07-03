@@ -185,6 +185,7 @@ PAYLOAD_GET_POSITION_UNREALIZED_PNL_RES = 2188
 
 DEFAULT_CTRADER_ACCOUNT_SETTINGS = {
     "active_account_id": None,
+    "active_account_env": None,
     "accounts": [],
     "forgotten_account_ids": [],
     "last_refresh": None,
@@ -405,6 +406,68 @@ def get_active_ctrader_account_id():
         or os.getenv("ACTIVE_CTRADER_ACCOUNT_ID")
     )
 
+def normalize_ctrader_env(value=None):
+    env = str(value or "").strip().lower()
+
+    if env in CTRADER_JSON_ENDPOINTS:
+        return env
+
+    fallback = str(os.getenv("CTRADER_ENV", "demo")).strip().lower()
+    return fallback if fallback in CTRADER_JSON_ENDPOINTS else "demo"
+
+def get_ctrader_env_for_account_item(account):
+    if not isinstance(account, dict):
+        return normalize_ctrader_env()
+
+    env = str(account.get("env") or account.get("mode") or "").strip().lower()
+
+    if env in CTRADER_JSON_ENDPOINTS:
+        return env
+
+    is_live = account.get("isLive")
+
+    if is_live is True:
+        return "live"
+
+    if is_live is False:
+        return "demo"
+
+    return normalize_ctrader_env()
+
+def get_saved_ctrader_account(account_id):
+    account_id_text = str(account_id or "").strip()
+
+    if not account_id_text:
+        return None
+
+    settings = load_ctrader_account_settings()
+
+    for account in settings.get("accounts", []):
+        if str(account.get("account_id")) == account_id_text:
+            return account
+
+    return None
+
+def get_active_ctrader_account_env():
+    settings = load_ctrader_account_settings()
+    active_account_id = (
+        settings.get("active_account_id")
+        or os.getenv("ACTIVE_CTRADER_ACCOUNT_ID")
+    )
+    active_env = settings.get("active_account_env")
+
+    if active_account_id:
+        for account in settings.get("accounts", []):
+            if str(account.get("account_id")) == str(active_account_id):
+                active_env = get_ctrader_env_for_account_item(account)
+                break
+
+    return normalize_ctrader_env(
+        active_env
+        or os.getenv("ACTIVE_CTRADER_ACCOUNT_ENV")
+        or os.getenv("CTRADER_ENV", "demo")
+    )
+
 def clear_ctrader_connection_cache():
     CTRADER_CONNECTION_CACHE["checked_at"] = 0
     CTRADER_CONNECTION_CACHE["state"] = None
@@ -560,15 +623,18 @@ def exchange_ctrader_authorization_code(code):
 def clear_ctrader_saved_accounts():
     settings = load_ctrader_account_settings()
     settings["active_account_id"] = None
+    settings["active_account_env"] = None
     settings["accounts"] = []
     settings["forgotten_account_ids"] = []
     settings["last_refresh"] = None
     save_ctrader_account_settings(settings)
 
     os.environ.pop("ACTIVE_CTRADER_ACCOUNT_ID", None)
+    os.environ.pop("ACTIVE_CTRADER_ACCOUNT_ENV", None)
     os.environ.pop("CTRADER_ACCOUNT_ID", None)
     update_env_file_values({
         "ACTIVE_CTRADER_ACCOUNT_ID": "",
+        "ACTIVE_CTRADER_ACCOUNT_ENV": "",
         "CTRADER_ACCOUNT_ID": "",
     })
     CONNECTED["account_id"] = None
@@ -591,7 +657,12 @@ def set_active_ctrader_account(account_id):
         }
 
     settings = load_ctrader_account_settings()
-    account_ids = {str(item.get("account_id")) for item in settings.get("accounts", []) if item.get("account_id")}
+    account_lookup = {
+        str(item.get("account_id")): item
+        for item in settings.get("accounts", [])
+        if item.get("account_id")
+    }
+    account_ids = set(account_lookup)
 
     if account_ids and account_id not in account_ids:
         return {
@@ -600,36 +671,48 @@ def set_active_ctrader_account(account_id):
             "account_id": account_id,
         }
 
-    auth_result = verify_ctrader_account_auth(account_id)
+    account = account_lookup.get(account_id) or {}
+    account_env = get_ctrader_env_for_account_item(account)
+    auth_result = verify_ctrader_account_auth(
+        account_id,
+        config={"env": account_env},
+    )
 
     if not auth_result.get("ok"):
         print("ACTIVE_ACCOUNT_SELECTED_DEBUG =", {
             "ok": False,
             "account_id": account_id,
+            "env": account_env,
             "reason": auth_result.get("reason"),
         })
         return auth_result
 
     settings["active_account_id"] = account_id
+    settings["active_account_env"] = account_env
     save_ctrader_account_settings(settings)
     os.environ["ACTIVE_CTRADER_ACCOUNT_ID"] = account_id
+    os.environ["ACTIVE_CTRADER_ACCOUNT_ENV"] = account_env
     os.environ["CTRADER_ACCOUNT_ID"] = account_id
     update_env_file_values({
         "ACTIVE_CTRADER_ACCOUNT_ID": account_id,
+        "ACTIVE_CTRADER_ACCOUNT_ENV": account_env,
         "CTRADER_ACCOUNT_ID": account_id,
     })
     CONNECTED["account_id"] = account_id
+    CONNECTED["mode"] = account_env
     CONNECTED["execution_ready"] = True
     clear_ctrader_connection_cache()
 
     print("ACTIVE_ACCOUNT_SELECTED_DEBUG =", {
         "ok": True,
         "account_id": account_id,
+        "env": account_env,
     })
 
     return {
         "ok": True,
         "account_id": account_id,
+        "env": account_env,
     }
 
 def forget_ctrader_account(account_id):
@@ -650,6 +733,7 @@ def forget_ctrader_account(account_id):
 
     if str(settings.get("active_account_id")) == account_id:
         settings["active_account_id"] = None
+        settings["active_account_env"] = None
 
     settings["accounts"] = accounts
     settings["forgotten_account_ids"] = sorted(forgotten)
@@ -666,6 +750,7 @@ def forget_ctrader_account(account_id):
 def clear_ctrader_tokens_and_accounts():
     settings = load_ctrader_account_settings()
     settings["active_account_id"] = None
+    settings["active_account_env"] = None
     settings["accounts"] = []
     settings["last_refresh"] = None
     save_ctrader_account_settings(settings)
@@ -674,6 +759,7 @@ def clear_ctrader_tokens_and_accounts():
         "CTRADER_ACCESS_TOKEN",
         "CTRADER_REFRESH_TOKEN",
         "ACTIVE_CTRADER_ACCOUNT_ID",
+        "ACTIVE_CTRADER_ACCOUNT_ENV",
         "CTRADER_ACCOUNT_ID",
     ]:
         os.environ.pop(key, None)
@@ -682,6 +768,7 @@ def clear_ctrader_tokens_and_accounts():
         "CTRADER_ACCESS_TOKEN": "",
         "CTRADER_REFRESH_TOKEN": "",
         "ACTIVE_CTRADER_ACCOUNT_ID": "",
+        "ACTIVE_CTRADER_ACCOUNT_ENV": "",
         "CTRADER_ACCOUNT_ID": "",
     })
     clear_ctrader_connection_cache()
@@ -1899,6 +1986,7 @@ def connect_account(account_id, mode="demo"):
             }
 
         config = get_ctrader_config()
+        selected_mode = config.get("env") if config else active_result.get("env", selected_mode)
 
     CONNECTED["connected"] = True
     CONNECTED["status"] = True
@@ -2431,6 +2519,9 @@ def place_market_order(
             **order_payload,
             "clientOrderId": "***",
         }
+        if normalized_symbol == "XAUUSD":
+            print("XAUUSD_CTRADER_EXACT_ORDER_PAYLOAD:")
+            print(json.dumps(order_payload, indent=2, default=str))
         print("CTRADER NEW ORDER REQUEST:", safe_payload)
         print("CTRADER NEW ORDER JSON:", json.dumps(safe_payload, default=str))
         print("CTRADER_ORDER_PAYLOAD_VOLUME_CHECK:", volume_check)
@@ -3280,13 +3371,14 @@ def fetch_ctrader_closed_deals(config, from_timestamp, to_timestamp, max_rows=10
 
 def get_ctrader_config():
     active_account_id = get_active_ctrader_account_id()
+    active_account_env = get_active_ctrader_account_env()
     config = {
         "client_id": os.getenv("CTRADER_CLIENT_ID"),
         "client_secret": os.getenv("CTRADER_CLIENT_SECRET"),
         "access_token": os.getenv("CTRADER_ACCESS_TOKEN"),
         "refresh_token": os.getenv("CTRADER_REFRESH_TOKEN"),
         "account_id": active_account_id,
-        "env": os.getenv("CTRADER_ENV", "demo").lower(),
+        "env": active_account_env,
     }
 
     missing = [
@@ -3303,7 +3395,7 @@ def get_ctrader_config():
         return None
 
     if config["env"] not in CTRADER_JSON_ENDPOINTS:
-        print("CTRADER CONFIG MISSING: CTRADER_ENV must be demo or live")
+        print("CTRADER CONFIG MISSING: active account env must be demo or live")
         return None
 
     return config
@@ -3674,7 +3766,8 @@ def verify_ctrader_account_auth(account_id, config=None):
     config.setdefault("client_secret", os.getenv("CTRADER_CLIENT_SECRET"))
     config.setdefault("access_token", os.getenv("CTRADER_ACCESS_TOKEN"))
     config.setdefault("refresh_token", os.getenv("CTRADER_REFRESH_TOKEN"))
-    config.setdefault("env", os.getenv("CTRADER_ENV", "demo").lower())
+    config.setdefault("env", get_active_ctrader_account_env())
+    config["env"] = normalize_ctrader_env(config.get("env"))
     config["account_id"] = account_id_text
 
     missing = [
@@ -3735,10 +3828,18 @@ def verify_ctrader_account_auth(account_id, config=None):
         except Exception:
             pass
 
-def extract_ctrader_account_display(account_id, response=None, error=None, env=None, active_account_id=None):
+def extract_ctrader_account_display(
+    account_id,
+    response=None,
+    error=None,
+    env=None,
+    active_account_id=None,
+    account_list_item=None,
+):
     payload = response.get("payload", {}) if isinstance(response, dict) else {}
     trader = payload.get("trader") if isinstance(payload.get("trader"), dict) else payload
     trader = trader if isinstance(trader, dict) else {}
+    account_list_item = account_list_item if isinstance(account_list_item, dict) else {}
     money_digits = trader.get("moneyDigits", payload.get("moneyDigits", 2))
     balance = parse_ctrader_money(
         trader.get("balance") or payload.get("balance"),
@@ -3750,19 +3851,42 @@ def extract_ctrader_account_display(account_id, response=None, error=None, env=N
     )
     account_id_text = str(account_id)
     unavailable = error is not None
+    trader_login = (
+        trader.get("traderLogin")
+        or trader.get("login")
+        or trader.get("accountId")
+        or account_list_item.get("traderLogin")
+    )
+    account_number = (
+        trader.get("accountNumber")
+        or trader.get("account_number")
+        or trader_login
+    )
+    is_live = trader.get("isLive")
+
+    if is_live is None:
+        is_live = account_list_item.get("isLive")
+
+    account_env = (
+        "live"
+        if is_live is True
+        else "demo"
+        if is_live is False
+        else normalize_ctrader_env(env)
+    )
 
     return {
         "account_id": account_id_text,
-        "account_number": (
-            trader.get("accountNumber")
-            or trader.get("account_number")
-            or trader.get("login")
-            or trader.get("accountId")
-        ),
+        "ctidTraderAccountId": account_id_text,
+        "account_number": account_number,
+        "trader_login": trader_login,
+        "traderLogin": trader_login,
         "broker_name": (
             trader.get("brokerName")
             or trader.get("broker_name")
             or trader.get("brokerTitle")
+            or account_list_item.get("brokerTitleShort")
+            or account_list_item.get("brokerTitle")
             or trader.get("broker")
             or "cTrader"
         ),
@@ -3774,13 +3898,9 @@ def extract_ctrader_account_display(account_id, response=None, error=None, env=N
             or trader.get("currency")
             or payload.get("currency")
         ),
-        "mode": (
-            "live"
-            if trader.get("isLive") is True
-            else "demo"
-            if trader.get("isLive") is False
-            else env
-        ),
+        "mode": account_env,
+        "env": account_env,
+        "isLive": is_live,
         "status": (
             "active"
             if not unavailable and active_account_id and account_id_text == str(active_account_id)
@@ -3802,15 +3922,26 @@ def extract_ctrader_account_display(account_id, response=None, error=None, env=N
                 "moneyDigits",
                 "depositAssetId",
                 "isLive",
+                "traderLogin",
+                "accessRights",
             ]
             if key in trader
+        } or {
+            key: account_list_item.get(key)
+            for key in [
+                "brokerTitleShort",
+                "brokerTitle",
+                "traderLogin",
+                "isLive",
+            ]
+            if key in account_list_item
         },
     }
 
 def fetch_ctrader_accounts(refresh=True):
     settings = load_ctrader_account_settings()
     active_account_id = get_active_ctrader_account_id()
-    env = os.getenv("CTRADER_ENV", "demo").lower()
+    env = normalize_ctrader_env(os.getenv("CTRADER_ENV", "demo"))
     config = {
         "client_id": os.getenv("CTRADER_CLIENT_ID"),
         "client_secret": os.getenv("CTRADER_CLIENT_SECRET"),
@@ -3906,6 +4037,37 @@ def fetch_ctrader_accounts(refresh=True):
                 },
                 PAYLOAD_GET_ACCOUNT_LIST_BY_ACCESS_TOKEN_RES,
             )
+        account_list_payload = (
+            account_list_response.get("payload", {})
+            if isinstance(account_list_response, dict)
+            else {}
+        )
+        raw_account_items = (
+            account_list_payload.get("ctidTraderAccount")
+            or account_list_payload.get("ctid_trader_account")
+            or []
+        )
+
+        if not isinstance(raw_account_items, list):
+            raw_account_items = []
+
+        account_items_by_id = {}
+
+        for item in raw_account_items:
+            if not isinstance(item, dict):
+                continue
+
+            account_item_id = (
+                item.get("ctidTraderAccountId")
+                or item.get("ctid_trader_account_id")
+                or item.get("accountId")
+            )
+
+            if account_item_id is None:
+                continue
+
+            account_items_by_id[str(account_item_id)] = item
+
         account_ids = [
             str(account_id)
             for account_id in extract_ctrader_authorized_account_ids(account_list_response)
@@ -3916,6 +4078,12 @@ def fetch_ctrader_accounts(refresh=True):
             "env": config["env"],
             "active_account_id": str(active_account_id) if active_account_id else None,
             "account_ids": account_ids,
+            "account_envs": {
+                account_id: get_ctrader_env_for_account_item(
+                    account_items_by_id.get(str(account_id), {})
+                )
+                for account_id in account_ids
+            },
             "forgotten_account_ids": sorted(forgotten),
         })
         accounts = []
@@ -3924,10 +4092,24 @@ def fetch_ctrader_accounts(refresh=True):
             account_response = None
             trader_response = None
             account_auth_error = None
+            account_item = account_items_by_id.get(str(account_id), {})
+            account_env = get_ctrader_env_for_account_item(account_item)
+            account_sock = None
 
             try:
+                account_host, account_port = CTRADER_JSON_ENDPOINTS[account_env]
+                account_sock = open_ctrader_json_socket(account_host, account_port)
+                send_ctrader_request(
+                    account_sock,
+                    PAYLOAD_APPLICATION_AUTH_REQ,
+                    {
+                        "clientId": config["client_id"],
+                        "clientSecret": config["client_secret"],
+                    },
+                    PAYLOAD_APPLICATION_AUTH_RES,
+                )
                 account_response = send_ctrader_request(
-                    sock,
+                    account_sock,
                     PAYLOAD_ACCOUNT_AUTH_REQ,
                     {
                         "ctidTraderAccountId": int(account_id),
@@ -3944,6 +4126,7 @@ def fetch_ctrader_accounts(refresh=True):
                 print("CTRADER_ACCOUNT_AUTH_DEBUG =", {
                     "ok": True,
                     "account_id": account_id,
+                    "env": account_env,
                     "source": "account_list_refresh",
                 })
             except Exception as exc:
@@ -3951,6 +4134,7 @@ def fetch_ctrader_accounts(refresh=True):
                 print("CTRADER_ACCOUNT_AUTH_DEBUG =", {
                     "ok": False,
                     "account_id": account_id,
+                    "env": account_env,
                     "source": "account_list_refresh",
                     "reason": describe_ctrader_error(exc),
                 })
@@ -3958,15 +4142,21 @@ def fetch_ctrader_accounts(refresh=True):
                     extract_ctrader_account_display(
                         account_id,
                         error=describe_ctrader_error(exc),
-                        env=config["env"],
+                        env=account_env,
                         active_account_id=active_account_id,
+                        account_list_item=account_item,
                     )
                 )
+                try:
+                    if account_sock:
+                        account_sock.close()
+                except Exception:
+                    pass
                 continue
 
             try:
                 trader_response = send_ctrader_request(
-                    sock,
+                    account_sock,
                     PAYLOAD_TRADER_REQ,
                     {
                         "ctidTraderAccountId": int(account_id),
@@ -3977,6 +4167,7 @@ def fetch_ctrader_accounts(refresh=True):
                 print("CTRADER_ACCOUNT_AUTH_DEBUG =", {
                     "ok": True,
                     "account_id": account_id,
+                    "env": account_env,
                     "source": "trader_details",
                     "details_available": False,
                     "reason": describe_ctrader_error(exc),
@@ -3987,10 +4178,17 @@ def fetch_ctrader_accounts(refresh=True):
                     extract_ctrader_account_display(
                         account_id,
                         trader_response or account_response,
-                        env=config["env"],
+                        env=account_env,
                         active_account_id=active_account_id,
+                        account_list_item=account_item,
                     )
                 )
+
+            try:
+                if account_sock:
+                    account_sock.close()
+            except Exception:
+                pass
 
         returned_ids = {str(item.get("account_id")) for item in accounts}
 
@@ -4026,14 +4224,28 @@ def fetch_ctrader_accounts(refresh=True):
             })
             active_account_id = None
             os.environ.pop("ACTIVE_CTRADER_ACCOUNT_ID", None)
+            os.environ.pop("ACTIVE_CTRADER_ACCOUNT_ENV", None)
             os.environ.pop("CTRADER_ACCOUNT_ID", None)
             update_env_file_values({
                 "ACTIVE_CTRADER_ACCOUNT_ID": "",
+                "ACTIVE_CTRADER_ACCOUNT_ENV": "",
                 "CTRADER_ACCOUNT_ID": "",
             })
             clear_ctrader_connection_cache()
 
         settings["active_account_id"] = str(active_account_id) if active_account_id else None
+        settings["active_account_env"] = (
+            next(
+                (
+                    get_ctrader_env_for_account_item(item)
+                    for item in accounts
+                    if str(item.get("account_id")) == str(active_account_id)
+                ),
+                None,
+            )
+            if active_account_id
+            else None
+        )
         settings["accounts"] = accounts
         settings["last_refresh"] = datetime.now(timezone.utc).isoformat()
         save_ctrader_account_settings(settings)
@@ -4041,10 +4253,11 @@ def fetch_ctrader_accounts(refresh=True):
         return {
             "ok": True,
             "active_account_id": settings["active_account_id"],
+            "active_account_env": settings["active_account_env"],
             "accounts": accounts,
             "forgotten_account_ids": sorted(forgotten),
             "last_refresh": settings["last_refresh"],
-            "env": config["env"],
+            "env": settings["active_account_env"] or config["env"],
         }
     except Exception as exc:
         return {
@@ -4139,13 +4352,14 @@ def resolve_ctrader_symbol(symbol_details, requested_symbol):
 
 def get_ctrader_diagnostics():
     active_account_id = get_active_ctrader_account_id()
+    active_account_env = get_active_ctrader_account_env()
     env_config = {
         "client_id": os.getenv("CTRADER_CLIENT_ID"),
         "client_secret": os.getenv("CTRADER_CLIENT_SECRET"),
         "access_token": os.getenv("CTRADER_ACCESS_TOKEN"),
         "refresh_token": os.getenv("CTRADER_REFRESH_TOKEN"),
         "account_id": active_account_id,
-        "env": os.getenv("CTRADER_ENV", "demo").lower(),
+        "env": active_account_env,
     }
     missing = [
         key for key in [

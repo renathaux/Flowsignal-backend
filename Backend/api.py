@@ -3179,6 +3179,122 @@ def calculate_live_pl_sync():
     }
 
 
+def parse_live_loss_limit(value):
+    if value in [None, ""]:
+        return None
+
+    try:
+        limit = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if not math.isfinite(limit) or limit <= 0:
+        return None
+
+    return abs(limit)
+
+
+def format_live_market_time(ts):
+    if ts in [None, ""]:
+        return None
+
+    try:
+        return datetime.fromtimestamp(
+            float(ts),
+            LIVE_MARKET_TIMEZONE,
+        ).isoformat()
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def get_live_loss_limit_status(now=None):
+    current = now or datetime.now(LIVE_MARKET_TIMEZONE)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=LIVE_MARKET_TIMEZONE)
+    else:
+        current = current.astimezone(LIVE_MARKET_TIMEZONE)
+
+    risk_settings = load_risk_settings()
+    daily_limit = parse_live_loss_limit(risk_settings.get("maxDailyLoss"))
+    weekly_limit = parse_live_loss_limit(risk_settings.get("maxWeeklyLoss"))
+
+    status = {
+        "blocked": False,
+        "reason": None,
+        "maxDailyLoss": daily_limit,
+        "maxWeeklyLoss": weekly_limit,
+        "daily_limit_enabled": daily_limit is not None,
+        "weekly_limit_enabled": weekly_limit is not None,
+        "daily_reset_rule": "5:00 PM New York",
+        "weekly_reset_rule": "Sunday 5:00 PM New York",
+    }
+
+    if daily_limit is None and weekly_limit is None:
+        return status
+
+    try:
+        live_pl = calculate_live_pl_sync()
+    except Exception as exc:
+        status.update({
+            "blocked": True,
+            "reason": "LIVE BLOCKED: risk limit check unavailable.",
+            "fetch_error": str(exc),
+        })
+        return status
+
+    daily_reset_ts = live_pl.get("daily_reset_ts") or get_live_daily_reset_ts(current)
+    weekly_reset_ts = live_pl.get("weekly_reset_ts") or get_live_week_start_ts(current)
+    daily_reset_dt = datetime.fromtimestamp(
+        float(daily_reset_ts),
+        LIVE_MARKET_TIMEZONE,
+    )
+    weekly_reset_dt = datetime.fromtimestamp(
+        float(weekly_reset_ts),
+        LIVE_MARKET_TIMEZONE,
+    )
+
+    daily_total_pl = float(live_pl.get("daily_total_pl") or 0)
+    weekly_total_pl = float(live_pl.get("weekly_total_pl") or 0)
+
+    status.update({
+        "daily_total_pl": round(daily_total_pl, 2),
+        "daily_realized_pl": live_pl.get("daily_realized_pl"),
+        "floating_live_pl": live_pl.get("floating_live_pl"),
+        "weekly_total_pl": round(weekly_total_pl, 2),
+        "weekly_realized_pl": live_pl.get("weekly_realized_pl"),
+        "daily_reset_ts": daily_reset_ts,
+        "daily_reset_time": daily_reset_dt.isoformat(),
+        "next_daily_reset_time": (daily_reset_dt + timedelta(days=1)).isoformat(),
+        "weekly_reset_ts": weekly_reset_ts,
+        "weekly_reset_time": weekly_reset_dt.isoformat(),
+        "next_weekly_reset_time": (weekly_reset_dt + timedelta(days=7)).isoformat(),
+    })
+
+    if daily_limit is not None and daily_total_pl <= -daily_limit:
+        status.update({
+            "blocked": True,
+            "limit_type": "daily",
+            "reason": "LIVE BLOCKED: max daily loss reached until next 5 PM New York reset.",
+            "loss_limit": daily_limit,
+            "loss_value": round(abs(daily_total_pl), 2),
+            "blocked_until": status["next_daily_reset_time"],
+        })
+        return status
+
+    if weekly_limit is not None and weekly_total_pl <= -weekly_limit:
+        status.update({
+            "blocked": True,
+            "limit_type": "weekly",
+            "reason": "LIVE BLOCKED: max weekly loss reached until Sunday 5 PM New York reset.",
+            "loss_limit": weekly_limit,
+            "loss_value": round(abs(weekly_total_pl), 2),
+            "blocked_until": status["next_weekly_reset_time"],
+        })
+        return status
+
+    return status
+
+
 def get_performance_data():
     monthly_trades = get_closed_deals_for_current_month(max_rows=500)
     if monthly_trades:
@@ -4653,6 +4769,96 @@ def calculate_live_risk_size(symbol, entry, sl):
         "volume_units": position_size.get("volume_units"),
     })
     return position_size
+
+def log_xauusd_live_risk_diagnostics(symbol, trade_payload, risk_size):
+    execution_symbol = normalize_symbol(symbol)
+
+    if execution_symbol != "XAUUSD":
+        return
+
+    trade_payload = trade_payload or {}
+    risk_size = risk_size or {}
+
+    try:
+        entry_value = float(trade_payload.get("entry"))
+        sl_value = float(trade_payload.get("sl"))
+        sl_distance_price = abs(entry_value - sl_value)
+    except (TypeError, ValueError):
+        entry_value = trade_payload.get("entry")
+        sl_value = trade_payload.get("sl")
+        sl_distance_price = risk_size.get("stop_loss_price_distance")
+
+    account_balance = risk_size.get("account_balance")
+    account_value_used = risk_size.get("account_equity_used")
+
+    if account_value_used is None:
+        account_value_used = account_balance
+
+    configured_risk_percent = risk_size.get(
+        "risk_percent",
+        get_configured_live_risk_percent()
+    )
+
+    try:
+        expected_dollar_risk = (
+            float(account_value_used)
+            * (float(configured_risk_percent) / 100)
+        )
+    except (TypeError, ValueError):
+        expected_dollar_risk = risk_size.get("risk_amount")
+
+    final_risk_percent = risk_size.get("final_risk_percent")
+
+    try:
+        would_exceed_one_percent = float(final_risk_percent) > 1.0
+    except (TypeError, ValueError):
+        would_exceed_one_percent = None
+
+    diagnostics = {
+        "symbol": execution_symbol,
+        "account_balance": account_balance,
+        "configured_risk_percent": configured_risk_percent,
+        "expected_dollar_risk": (
+            round(expected_dollar_risk, 2)
+            if isinstance(expected_dollar_risk, (int, float))
+            else expected_dollar_risk
+        ),
+        "entry": entry_value,
+        "stop_loss": sl_value,
+        "sl_distance_price": (
+            round(sl_distance_price, 8)
+            if isinstance(sl_distance_price, (int, float))
+            else sl_distance_price
+        ),
+        "pip_size": risk_size.get("pip_size"),
+        "sl_pips": risk_size.get("sl_pips"),
+        "pip_value_per_lot": risk_size.get("pip_value_per_lot"),
+        "raw_lot_size": (
+            risk_size.get("raw_lots")
+            if risk_size.get("raw_lots") is not None
+            else risk_size.get("calculated_lots")
+        ),
+        "rounded_lot_size": (
+            risk_size.get("rounded_lots")
+            if risk_size.get("rounded_lots") is not None
+            else risk_size.get("lot_size")
+        ),
+        "min_volume_units": risk_size.get("min_volume_units"),
+        "volume_step_units": risk_size.get("volume_step_units"),
+        "final_volume_units": risk_size.get("volume_units"),
+        "ctrader_payload_volume": risk_size.get("payload_volume"),
+        "backend_estimated_dollar_risk": risk_size.get("final_risk_amount"),
+        "backend_estimated_risk_percent": final_risk_percent,
+        "allowed_max_risk_percent": (
+            risk_size.get("maximum_allowed_risk_percent")
+            or risk_size.get("allowed_risk_percent")
+        ),
+        "would_exceed_1_percent": would_exceed_one_percent,
+    }
+
+    print("XAUUSD_LIVE_RISK_DIAGNOSTICS_START")
+    print(json.dumps(diagnostics, indent=2, default=str))
+    print("XAUUSD_LIVE_RISK_DIAGNOSTICS_END")
 
 def build_minimum_live_size(symbol, entry, sl, failed_risk_size=None):
     execution_symbol = normalize_symbol(symbol)
@@ -6971,6 +7177,56 @@ def execute_live_order_core(payload: dict, source="manual"):
             log_message
         )
 
+    loss_limit_status = get_live_loss_limit_status()
+
+    if loss_limit_status.get("blocked"):
+        reason = (
+            loss_limit_status.get("reason")
+            or "LIVE BLOCKED: risk loss limit reached."
+        )
+        log_message = (
+            f"CTRADER AUTO TRADE BLOCKED: {reason}"
+            if source == "auto"
+            else f"LIVE EXECUTION BLOCKED: {reason}"
+        )
+
+        if source == "auto":
+            set_auto_trade_status(
+                symbol=symbol,
+                signal=trade_payload.get("signal"),
+                action=side,
+                status="BLOCKED",
+                reason=reason,
+                details=loss_limit_status,
+            )
+            log_auto_trade_blocked_reason(
+                symbol=symbol,
+                signal=trade_payload.get("signal"),
+                stage="risk_loss_limit",
+                reason=reason,
+                details=loss_limit_status,
+            )
+
+        log_live_xauusd_execution_debug(
+            symbol,
+            plan=plan,
+            trade_payload=trade_payload,
+            stage="risk_loss_limit",
+            blocked_by="risk_loss_limit",
+            blocked_reason=reason,
+            payload_valid=True,
+            order_sent=False,
+            order_accepted=False,
+        )
+        return reject_live_execution_block(
+            symbol,
+            side,
+            trade_payload,
+            reason,
+            log_message,
+            details=loss_limit_status,
+        )
+
     risk_size = calculate_live_risk_size(
         symbol,
         trade_payload.get("entry"),
@@ -7046,6 +7302,7 @@ def execute_live_order_core(payload: dict, source="manual"):
         "account_equity_used": risk_size.get("account_equity_used"),
         "risk": risk_size,
     })
+    log_xauusd_live_risk_diagnostics(symbol, trade_payload, risk_size)
     log_live_xauusd_execution_debug(
         symbol,
         plan=plan,
