@@ -6212,6 +6212,141 @@ def confirm_5m_close_after_15m_break(data_5m, side, setup_level, breakout_candle
         ),
     }
 
+def evaluate_xauusd_buy_continuation_quality(
+    closed_data_15m,
+    five_m_entry,
+    fifteen_m_swing_break,
+    five_m_after_setup,
+):
+    reason = "WAIT: XAUUSD weak BOS / no clean continuation confirmation"
+    debug = {
+        "blocked": False,
+        "reason": None,
+        "min_clearance": None,
+        "break_close_clearance": None,
+        "break_body_ratio": None,
+        "closed_above_swing_cleanly": False,
+        "bullish_break_body": False,
+        "fresh_5m_confirmation": False,
+        "cleared_nearby_resistance": False,
+        "recent_resistance": None,
+    }
+
+    if closed_data_15m is None or closed_data_15m.empty:
+        debug["blocked"] = True
+        debug["reason"] = reason
+        return debug
+
+    try:
+        swing_level = float(fifteen_m_swing_break.get("swing_level"))
+        break_close = float(fifteen_m_swing_break.get("closed_candle_close"))
+        break_time = pd.Timestamp(fifteen_m_swing_break.get("closed_candle_time"))
+        tolerance = get_15m_level_tolerance("XAUUSD") or 0
+        min_clearance = max(0.50, float(tolerance) * 0.50)
+    except (TypeError, ValueError):
+        debug["blocked"] = True
+        debug["reason"] = reason
+        return debug
+
+    if break_time.tzinfo is None:
+        break_time = break_time.tz_localize("UTC")
+    else:
+        break_time = break_time.tz_convert("UTC")
+
+    break_row = None
+    pre_break_rows = []
+
+    for candle_time, candle in closed_data_15m.iterrows():
+        candle_ts = pd.Timestamp(candle_time)
+        if candle_ts.tzinfo is None:
+            candle_ts = candle_ts.tz_localize("UTC")
+        else:
+            candle_ts = candle_ts.tz_convert("UTC")
+
+        if candle_ts < break_time:
+            pre_break_rows.append(candle)
+        elif candle_ts == break_time:
+            break_row = candle
+
+    if break_row is None:
+        break_row = closed_data_15m.iloc[-1]
+        pre_break = closed_data_15m.iloc[:-1].copy()
+    else:
+        pre_break = pd.DataFrame(pre_break_rows)
+
+    try:
+        break_open = float(break_row["Open"])
+        break_high = float(break_row["High"])
+        break_low = float(break_row["Low"])
+    except (TypeError, ValueError):
+        debug["blocked"] = True
+        debug["reason"] = reason
+        return debug
+
+    break_range = max(abs(break_high - break_low), 1e-12)
+    break_body = abs(break_close - break_open)
+    break_body_ratio = break_body / break_range
+    break_close_clearance = break_close - swing_level
+    recent_resistance = None
+
+    if pre_break is not None and not pre_break.empty:
+        try:
+            recent_resistance = float(pre_break["High"].tail(20).max())
+        except Exception:
+            recent_resistance = None
+
+    closed_above_swing_cleanly = break_close_clearance >= min_clearance
+    bullish_break_body = (
+        break_close > break_open
+        and break_body_ratio >= 0.45
+    )
+    cleared_nearby_resistance = (
+        recent_resistance is None
+        or break_close >= max(swing_level, recent_resistance) + min_clearance
+    )
+
+    try:
+        five_m_close = float(five_m_entry.get("close"))
+        five_m_open = float(five_m_entry.get("open"))
+    except (TypeError, ValueError):
+        five_m_close = None
+        five_m_open = None
+
+    fresh_5m_confirmation = bool(
+        five_m_entry.get("side") == "BUY"
+        and five_m_entry.get("close_confirmed")
+        and five_m_after_setup
+        and five_m_close is not None
+        and five_m_open is not None
+        and five_m_close >= swing_level + min_clearance
+        and five_m_close > five_m_open
+    )
+
+    debug.update({
+        "min_clearance": round(min_clearance, 2),
+        "break_close_clearance": round(break_close_clearance, 2),
+        "break_body_ratio": round(break_body_ratio, 3),
+        "closed_above_swing_cleanly": closed_above_swing_cleanly,
+        "bullish_break_body": bullish_break_body,
+        "fresh_5m_confirmation": fresh_5m_confirmation,
+        "cleared_nearby_resistance": cleared_nearby_resistance,
+        "recent_resistance": recent_resistance,
+        "swing_level": swing_level,
+        "break_close": break_close,
+        "five_m_entry": copy.deepcopy(five_m_entry),
+    })
+
+    if not (
+        closed_above_swing_cleanly
+        and bullish_break_body
+        and cleared_nearby_resistance
+        and fresh_5m_confirmation
+    ):
+        debug["blocked"] = True
+        debug["reason"] = reason
+
+    return debug
+
 def is_current_5m_entry_confirmation(closed_data_5m, confirmation, side):
     side = str(side or "").upper()
     confirmation = confirmation if isinstance(confirmation, dict) else {}
@@ -7393,6 +7528,11 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
     closed_data_5m = remove_current_forming_candle(data_5m, 5)
     closed_data_15m = remove_current_forming_candle(data_15m, 15)
     closed_data_1h = remove_current_forming_candle(data_1h, 60)
+    removed_forming_15m_candle = (
+        data_15m is not None
+        and closed_data_15m is not None
+        and len(data_15m) > len(closed_data_15m)
+    )
 
     setup_result_15m = get_signal(
         closed_data_15m,
@@ -7683,6 +7823,8 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
     result["strategy_entry_timeframe"] = "5m"
     result["strategy_setup_timeframe"] = "15m"
     result["strategy_confirmation_timeframe"] = "5m closed candle"
+    result["fifteen_m_uses_closed_candle_only"] = True
+    result["fifteen_m_forming_candle_removed"] = removed_forming_15m_candle
     result["confirmation_5m"] = five_m_signal
     result["confirmation_5m_raw"] = lightweight_5m_signal
     result["current_5m_entry_confirmation"] = (
@@ -7821,6 +7963,28 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
                     "five_m_expired": five_m_entry.get("expired"),
                     "reason": reason,
                 }
+                return False
+
+        if normalize_symbol(symbol) == "XAUUSD" and fifteen_m_setup == "BUY":
+            xauusd_buy_quality = evaluate_xauusd_buy_continuation_quality(
+                closed_data_15m,
+                five_m_entry,
+                fifteen_m_swing_break,
+                five_m_after_setup,
+            )
+
+            if xauusd_buy_quality.get("blocked"):
+                reason = xauusd_buy_quality.get("reason")
+                clear_trade_plan(result, reason)
+                mark_signal_blocker(
+                    result,
+                    "xauusd_weak_buy_bos",
+                    reason,
+                    "xauusd_clean_buy_continuation_required",
+                    fifteen_m_setup,
+                )
+                result["entry_timing"] = "WAIT CLEAN XAUUSD BUY CONFIRMATION"
+                result["xauusd_buy_confirmation_debug"] = xauusd_buy_quality
                 return False
 
         risk_levels = build_15m_swing_risk_levels(
