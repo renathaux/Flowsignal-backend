@@ -1786,7 +1786,7 @@ def normalize_trade_levels(symbol, action, entry, sl, tp1, tp2):
             sl_value = round(entry_value + minimum_required_distance, precision)
 
     adjusted_sl_distance = abs(entry_value - sl_value)
-    minimum_tp2_distance = minimum_required_distance / 0.50
+    minimum_tp2_distance = minimum_required_distance / 0.80
     adjusted_tp2_distance = max(
         original_tp2_distance,
         minimum_tp2_distance,
@@ -1798,13 +1798,13 @@ def normalize_trade_levels(symbol, action, entry, sl, tp1, tp2):
     if normalized_action == "BUY":
         tp2_value = round(entry_value + adjusted_tp2_distance, precision)
         tp1_value = round(
-            entry_value + ((tp2_value - entry_value) * 0.50),
+            entry_value + ((tp2_value - entry_value) * 0.80),
             precision,
         )
     else:
         tp2_value = round(entry_value - adjusted_tp2_distance, precision)
         tp1_value = round(
-            entry_value - ((entry_value - tp2_value) * 0.50),
+            entry_value - ((entry_value - tp2_value) * 0.80),
             precision,
         )
 

@@ -2697,9 +2697,9 @@ def calculate_tp1_from_tp2(entry, tp2, side):
     tp2_value = float(tp2)
 
     if str(side or "").upper() == "BUY":
-        return entry_value + ((tp2_value - entry_value) * 0.50)
+        return entry_value + ((tp2_value - entry_value) * 0.80)
 
-    return entry_value - ((entry_value - tp2_value) * 0.50)
+    return entry_value - ((entry_value - tp2_value) * 0.80)
 
 def calculate_protected_sl_price(entry, tp2, side):
     entry_value = float(entry)
