@@ -5427,6 +5427,60 @@ def validate_trade_levels_1_to_2(result, side):
 def get_15m_swing_watch_key(symbol, side):
     return f"{normalize_symbol(symbol)}:{str(side or '').upper()}"
 
+def eurusd_requires_fresh_5m_entry(symbol):
+    return normalize_symbol(symbol) == "EURUSD"
+
+def clear_final_signal_hold_for_symbol(symbol, reason):
+    hold_key = get_final_signal_hold_key(symbol)
+
+    if hold_key not in FINAL_SIGNAL_HOLD:
+        return False
+
+    FINAL_SIGNAL_HOLD.pop(hold_key, None)
+    save_final_signal_hold()
+    print("FINAL_SIGNAL_HOLD_CLEARED =", {
+        "symbol": hold_key,
+        "reason": reason,
+    })
+    return True
+
+def clear_eurusd_entry_memory(symbol, reason, side=None):
+    if not eurusd_requires_fresh_5m_entry(symbol):
+        return False
+
+    changed = False
+
+    if clear_final_signal_hold_for_symbol(symbol, reason):
+        changed = True
+
+    sides = [str(side).upper()] if str(side or "").upper() in ["BUY", "SELL"] else ["BUY", "SELL"]
+
+    for watch_side in sides:
+        watch_key = get_15m_swing_watch_key(symbol, watch_side)
+        watched = FIFTEEN_M_SWING_WATCH.get(watch_key)
+
+        if not isinstance(watched, dict):
+            continue
+
+        if str(watched.get("status") or "").upper() in ["EXPIRED", "INVALIDATED"]:
+            continue
+
+        watched["status"] = "EXPIRED"
+        watched["expired_at"] = datetime.now(timezone.utc).isoformat()
+        watched["expiration_reason"] = reason
+        changed = True
+
+    if changed:
+        save_fifteen_m_swing_watch()
+
+    print("EURUSD_ENTRY_MEMORY_CLEARED =", {
+        "symbol": normalize_symbol(symbol),
+        "side": side,
+        "reason": reason,
+        "changed": changed,
+    })
+    return changed
+
 def get_15m_level_tolerance(symbol):
     normalized_symbol = normalize_symbol(symbol)
     return get_pair_strategy_rule(normalized_symbol, "fifteen_m_level_tolerance")
@@ -5446,6 +5500,7 @@ def update_fifteen_m_swing_watch(symbol, side, swing_level, candle_time):
         return previous or None
 
     previous_level = previous.get("swing_level")
+    previous_status = str(previous.get("status") or "").upper()
     same_level = False
 
     try:
@@ -5453,10 +5508,15 @@ def update_fifteen_m_swing_watch(symbol, side, swing_level, candle_time):
     except (TypeError, ValueError):
         same_level = False
 
-    if previous and not previous.get("break_confirmed") and same_level:
+    if (
+        previous
+        and not previous.get("break_confirmed")
+        and same_level
+        and previous_status not in ["EXPIRED", "INVALIDATED"]
+    ):
         return previous
 
-    if not previous or not same_level:
+    if not previous or not same_level or previous_status in ["EXPIRED", "INVALIDATED"]:
         FIFTEEN_M_SWING_WATCH[key] = {
             "symbol": normalize_symbol(symbol),
             "side": side,
@@ -5493,6 +5553,7 @@ def evaluate_closed_15m_swing_break(closed_data_15m, side, symbol=None):
 
     try:
         close_price = float(closed_data_15m["Close"].iloc[-1])
+        previous_close = float(closed_data_15m["Close"].iloc[-2])
         candle_time = pd.Timestamp(closed_data_15m.index[-1]).isoformat()
         swing_source = closed_data_15m.iloc[:-1].copy()
 
@@ -5580,6 +5641,45 @@ def evaluate_closed_15m_swing_break(closed_data_15m, side, symbol=None):
                     reason = "WAIT_NO_15M_CLOSE_CONFIRMATION"
                 else:
                     reason = "WAIT_NO_15M_BREAK"
+
+        if eurusd_requires_fresh_5m_entry(normalized_symbol):
+            fresh_cross = (
+                side == "BUY"
+                and confirmed
+                and previous_close <= float(swing_level)
+            ) or (
+                side == "SELL"
+                and confirmed
+                and previous_close >= float(swing_level)
+            )
+
+            returned_through_swing = (
+                side == "BUY"
+                and close_price < float(swing_level)
+            ) or (
+                side == "SELL"
+                and close_price > float(swing_level)
+            )
+
+            if confirmed and not fresh_cross:
+                confirmed = False
+                reason = "WAIT: old EURUSD setup expired"
+                clear_eurusd_entry_memory(
+                    normalized_symbol,
+                    reason,
+                    side,
+                )
+            elif (
+                returned_through_swing
+                and isinstance(watched, dict)
+                and watched.get("break_confirmed")
+            ):
+                reason = "WAIT: held signal cleared"
+                clear_eurusd_entry_memory(
+                    normalized_symbol,
+                    reason,
+                    side,
+                )
 
         if confirmed and watched and not watched.get("break_confirmed"):
             key = get_15m_swing_watch_key(debug.get("symbol"), side)
@@ -7437,6 +7537,12 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
         fifteen_m_breakout_candle_time,
         symbol,
     )
+    if eurusd_requires_fresh_5m_entry(symbol):
+        current_5m_entry_confirmation = is_current_5m_entry_confirmation(
+            closed_data_5m,
+            five_m_entry,
+            fifteen_m_setup,
+        )
     if pending_15m_setup and (
         five_m_entry.get("invalidated")
         or five_m_entry.get("expired")
@@ -7657,6 +7763,56 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             result["entry_timing"] = f"WAIT NEW 15M {fifteen_m_setup} BOS"
             return False
 
+        if eurusd_requires_fresh_5m_entry(symbol):
+            eurusd_current_5m_confirmation = (
+                is_current_5m_entry_confirmation(
+                    closed_data_5m,
+                    five_m_entry,
+                    fifteen_m_setup,
+                )
+            )
+            eurusd_5m_valid = (
+                five_m_entry.get("side") == fifteen_m_setup
+                and five_m_entry.get("close_confirmed")
+                and five_m_after_setup
+                and eurusd_current_5m_confirmation
+            )
+
+            if not eurusd_5m_valid:
+                if five_m_entry.get("invalidated") or five_m_entry.get("expired"):
+                    reason = "WAIT: old EURUSD setup expired"
+                    clear_eurusd_entry_memory(symbol, reason, fifteen_m_setup)
+                elif not five_m_after_setup or not eurusd_current_5m_confirmation:
+                    reason = "WAIT: old EURUSD setup expired"
+                    clear_eurusd_entry_memory(symbol, reason, fifteen_m_setup)
+                else:
+                    reason = "WAIT: 15m break found, waiting for fresh 5m confirmation"
+                    clear_final_signal_hold_for_symbol(
+                        symbol,
+                        "WAIT: held signal cleared",
+                    )
+
+                clear_trade_plan(result, reason)
+                mark_signal_blocker(
+                    result,
+                    "missing_fresh_5m_confirmation",
+                    reason,
+                    "eurusd_fresh_5m_confirmation_required",
+                    fifteen_m_setup,
+                )
+                result["entry_timing"] = "WAIT FRESH 5M CONFIRMATION"
+                result["eurusd_fresh_5m_required"] = True
+                result["eurusd_fresh_5m_debug"] = {
+                    "five_m_side": five_m_entry.get("side"),
+                    "five_m_close_confirmed": five_m_entry.get("close_confirmed"),
+                    "five_m_after_setup": five_m_after_setup,
+                    "current_5m_entry_confirmation": eurusd_current_5m_confirmation,
+                    "five_m_invalidated": five_m_entry.get("invalidated"),
+                    "five_m_expired": five_m_entry.get("expired"),
+                    "reason": reason,
+                }
+                return False
+
         risk_levels = build_15m_swing_risk_levels(
             closed_data_15m,
             five_m_entry.get("close")
@@ -7753,7 +7909,9 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             else f"SMC {fifteen_m_setup} 15M CONFIRMED"
         )
         result["plan_reason"] = (
-            five_m_entry.get("reason")
+            f"{fifteen_m_setup}: fresh 15m break + fresh 5m confirmation"
+            if eurusd_requires_fresh_5m_entry(symbol)
+            else five_m_entry.get("reason")
             if five_m_entry.get("close_confirmed")
             else f"{fifteen_m_setup} after 15m swing break and close confirmation"
         )

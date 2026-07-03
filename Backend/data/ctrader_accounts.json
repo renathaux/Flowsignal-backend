@@ -1,14 +1,125 @@
 {
-  "active_account_id": "47644840",
+  "active_account_id": "47810571",
+  "active_account_env": "demo",
   "accounts": [
     {
+      "account_id": "47644773",
+      "ctidTraderAccountId": "47644773",
+      "account_number": 5842276,
+      "trader_login": 5842276,
+      "traderLogin": 5842276,
+      "broker_name": "Spotware",
+      "balance": 1000.0,
+      "equity": null,
+      "currency": 4,
+      "mode": "demo",
+      "env": "demo",
+      "isLive": false,
+      "status": "available",
+      "unavailable": false,
+      "expired": false,
+      "reason": null,
+      "money_digits": 2,
+      "raw": {
+        "brokerName": "Spotware",
+        "balance": 100000,
+        "moneyDigits": 2,
+        "depositAssetId": 4,
+        "traderLogin": 5842276,
+        "accessRights": 0
+      }
+    },
+    {
       "account_id": "47644840",
-      "account_number": null,
+      "ctidTraderAccountId": "47644840",
+      "account_number": 17136183,
+      "trader_login": 17136183,
+      "traderLogin": 17136183,
+      "broker_name": "FTMO Platform",
+      "balance": null,
+      "equity": null,
+      "currency": null,
+      "mode": "live",
+      "env": "live",
+      "isLive": true,
+      "status": "unavailable",
+      "unavailable": true,
+      "expired": true,
+      "reason": "cTrader error response: Authentication failed",
+      "money_digits": 2,
+      "raw": {
+        "brokerTitleShort": "FTMO Platform",
+        "traderLogin": 17136183,
+        "isLive": true
+      }
+    },
+    {
+      "account_id": "47784297",
+      "ctidTraderAccountId": "47784297",
+      "account_number": 5850466,
+      "trader_login": 5850466,
+      "traderLogin": 5850466,
+      "broker_name": "Spotware",
+      "balance": 1000.0,
+      "equity": null,
+      "currency": 11,
+      "mode": "demo",
+      "env": "demo",
+      "isLive": false,
+      "status": "available",
+      "unavailable": false,
+      "expired": false,
+      "reason": null,
+      "money_digits": 2,
+      "raw": {
+        "brokerName": "Spotware",
+        "balance": 100000,
+        "moneyDigits": 2,
+        "depositAssetId": 11,
+        "traderLogin": 5850466,
+        "accessRights": 0
+      }
+    },
+    {
+      "account_id": "47792343",
+      "ctidTraderAccountId": "47792343",
+      "account_number": 17146097,
+      "trader_login": 17146097,
+      "traderLogin": 17146097,
       "broker_name": "ftmo",
-      "balance": 107633.1,
+      "balance": 9914.86,
       "equity": null,
       "currency": 15,
       "mode": "live",
+      "env": "live",
+      "isLive": true,
+      "status": "available",
+      "unavailable": false,
+      "expired": false,
+      "reason": null,
+      "money_digits": 2,
+      "raw": {
+        "brokerName": "ftmo",
+        "balance": 991486,
+        "moneyDigits": 2,
+        "depositAssetId": 15,
+        "traderLogin": 17146097,
+        "accessRights": 0
+      }
+    },
+    {
+      "account_id": "47810571",
+      "ctidTraderAccountId": "47810571",
+      "account_number": 7578842,
+      "trader_login": 7578842,
+      "traderLogin": 7578842,
+      "broker_name": "ftmo",
+      "balance": 10000.0,
+      "equity": null,
+      "currency": 15,
+      "mode": "demo",
+      "env": "demo",
+      "isLive": false,
       "status": "active",
       "unavailable": false,
       "expired": false,
@@ -16,12 +127,14 @@
       "money_digits": 2,
       "raw": {
         "brokerName": "ftmo",
-        "balance": 10763310,
+        "balance": 1000000,
         "moneyDigits": 2,
-        "depositAssetId": 15
+        "depositAssetId": 15,
+        "traderLogin": 7578842,
+        "accessRights": 0
       }
     }
   ],
   "forgotten_account_ids": [],
-  "last_refresh": "2026-07-01T02:42:53.725863+00:00"
+  "last_refresh": "2026-07-03T12:36:55.450730+00:00"
 }
