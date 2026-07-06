@@ -192,6 +192,17 @@ DEFAULT_CTRADER_ACCOUNT_SETTINGS = {
     "last_refresh": None,
 }
 
+CTRADER_UNAUTHORIZED_ACCOUNT_MESSAGE = (
+    "Selected cTrader account is not authorized. Reconnect or choose an authorized account."
+)
+CTRADER_ACCOUNT_AUTH_SELECTION_DEBUG = {
+    "active_account_id": None,
+    "authorized_account_ids": [],
+    "selected_account_source": None,
+    "is_active_account_authorized": False,
+    "reason": None,
+}
+
 TRADE_LEVEL_RULES = {
     "EURUSD": {
         "min_distance": 0.0008,
@@ -264,6 +275,7 @@ def check_ctrader_connection_capability(force=False):
         "auth_ok": False,
         "account_found": False,
         "reason": "missing or invalid cTrader config",
+        **get_ctrader_account_selection_debug(),
     }
 
     if config:
@@ -293,6 +305,7 @@ def check_ctrader_connection_capability(force=False):
                 ),
                 "reason": "authenticated",
                 "degraded": False,
+                **get_ctrader_account_selection_debug(),
             })
             CTRADER_CONNECTION_CACHE["last_success_at"] = now
             CTRADER_CONNECTION_CACHE["consecutive_failures"] = 0
@@ -303,6 +316,7 @@ def check_ctrader_connection_capability(force=False):
             state["execution_ready"] = False
             state["auth_ok"] = False
             state["account_found"] = False
+            state.update(get_ctrader_account_selection_debug())
 
     if not state["connected"]:
         try:
@@ -315,6 +329,7 @@ def check_ctrader_connection_capability(force=False):
                     "status": True,
                     "execution_ready": bool(config),
                     "reason": "positions fetched",
+                    **get_ctrader_account_selection_debug(),
                 })
 
                 if config:
@@ -400,12 +415,106 @@ def save_ctrader_account_settings(settings):
     CTRADER_ACCOUNTS_PATH.write_text(json.dumps(payload, indent=2, default=str))
     return payload
 
+def get_selected_ctrader_account_source():
+    settings = load_ctrader_account_settings()
+
+    if settings.get("active_account_id"):
+        return "settings"
+
+    if os.getenv("ACTIVE_CTRADER_ACCOUNT_ID"):
+        return "env:ACTIVE_CTRADER_ACCOUNT_ID"
+
+    if os.getenv("CTRADER_ACCOUNT_ID"):
+        return "env:CTRADER_ACCOUNT_ID"
+
+    return None
+
 def get_active_ctrader_account_id():
     settings = load_ctrader_account_settings()
     return (
         settings.get("active_account_id")
         or os.getenv("ACTIVE_CTRADER_ACCOUNT_ID")
+        or os.getenv("CTRADER_ACCOUNT_ID")
     )
+
+def clear_active_ctrader_account_selection(reason, authorized_account_ids=None):
+    settings = load_ctrader_account_settings()
+    active_account_id = get_active_ctrader_account_id()
+    selected_source = get_selected_ctrader_account_source()
+    authorized_set = {
+        str(account_id)
+        for account_id in (authorized_account_ids or [])
+        if account_id is not None
+    }
+
+    if authorized_set:
+        settings["accounts"] = [
+            account
+            for account in settings.get("accounts", [])
+            if str(account.get("account_id")) in authorized_set
+        ]
+
+    settings["active_account_id"] = None
+    settings["active_account_env"] = None
+    save_ctrader_account_settings(settings)
+
+    os.environ.pop("ACTIVE_CTRADER_ACCOUNT_ID", None)
+    os.environ.pop("ACTIVE_CTRADER_ACCOUNT_ENV", None)
+    os.environ.pop("CTRADER_ACCOUNT_ID", None)
+    update_env_file_values({
+        "ACTIVE_CTRADER_ACCOUNT_ID": "",
+        "ACTIVE_CTRADER_ACCOUNT_ENV": "",
+        "CTRADER_ACCOUNT_ID": "",
+    })
+
+    CONNECTED["account_id"] = None
+    CONNECTED["execution_ready"] = False
+    CONNECTED["connected"] = False
+    CONNECTED["status"] = False
+    clear_ctrader_connection_cache()
+
+    debug = update_ctrader_account_auth_selection_debug(
+        active_account_id,
+        sorted(authorized_set),
+        reason=reason,
+    )
+    debug["selected_account_source"] = selected_source
+    CTRADER_ACCOUNT_AUTH_SELECTION_DEBUG.update(debug)
+    print("CTRADER_ACTIVE_ACCOUNT_CLEARED =", {
+        "active_account_id": active_account_id,
+        "authorized_account_ids": sorted(authorized_set),
+        "selected_account_source": selected_source,
+        "reason": reason,
+    })
+    return {
+        "ok": True,
+        "active_account_id": None,
+        "authorized_account_ids": sorted(authorized_set),
+        "reason": reason,
+    }
+
+def update_ctrader_account_auth_selection_debug(
+    active_account_id,
+    authorized_account_ids,
+    reason=None,
+):
+    authorized = [
+        str(account_id)
+        for account_id in (authorized_account_ids or [])
+        if account_id is not None
+    ]
+    active = str(active_account_id) if active_account_id else None
+    CTRADER_ACCOUNT_AUTH_SELECTION_DEBUG.update({
+        "active_account_id": active,
+        "authorized_account_ids": authorized,
+        "selected_account_source": get_selected_ctrader_account_source(),
+        "is_active_account_authorized": bool(active and active in authorized),
+        "reason": reason,
+    })
+    return dict(CTRADER_ACCOUNT_AUTH_SELECTION_DEBUG)
+
+def get_ctrader_account_selection_debug():
+    return dict(CTRADER_ACCOUNT_AUTH_SELECTION_DEBUG)
 
 def normalize_ctrader_env(value=None):
     env = str(value or "").strip().lower()
@@ -666,10 +775,19 @@ def set_active_ctrader_account(account_id):
     account_ids = set(account_lookup)
 
     if account_ids and account_id not in account_ids:
+        update_ctrader_account_auth_selection_debug(
+            account_id,
+            sorted(account_ids),
+            reason=CTRADER_UNAUTHORIZED_ACCOUNT_MESSAGE,
+        )
         return {
             "ok": False,
-            "reason": "Account is not in FlowSignal account list. Refresh accounts first.",
+            "reason": CTRADER_UNAUTHORIZED_ACCOUNT_MESSAGE,
             "account_id": account_id,
+            "active_account_id": account_id,
+            "authorized_account_ids": sorted(account_ids),
+            "selected_account_source": "request",
+            "is_active_account_authorized": False,
         }
 
     account = account_lookup.get(account_id) or {}
@@ -714,6 +832,7 @@ def set_active_ctrader_account(account_id):
         "ok": True,
         "account_id": account_id,
         "env": account_env,
+        **get_ctrader_account_selection_debug(),
     }
 
 def forget_ctrader_account(account_id):
@@ -1582,6 +1701,31 @@ def start_ctrader_live_price_stream():
             "status": "already_running",
         }
 
+    config = get_ctrader_config()
+
+    if not config:
+        LIVE_PRICE_LAST_ERROR = "Missing or invalid cTrader config"
+        return {
+            "ok": False,
+            "status": "not_started",
+            "reason": LIVE_PRICE_LAST_ERROR,
+            **get_ctrader_account_selection_debug(),
+        }
+
+    auth_check = verify_ctrader_account_auth(
+        config.get("account_id"),
+        config=config,
+    )
+
+    if not auth_check.get("ok"):
+        LIVE_PRICE_LAST_ERROR = auth_check.get("reason")
+        return {
+            "ok": False,
+            "status": "not_started",
+            "reason": LIVE_PRICE_LAST_ERROR,
+            **get_ctrader_account_selection_debug(),
+        }
+
     LIVE_PRICE_THREAD_STARTED = True
     LIVE_PRICE_THREAD = threading.Thread(
         target=ctrader_live_price_stream_loop,
@@ -1592,6 +1736,7 @@ def start_ctrader_live_price_stream():
     return {
         "ok": True,
         "status": "started",
+        **get_ctrader_account_selection_debug(),
     }
 
 def ctrader_live_price_stream_loop():
@@ -3690,7 +3835,15 @@ def authorize_ctrader_account(sock, config, account_id):
         "env": config.get("env"),
         "requested_account_id": str(account_id),
         "account_ids": authorized_account_ids,
+        "active_account_id": str(account_id),
+        "authorized_account_ids": authorized_account_ids,
+        "selected_account_source": get_selected_ctrader_account_source(),
+        "is_active_account_authorized": str(account_id) in authorized_account_ids,
     })
+    update_ctrader_account_auth_selection_debug(
+        str(account_id),
+        authorized_account_ids,
+    )
 
     if not authorized_account_ids:
         print("CTRADER_ACCOUNT_AUTH_DEBUG =", {
@@ -3703,15 +3856,18 @@ def authorize_ctrader_account(sock, config, account_id):
     configured_account_id_found = str(account_id) in authorized_account_ids
 
     if not configured_account_id_found:
+        if str(get_active_ctrader_account_id()) == str(account_id):
+            clear_active_ctrader_account_selection(
+                CTRADER_UNAUTHORIZED_ACCOUNT_MESSAGE,
+                authorized_account_ids,
+            )
         print("CTRADER_ACCOUNT_AUTH_DEBUG =", {
             "ok": False,
             "account_id": str(account_id),
-            "reason": "Account is not authorized for this access token",
+            "reason": CTRADER_UNAUTHORIZED_ACCOUNT_MESSAGE,
             "authorized_account_ids": authorized_account_ids,
         })
-        raise RuntimeError(
-            "Configured cTrader account_id is not authorized for this access token"
-        )
+        raise RuntimeError(CTRADER_UNAUTHORIZED_ACCOUNT_MESSAGE)
 
     account_response = send_ctrader_request(
         sock,
@@ -3737,6 +3893,9 @@ def authorize_ctrader_account(sock, config, account_id):
     print("CTRADER_ACCOUNT_AUTH_DEBUG =", {
         "ok": True,
         "account_id": str(account_id),
+        "authorized_account_ids": authorized_account_ids,
+        "selected_account_source": get_selected_ctrader_account_source(),
+        "is_active_account_authorized": True,
     })
 
     return {
@@ -3823,6 +3982,7 @@ def verify_ctrader_account_auth(account_id, config=None):
             "ok": False,
             "reason": reason,
             "account_id": account_id_text,
+            **get_ctrader_account_selection_debug(),
         }
     finally:
         try:
@@ -4075,11 +4235,22 @@ def fetch_ctrader_accounts(refresh=True):
             for account_id in extract_ctrader_authorized_account_ids(account_list_response)
             if str(account_id) not in forgotten
         ]
+        update_ctrader_account_auth_selection_debug(
+            active_account_id,
+            account_ids,
+        )
         print("CTRADER_ACCOUNT_LIST_DEBUG =", {
             "ok": True,
             "env": config["env"],
             "active_account_id": str(active_account_id) if active_account_id else None,
             "account_ids": account_ids,
+            "authorized_account_ids": account_ids,
+            "selected_account_source": get_selected_ctrader_account_source(),
+            "is_active_account_authorized": (
+                str(active_account_id) in account_ids
+                if active_account_id
+                else False
+            ),
             "account_envs": {
                 account_id: get_ctrader_env_for_account_item(
                     account_items_by_id.get(str(account_id), {})
@@ -4192,26 +4363,6 @@ def fetch_ctrader_accounts(refresh=True):
             except Exception:
                 pass
 
-        returned_ids = {str(item.get("account_id")) for item in accounts}
-
-        for old_account in settings.get("accounts", []):
-            old_account_id = str(old_account.get("account_id") or "")
-
-            if (
-                not old_account_id
-                or old_account_id in returned_ids
-                or old_account_id in forgotten
-            ):
-                continue
-
-            accounts.append({
-                **old_account,
-                "status": "unavailable",
-                "unavailable": True,
-                "expired": True,
-                "reason": "Account was not returned by cTrader during refresh",
-            })
-
         active_available = any(
             str(item.get("account_id")) == str(active_account_id)
             and not item.get("unavailable")
@@ -4222,7 +4373,10 @@ def fetch_ctrader_accounts(refresh=True):
             print("ACTIVE_ACCOUNT_SELECTED_DEBUG =", {
                 "ok": False,
                 "account_id": str(active_account_id),
-                "reason": "Active account is unavailable after cTrader refresh",
+                "authorized_account_ids": account_ids,
+                "selected_account_source": get_selected_ctrader_account_source(),
+                "is_active_account_authorized": False,
+                "reason": CTRADER_UNAUTHORIZED_ACCOUNT_MESSAGE,
             })
             active_account_id = None
             os.environ.pop("ACTIVE_CTRADER_ACCOUNT_ID", None)
@@ -4251,11 +4405,21 @@ def fetch_ctrader_accounts(refresh=True):
         settings["accounts"] = accounts
         settings["last_refresh"] = datetime.now(timezone.utc).isoformat()
         save_ctrader_account_settings(settings)
+        selection_debug = update_ctrader_account_auth_selection_debug(
+            settings["active_account_id"],
+            account_ids,
+        )
 
         return {
             "ok": True,
             "active_account_id": settings["active_account_id"],
             "active_account_env": settings["active_account_env"],
+            "active_account_id_authorized": selection_debug["is_active_account_authorized"],
+            "active_account_id_source": selection_debug["selected_account_source"],
+            "authorized_account_ids": account_ids,
+            "active_account_id_debug": selection_debug["active_account_id"],
+            "selected_account_source": selection_debug["selected_account_source"],
+            "is_active_account_authorized": selection_debug["is_active_account_authorized"],
             "accounts": accounts,
             "forgotten_account_ids": sorted(forgotten),
             "last_refresh": settings["last_refresh"],
@@ -4355,6 +4519,7 @@ def resolve_ctrader_symbol(symbol_details, requested_symbol):
 def get_ctrader_diagnostics():
     active_account_id = get_active_ctrader_account_id()
     active_account_env = get_active_ctrader_account_env()
+    selection_debug = get_ctrader_account_selection_debug()
     env_config = {
         "client_id": os.getenv("CTRADER_CLIENT_ID"),
         "client_secret": os.getenv("CTRADER_CLIENT_SECRET"),
@@ -4384,6 +4549,9 @@ def get_ctrader_diagnostics():
         "connection_state": get_connection_state(),
         "account_auth_ok": False,
         "authorized_account_ids": [],
+        "active_account_id": selection_debug.get("active_account_id") or active_account_id,
+        "selected_account_source": selection_debug.get("selected_account_source"),
+        "is_active_account_authorized": selection_debug.get("is_active_account_authorized"),
         "configured_account_id_found": False,
         "can_fetch_positions": False,
         "can_fetch_candles": False,
@@ -4414,6 +4582,7 @@ def get_ctrader_diagnostics():
                 "authorized_account_ids",
                 []
             )
+            diagnostics.update(get_ctrader_account_selection_debug())
             diagnostics["configured_account_id_found"] = auth_state.get(
                 "configured_account_id_found",
                 False
