@@ -5110,13 +5110,54 @@ def build_15m_swing_risk_levels(
         "sl_distance_pips": None,
         "broker_min_distance": broker_min_distance,
         "rejected_swing_candidates": [],
+        "swing_sl_validation": {
+            "swing_found": "NO",
+            "swing_price": None,
+            "swing_time": None,
+            "swing_type": None,
+            "distance_from_entry_to_swing": None,
+            "validation_rules": [],
+            "failed_validation": None,
+            "why_swing_sl_no": None,
+        },
         "final_entry": None,
         "final_tp1": None,
         "final_tp2": None,
     }
 
-    if side not in ["BUY", "SELL"] or closed_data_15m is None or len(closed_data_15m) < 10:
+    def log_swing_sl_validation():
+        validation = debug.get("swing_sl_validation") or {}
+        swing_sl_visible = bool(
+            debug.get("selected_swing_sl")
+            or debug.get("sl_source")
+            or debug.get("sl_valid")
+        )
+        if not swing_sl_visible and not validation.get("why_swing_sl_no"):
+            validation["why_swing_sl_no"] = (
+                validation.get("failed_validation")
+                or debug.get("reason")
+                or debug.get("reason_if_wait")
+                or "No selected swing SL debug field was produced"
+            )
+        debug["swing_sl_validation"] = validation
+        print("SWING_SL_VALIDATION_DEBUG =", {
+            "symbol": normalized_symbol,
+            "side": side,
+            "entry": entry,
+            "swing_sl_visible": "YES" if swing_sl_visible else "NO",
+            **validation,
+        })
+
+    def return_with_swing_log():
+        log_swing_sl_validation()
         return debug
+
+    if side not in ["BUY", "SELL"] or closed_data_15m is None or len(closed_data_15m) < 10:
+        debug["swing_sl_validation"]["failed_validation"] = "invalid input/data"
+        debug["swing_sl_validation"]["why_swing_sl_no"] = (
+            "Side must be BUY/SELL and at least 10 closed 15m candles are required"
+        )
+        return return_with_swing_log()
 
     try:
         entry_price = float(entry)
@@ -5162,6 +5203,23 @@ def build_15m_swing_risk_levels(
         rejected_candidates = []
         last_swing_position = len(swing_source) - 1
 
+        def record_rule(name, passed, reason=None, candidate=None):
+            rule = {
+                "rule": name,
+                "passed": bool(passed),
+                "reason": reason,
+            }
+            if candidate:
+                rule.update({
+                    "candidate_price": candidate.get("price"),
+                    "candidate_time": candidate.get("time"),
+                    "candidate_type": candidate.get("type"),
+                    "candidate_age_candles": candidate.get("age_candles"),
+                })
+            debug["swing_sl_validation"]["validation_rules"].append(rule)
+            if not passed and not debug["swing_sl_validation"].get("failed_validation"):
+                debug["swing_sl_validation"]["failed_validation"] = reason or name
+
         def numeric_candidate(value, source):
             try:
                 candidate = float(value)
@@ -5188,6 +5246,7 @@ def build_15m_swing_risk_levels(
             if candidate:
                 candidate["index"] = swing.get("index")
                 candidate["time"] = swing.get("time")
+                candidate["type"] = swing_type.lower()
                 swing_candidates.append(candidate)
 
         if side == "BUY":
@@ -5195,12 +5254,14 @@ def build_15m_swing_risk_levels(
             if candidate:
                 candidate["index"] = None
                 candidate["time"] = None
+                candidate["type"] = "low"
                 swing_candidates.append(candidate)
         else:
             candidate = numeric_candidate(swing_high, "detected_15m_swing_high")
             if candidate:
                 candidate["index"] = None
                 candidate["time"] = None
+                candidate["type"] = "high"
                 swing_candidates.append(candidate)
 
         seen_candidates = set()
@@ -5248,6 +5309,7 @@ def build_15m_swing_risk_levels(
             return enriched
 
         swing_candidates = [enrich_candidate(candidate) for candidate in swing_candidates]
+        debug["swing_sl_validation"]["swing_found"] = "YES" if swing_candidates else "NO"
         swing_candidates.sort(
             key=lambda item: (
                 item["age_candles"] is None,
@@ -5263,6 +5325,63 @@ def build_15m_swing_risk_levels(
             debug["reason"] = reason
             debug["reason_if_wait"] = reason
             debug["rejected_swing_candidates"] = rejected_candidates
+            validation = debug["swing_sl_validation"]
+            if not validation.get("failed_validation"):
+                validation["failed_validation"] = reason
+            validation["why_swing_sl_no"] = reason
+
+        def mark_selected_swing(candidate):
+            validation = debug["swing_sl_validation"]
+            validation["swing_found"] = "YES"
+            validation["swing_price"] = round(candidate["price"], decimals)
+            validation["swing_time"] = candidate.get("time")
+            validation["swing_type"] = candidate.get("type")
+            validation["distance_from_entry_to_swing"] = round(
+                abs(entry_price - candidate["price"]),
+                decimals,
+            )
+            validation["failed_validation"] = None
+            validation["why_swing_sl_no"] = None
+
+        def clear_selected_swing_sl():
+            debug["selected_swing_sl"] = None
+            debug["sl_source_swing"] = None
+            debug["selected_swing_time"] = None
+            debug["selected_swing_age_candles"] = None
+            debug["sl_source"] = None
+            debug["sl_reason"] = None
+
+        def find_swing_meta_for_price(swing_type, price):
+            try:
+                price_value = float(price)
+            except (TypeError, ValueError):
+                return {}
+
+            for swing in _swings or []:
+                if not isinstance(swing, dict):
+                    continue
+                if str(swing.get("type") or "").upper() != swing_type:
+                    continue
+                try:
+                    swing_price = float(swing.get("price"))
+                except (TypeError, ValueError):
+                    continue
+                if abs(swing_price - price_value) <= max(pip_size * 0.1, 1e-10):
+                    index_value = normalize_candidate_index(swing)
+                    if index_value is not None and index_value >= len(swing_source):
+                        index_value = len(swing_source) - 1
+                    age = (
+                        max(0, last_swing_position - index_value)
+                        if index_value is not None
+                        else None
+                    )
+                    return {
+                        "index": index_value,
+                        "time": swing.get("time") or candidate_time(swing, index_value),
+                        "age_candles": age,
+                    }
+
+            return {}
 
         def build_target_candidates(target_side):
             target_type = "HIGH" if target_side == "BUY" else "LOW"
@@ -5318,96 +5437,110 @@ def build_15m_swing_risk_levels(
             return valid_targets
 
         if side == "BUY":
-            selected = None
-            for candidate in swing_candidates:
-                if not is_recent_candidate(candidate):
-                    rejected_candidates.append({
-                        **candidate,
-                        "reason": "BUY swing low is too old for structure SL",
-                    })
-                    continue
-
-                stop_loss_candidate = candidate["price"] - buffer
-                if candidate["price"] >= entry_price:
-                    rejected_candidates.append({
-                        **candidate,
-                        "candidate_sl": round(stop_loss_candidate, decimals),
-                        "reason": "BUY swing low is not below entry",
-                    })
-                    continue
-                if stop_loss_candidate >= entry_price:
-                    rejected_candidates.append({
-                        **candidate,
-                        "candidate_sl": round(stop_loss_candidate, decimals),
-                        "reason": "BUY swing SL is too close to entry",
-                    })
-                    continue
-                selected = candidate
-                break
-
+            selected = numeric_candidate(swing_low, "detected_15m_swing_low")
             if selected:
-                swing_low = selected["price"]
-                stop_loss = swing_low - buffer
-                debug["sl_source"] = selected["source"]
-                debug["sl_reason"] = "BUY SL = last valid structure swing low - 5 pips"
-            else:
-                mark_wait("WAIT_VALID_SWING_SL")
-                return debug
+                swing_meta = find_swing_meta_for_price("LOW", selected["price"])
+                selected.update({
+                    "index": swing_meta.get("index"),
+                    "time": swing_meta.get("time"),
+                    "type": "low",
+                    "age_candles": swing_meta.get("age_candles"),
+                })
 
-            if stop_loss >= entry_price:
+            record_rule(
+                "BUY swing_low must exist",
+                selected is not None,
+                None if selected is not None else "BUY swing low missing",
+                selected,
+            )
+
+            if not selected:
+                mark_wait("WAIT_VALID_SWING_SL")
+                return return_with_swing_log()
+
+            mark_selected_swing(selected)
+            swing_low = selected["price"]
+            stop_loss = swing_low - buffer
+            debug["sl_source"] = selected["source"]
+            debug["sl_reason"] = "BUY SL = last valid structure swing low - 5 pips"
+            debug["selected_swing_sl"] = round(swing_low, decimals)
+            debug["sl_source_swing"] = round(swing_low, decimals)
+            debug["selected_swing_time"] = selected.get("time")
+            debug["selected_swing_age_candles"] = selected.get("age_candles")
+
+            final_sl_below_entry = stop_loss < entry_price
+            record_rule(
+                "BUY final buffered SL must be below entry",
+                final_sl_below_entry,
+                None if final_sl_below_entry else "WAIT_BUY_SL_NOT_BELOW_ENTRY",
+                selected,
+            )
+            if not final_sl_below_entry:
+                clear_selected_swing_sl()
                 mark_wait("WAIT_BUY_SL_NOT_BELOW_ENTRY")
-                return debug
+                return return_with_swing_log()
             risk = entry_price - stop_loss
         else:
-            selected = None
-            for candidate in swing_candidates:
-                if not is_recent_candidate(candidate):
-                    rejected_candidates.append({
-                        **candidate,
-                        "reason": "SELL swing high is too old for structure SL",
-                    })
-                    continue
-
-                stop_loss_candidate = candidate["price"] + buffer
-                if candidate["price"] <= entry_price:
-                    rejected_candidates.append({
-                        **candidate,
-                        "candidate_sl": round(stop_loss_candidate, decimals),
-                        "reason": "SELL swing high is not above entry",
-                    })
-                    continue
-                if stop_loss_candidate <= entry_price:
-                    rejected_candidates.append({
-                        **candidate,
-                        "candidate_sl": round(stop_loss_candidate, decimals),
-                        "reason": "SELL swing SL is too close to entry",
-                    })
-                    continue
-                selected = candidate
-                break
-
+            selected = numeric_candidate(swing_high, "detected_15m_swing_high")
             if selected:
-                swing_high = selected["price"]
-                stop_loss = swing_high + buffer
-                debug["sl_source"] = selected["source"]
-                debug["sl_reason"] = "SELL SL = last valid structure swing high + 5 pips"
-            else:
-                mark_wait("WAIT_VALID_SWING_SL")
-                return debug
+                swing_meta = find_swing_meta_for_price("HIGH", selected["price"])
+                selected.update({
+                    "index": swing_meta.get("index"),
+                    "time": swing_meta.get("time"),
+                    "type": "high",
+                    "age_candles": swing_meta.get("age_candles"),
+                })
 
-            if stop_loss <= entry_price:
+            record_rule(
+                "SELL swing_high must exist",
+                selected is not None,
+                None if selected is not None else "SELL swing high missing",
+                selected,
+            )
+
+            if not selected:
+                mark_wait("WAIT_VALID_SWING_SL")
+                return return_with_swing_log()
+
+            mark_selected_swing(selected)
+            swing_high = selected["price"]
+            stop_loss = swing_high + buffer
+            debug["sl_source"] = selected["source"]
+            debug["sl_reason"] = "SELL SL = last valid structure swing high + 5 pips"
+            debug["selected_swing_sl"] = round(swing_high, decimals)
+            debug["sl_source_swing"] = round(swing_high, decimals)
+            debug["selected_swing_time"] = selected.get("time")
+            debug["selected_swing_age_candles"] = selected.get("age_candles")
+
+            final_sl_above_entry = stop_loss > entry_price
+            record_rule(
+                "SELL final buffered SL must be above entry",
+                final_sl_above_entry,
+                None if final_sl_above_entry else "WAIT_SELL_SL_NOT_ABOVE_ENTRY",
+                selected,
+            )
+            if not final_sl_above_entry:
+                clear_selected_swing_sl()
                 mark_wait("WAIT_SELL_SL_NOT_ABOVE_ENTRY")
-                return debug
+                return return_with_swing_log()
             risk = stop_loss - entry_price
 
-        if risk <= 0:
+        positive_risk = risk > 0
+        record_rule(
+            "SL risk distance must be positive",
+            positive_risk,
+            None if positive_risk else "risk distance is not positive",
+            selected,
+        )
+        if not positive_risk:
             debug["rejected_swing_candidates"] = rejected_candidates
-            return debug
+            debug["swing_sl_validation"]["why_swing_sl_no"] = "risk distance is not positive"
+            return return_with_swing_log()
 
         target_candidates = build_target_candidates(side)
         if not target_candidates:
             mark_wait("WAIT_VALID_STRUCTURE_TP")
-            return debug
+            return return_with_swing_log()
 
         structure_target = target_candidates[0]
         structure_reward = abs(structure_target["price"] - entry_price)
@@ -5432,7 +5565,7 @@ def build_15m_swing_risk_levels(
                 f"{round(minimum_reward, decimals)} (1.2R)."
             )
             print(debug["rejection_reason"])
-            return debug
+            return return_with_swing_log()
 
         target_reward = min(structure_reward, maximum_reward)
         if side == "BUY":
@@ -5446,7 +5579,8 @@ def build_15m_swing_risk_levels(
 
         if rr + 0.01 < 1.2 or rr - 0.01 > 2.0:
             debug["reason"] = "WAIT_RR_OUTSIDE_1_2_TO_2"
-            return debug
+            debug["swing_sl_validation"]["why_swing_sl_no"] = "TP reward ratio outside 1.2R-2R window"
+            return return_with_swing_log()
 
         levels = {
             "ok": True,
@@ -5500,8 +5634,10 @@ def build_15m_swing_risk_levels(
         debug.update(levels)
     except Exception as exc:
         debug["reason"] = f"WAIT_INVALID_SWING_SL: {exc}"
+        debug["swing_sl_validation"]["failed_validation"] = debug["reason"]
+        debug["swing_sl_validation"]["why_swing_sl_no"] = debug["reason"]
 
-    return debug
+    return return_with_swing_log()
 
 def validate_trade_levels_1_to_2(result, side):
     side = str(side or "").upper()
