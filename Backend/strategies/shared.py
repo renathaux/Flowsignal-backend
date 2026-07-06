@@ -5083,6 +5083,16 @@ def build_15m_swing_risk_levels(
         "risk": None,
         "reward": None,
         "risk_reward": None,
+        "risk_reward_ratio": None,
+        "risk_dollars": None,
+        "structure_reward_dollars": None,
+        "minimum_required_reward": None,
+        "maximum_allowed_reward": None,
+        "minimum_reward_ratio": 1.2,
+        "maximum_reward_ratio": 2.0,
+        "sl_swing_used": None,
+        "tp_structure_used": None,
+        "tp_structure_source": None,
         "swing_low": None,
         "swing_high": None,
         "sl_buffer": round(buffer, decimals),
@@ -5254,6 +5264,59 @@ def build_15m_swing_risk_levels(
             debug["reason_if_wait"] = reason
             debug["rejected_swing_candidates"] = rejected_candidates
 
+        def build_target_candidates(target_side):
+            target_type = "HIGH" if target_side == "BUY" else "LOW"
+            target_source = (
+                "detected_15m_swing_high"
+                if target_side == "BUY"
+                else "detected_15m_swing_low"
+            )
+            targets = []
+
+            for swing in _swings or []:
+                if not isinstance(swing, dict):
+                    continue
+                swing_type = str(swing.get("type") or "").upper()
+                if swing_type != target_type:
+                    continue
+                candidate = numeric_candidate(swing.get("price"), target_source)
+                if candidate:
+                    candidate["index"] = swing.get("index")
+                    candidate["time"] = swing.get("time")
+                    targets.append(candidate)
+
+            fallback_value = swing_high if target_side == "BUY" else swing_low
+            candidate = numeric_candidate(fallback_value, target_source)
+            if candidate:
+                candidate["index"] = None
+                candidate["time"] = None
+                targets.append(candidate)
+
+            seen_targets = set()
+            deduped_targets = []
+            for candidate in targets:
+                key = round(candidate["price"], decimals)
+                if key in seen_targets:
+                    continue
+                seen_targets.add(key)
+                deduped_targets.append(candidate)
+
+            enriched_targets = [enrich_candidate(candidate) for candidate in deduped_targets]
+            if target_side == "BUY":
+                valid_targets = [
+                    candidate for candidate in enriched_targets
+                    if candidate["price"] > entry_price
+                ]
+                valid_targets.sort(key=lambda item: item["price"])
+            else:
+                valid_targets = [
+                    candidate for candidate in enriched_targets
+                    if candidate["price"] < entry_price
+                ]
+                valid_targets.sort(key=lambda item: item["price"], reverse=True)
+
+            return valid_targets
+
         if side == "BUY":
             selected = None
             for candidate in swing_candidates:
@@ -5295,7 +5358,6 @@ def build_15m_swing_risk_levels(
                 mark_wait("WAIT_BUY_SL_NOT_BELOW_ENTRY")
                 return debug
             risk = entry_price - stop_loss
-            tp2 = entry_price + (risk * 2.0)
         else:
             selected = None
             for candidate in swing_candidates:
@@ -5337,18 +5399,53 @@ def build_15m_swing_risk_levels(
                 mark_wait("WAIT_SELL_SL_NOT_ABOVE_ENTRY")
                 return debug
             risk = stop_loss - entry_price
-            tp2 = entry_price - (risk * 2.0)
 
         if risk <= 0:
             debug["rejected_swing_candidates"] = rejected_candidates
             return debug
 
+        target_candidates = build_target_candidates(side)
+        if not target_candidates:
+            mark_wait("WAIT_VALID_STRUCTURE_TP")
+            return debug
+
+        structure_target = target_candidates[0]
+        structure_reward = abs(structure_target["price"] - entry_price)
+        minimum_reward = risk * 1.2
+        maximum_reward = risk * 2.0
+        structure_rr = structure_reward / risk if risk > 0 else 0
+        debug.update({
+            "risk_reward_ratio": round(structure_rr, 4),
+            "minimum_required_reward": round(minimum_reward, decimals),
+            "maximum_allowed_reward": round(maximum_reward, decimals),
+            "sl_swing_used": round(swing_low if side == "BUY" else swing_high, decimals),
+            "tp_structure_used": round(structure_target["price"], decimals),
+            "tp_structure_source": structure_target.get("source"),
+        })
+
+        if structure_reward + (pip_size * 0.1) < minimum_reward:
+            debug["reason"] = "WAIT_STRUCTURE_REWARD_BELOW_MINIMUM"
+            debug["reason_if_wait"] = "WAIT_STRUCTURE_REWARD_BELOW_MINIMUM"
+            debug["rejection_reason"] = (
+                f"Rejected {normalized_symbol} {side}: structure reward "
+                f"{round(structure_reward, decimals)} is below minimum "
+                f"{round(minimum_reward, decimals)} (1.2R)."
+            )
+            print(debug["rejection_reason"])
+            return debug
+
+        target_reward = min(structure_reward, maximum_reward)
+        if side == "BUY":
+            tp2 = entry_price + target_reward
+        else:
+            tp2 = entry_price - target_reward
+
         tp1 = calculate_tp1_from_tp2_price(entry_price, tp2, side)
         reward = abs(tp2 - entry_price)
         rr = reward / risk
 
-        if abs(rr - 2.0) > 0.01:
-            debug["reason"] = "WAIT_RR_NOT_1_TO_2"
+        if rr + 0.01 < 1.2 or rr - 0.01 > 2.0:
+            debug["reason"] = "WAIT_RR_OUTSIDE_1_2_TO_2"
             return debug
 
         levels = {
@@ -5360,7 +5457,21 @@ def build_15m_swing_risk_levels(
             "tp2": round(tp2, decimals),
             "risk": round(risk, decimals),
             "reward": round(reward, decimals),
-            "risk_reward": "1:2",
+            "risk_reward": f"1:{round(rr, 2):g}",
+            "risk_reward_ratio": round(rr, 4),
+            "minimum_required_reward": round(minimum_reward, decimals),
+            "maximum_allowed_reward": round(maximum_reward, decimals),
+            "sl_swing_used": round(
+                swing_low if side == "BUY" else swing_high,
+                decimals,
+            ),
+            "tp_structure_used": round(structure_target["price"], decimals),
+            "tp_structure_source": structure_target.get("source"),
+            "tp_structure_time": structure_target.get("time"),
+            "tp_structure_age_candles": structure_target.get("age_candles"),
+            "structure_reward": round(structure_reward, decimals),
+            "structure_reward_ratio": round(structure_rr, 4),
+            "tp_capped_at_2r": structure_reward > maximum_reward,
             "level_source": debug.get("sl_source"),
             "selected_swing_sl": round(
                 swing_low if side == "BUY" else swing_high,
@@ -5429,8 +5540,12 @@ def validate_trade_levels_1_to_2(result, side):
     if abs(tp1 - expected_tp1) > tp1_rounding_tolerance:
         return False, "WAIT_TP_LEVELS_MISSING"
 
-    if abs((reward / risk) - 2.0) > 0.01:
-        return False, "WAIT_RR_NOT_1_TO_2"
+    rr = reward / risk
+    if rr + 0.01 < 1.2:
+        return False, "WAIT_STRUCTURE_REWARD_BELOW_MINIMUM"
+
+    if rr - 0.01 > 2.0:
+        return False, "WAIT_RR_ABOVE_2R"
 
     return True, None
 
@@ -8584,7 +8699,17 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
                 current_result_signal,
             )
         else:
-            result["risk_reward"] = "1:2"
+            try:
+                entry_value = float(result.get("entry_price"))
+                sl_value = float(result.get("stop_loss"))
+                tp_value = float(result.get("tp2"))
+                risk_value = abs(entry_value - sl_value)
+                reward_value = abs(tp_value - entry_value)
+                rr_value = reward_value / risk_value if risk_value > 0 else 0
+                result["risk_reward"] = f"1:{round(rr_value, 2):g}"
+                result["risk_reward_ratio"] = round(rr_value, 4)
+            except (TypeError, ValueError):
+                result["risk_reward"] = result.get("risk_reward") or "1:1.2-2"
             result["risk_percent"] = 0.5
             result["target_percent"] = 1.0
 

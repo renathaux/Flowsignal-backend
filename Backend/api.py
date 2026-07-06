@@ -31,6 +31,7 @@ from ctrader_connector import (
     get_closed_deals_for_current_week,
     get_closed_deals_for_current_month,
     get_ctrader_diagnostics,
+    get_ctrader_account_selection_debug,
     get_ctrader_redirect_uri_debug,
     get_ctrader_refresh_token_status,
     get_live_prices,
@@ -956,6 +957,7 @@ LIVE_POSITION_SYNC_STATUS = {
 def ctrader_status():
     account_state = sync_ctrader_account_state(force=False)
     refresh_token_status = get_ctrader_refresh_token_status()
+    selection_debug = get_ctrader_account_selection_debug()
     connected = bool(account_state.get("connected"))
     positions = []
     last_error = LIVE_POSITION_SYNC_STATUS.get("last_error")
@@ -995,6 +997,23 @@ def ctrader_status():
         "refresh_token_loaded": bool(refresh_token_status.get("has_refresh_token")),
         "reason": reason,
         "account_id": account_state.get("account_id"),
+        "active_account_id": (
+            account_state.get("active_account_id")
+            or selection_debug.get("active_account_id")
+        ),
+        "authorized_account_ids": (
+            account_state.get("authorized_account_ids")
+            or selection_debug.get("authorized_account_ids")
+            or []
+        ),
+        "selected_account_source": (
+            account_state.get("selected_account_source")
+            or selection_debug.get("selected_account_source")
+        ),
+        "is_active_account_authorized": bool(
+            account_state.get("is_active_account_authorized")
+            or selection_debug.get("is_active_account_authorized")
+        ),
         "live_positions_count": len(positions or []),
         "last_success": format_status_time(
             LIVE_POSITION_SYNC_STATUS.get("last_success")
@@ -3763,6 +3782,20 @@ def sync_ctrader_account_state(force=False):
     LIVE_ACCOUNT_STATE["last_success_at"] = connector_state.get(
         "last_success_at"
     )
+    LIVE_ACCOUNT_STATE["active_account_id"] = connector_state.get(
+        "active_account_id"
+    )
+    LIVE_ACCOUNT_STATE["authorized_account_ids"] = connector_state.get(
+        "authorized_account_ids",
+        [],
+    )
+    LIVE_ACCOUNT_STATE["selected_account_source"] = connector_state.get(
+        "selected_account_source"
+    )
+    LIVE_ACCOUNT_STATE["is_active_account_authorized"] = connector_state.get(
+        "is_active_account_authorized",
+        False,
+    )
 
     return LIVE_ACCOUNT_STATE
 
@@ -5697,6 +5730,73 @@ def prepare_ctrader_trade(payload, volume=0.01):
 
     return normalized
 
+def log_structure_tp_trade_audit(symbol, side, trade_payload, risk_size, plan=None):
+    plan = plan or {}
+    trade_payload = trade_payload or {}
+    risk_size = risk_size or {}
+    symbol = normalize_symbol(symbol)
+    side = str(side or "").upper()
+
+    try:
+        entry = float(trade_payload.get("entry"))
+        sl = float(trade_payload.get("sl"))
+        tp = float(trade_payload.get("tp2"))
+        risk_amount = float(risk_size.get("risk_amount"))
+    except (TypeError, ValueError):
+        print("STRUCTURE_TP_TRADE_AUDIT:", {
+            "symbol": symbol,
+            "direction": side,
+            "reason": "missing level or risk amount for TP audit",
+            "entry": trade_payload.get("entry"),
+            "sl": trade_payload.get("sl"),
+            "tp": trade_payload.get("tp2"),
+            "risk_amount": risk_size.get("risk_amount"),
+        })
+        return
+
+    price_risk = abs(entry - sl)
+    price_reward = abs(tp - entry)
+    rr = price_reward / price_risk if price_risk > 0 else 0
+
+    try:
+        structure_rr = float(
+            plan.get("structure_reward_ratio")
+            or plan.get("risk_reward_ratio")
+            or rr
+        )
+    except (TypeError, ValueError):
+        structure_rr = rr
+
+    structure_reward_dollars = risk_amount * structure_rr
+    minimum_reward_dollars = risk_amount * 1.2
+    maximum_reward_dollars = risk_amount * 2.0
+
+    print("STRUCTURE_TP_TRADE_AUDIT:", {
+        "symbol": symbol,
+        "direction": side,
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "risk_dollars": round(risk_amount, 2),
+        "structure_reward_dollars": round(structure_reward_dollars, 2),
+        "reward_risk_ratio": round(rr, 4),
+        "structure_reward_risk_ratio": round(structure_rr, 4),
+        "minimum_required_reward": round(minimum_reward_dollars, 2),
+        "maximum_allowed_reward": round(maximum_reward_dollars, 2),
+        "sl_swing_used": (
+            plan.get("sl_swing_used")
+            or plan.get("sl_source_swing")
+            or plan.get("selected_swing_sl")
+        ),
+        "tp_structure_used": (
+            plan.get("tp_structure_used")
+            or plan.get("structure_resistance")
+            or plan.get("structure_support")
+        ),
+        "tp_structure_source": plan.get("tp_structure_source"),
+        "tp_capped_at_2r": plan.get("tp_capped_at_2r"),
+    })
+
 def is_dev_request(request: Request):
     host = request.client.host if request.client else ""
     forwarded = request.headers.get("x-forwarded-for", "")
@@ -7307,6 +7407,7 @@ def execute_live_order_core(payload: dict, source="manual"):
         "account_equity_used": risk_size.get("account_equity_used"),
         "risk": risk_size,
     })
+    log_structure_tp_trade_audit(symbol, side, trade_payload, risk_size, plan)
     log_xauusd_live_risk_diagnostics(symbol, trade_payload, risk_size)
     log_live_xauusd_execution_debug(
         symbol,
