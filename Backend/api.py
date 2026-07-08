@@ -272,6 +272,11 @@ PANEL_REFRESH_STUCK_SECONDS = 45
 ADMIN_TOKEN = "N2415"
 FEEDBACK_EMAIL = "flowsignal.contact@gmail.com"
 FEEDBACK_APP_PASSWORD = "wwro vjjg grzt vpcp"
+SIGNAL_EMAIL_LAST_SIGNAL = {
+    "EURUSD": "WAIT",
+    "XAUUSD": "WAIT",
+}
+SIGNAL_EMAIL_LOCK = threading.Lock()
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 VISITS_FILE = os.path.join(DATA_DIR, "visits.json")
 SESSIONS = {}
@@ -396,6 +401,149 @@ def _is_startup_panel_payload(data):
         for symbol in ["EURUSD", "XAUUSD"]
     )
 
+
+def signal_email_alerts_enabled():
+    return str(
+        os.getenv("SIGNAL_EMAIL_ALERTS_ENABLED", "false")
+    ).strip().lower() in ["1", "true", "yes", "on"]
+
+
+def get_signal_alert_email_to():
+    return (
+        os.getenv("SIGNAL_ALERT_EMAIL_TO", "").strip()
+        or FEEDBACK_EMAIL
+    )
+
+
+def get_plan_value(plan, *keys, default="--"):
+    if not isinstance(plan, dict):
+        return default
+
+    for key in keys:
+        value = plan.get(key)
+        if value not in [None, "", "--"]:
+            return value
+
+    return default
+
+
+def get_signal_news_status(symbol):
+    try:
+        news = get_news_impact(symbol)
+        if not isinstance(news, dict):
+            return "--"
+
+        status = (
+            news.get("status")
+            or news.get("decision")
+            or news.get("news_bias")
+            or news.get("bias")
+            or "--"
+        )
+        event = (
+            news.get("event_name")
+            or news.get("next_event")
+            or news.get("event")
+            or news.get("news_event")
+        )
+
+        if event and status and status != "--":
+            return f"{event} - {status}"
+
+        return status or "--"
+    except Exception as exc:
+        print("SIGNAL_EMAIL_NEWS_STATUS_ERROR =", {
+            "symbol": normalize_symbol(symbol),
+            "error": str(exc),
+        })
+        return "--"
+
+
+def build_signal_alert_email_body(symbol, signal, plan, generated_at=None):
+    generated_at = generated_at or datetime.now(timezone.utc)
+    if isinstance(generated_at, datetime):
+        generated_at = generated_at.isoformat()
+
+    return f"""
+FlowSignal New Signal Alert
+
+Symbol: {normalize_symbol(symbol)}
+Signal direction: {signal}
+Entry price: {get_plan_value(plan, "entry_price", "entry", "price")}
+Stop Loss: {get_plan_value(plan, "stop_loss", "sl")}
+TP1: {get_plan_value(plan, "tp1")}
+TP2: {get_plan_value(plan, "tp2")}
+Risk %: {get_plan_value(plan, "final_risk_percent", "risk_percent", "allowed_risk_percent")}
+Risk dollars: {get_plan_value(plan, "risk_dollars", "risk_amount", "risk_usd")}
+Bias strength: {get_plan_value(plan, "bias_strength", "confidence", "directional_bias_strength")}
+Main reason: {get_plan_value(plan, "blocked_reason", "plan_reason", "reason", "entry_timing")}
+Time generated: {generated_at}
+News status: {get_signal_news_status(symbol)}
+""".strip()
+
+
+def send_signal_alert_email(symbol, signal, plan):
+    normalized_symbol = normalize_symbol(symbol)
+    recipient = get_signal_alert_email_to()
+    subject = f"FlowSignal Alert: {normalized_symbol} {signal}"
+    body = build_signal_alert_email_body(normalized_symbol, signal, plan)
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = FEEDBACK_EMAIL
+    msg["To"] = recipient
+
+    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+        server.starttls()
+        server.login(FEEDBACK_EMAIL, FEEDBACK_APP_PASSWORD)
+        server.send_message(msg)
+
+    print("SIGNAL_EMAIL_SENT =", {
+        "symbol": normalized_symbol,
+        "signal": signal,
+        "to": recipient,
+        "subject": subject,
+    })
+
+
+def process_signal_email_alerts(panel_data):
+    if not signal_email_alerts_enabled():
+        return
+
+    if not isinstance(panel_data, dict):
+        return
+
+    with SIGNAL_EMAIL_LOCK:
+        for symbol in ["EURUSD", "XAUUSD"]:
+            plan = panel_data.get(symbol)
+            if not isinstance(plan, dict):
+                continue
+
+            signal = str(plan.get("signal") or "WAIT").upper()
+            if signal not in ["BUY", "SELL"]:
+                SIGNAL_EMAIL_LAST_SIGNAL[symbol] = "WAIT"
+                continue
+
+            previous_signal = SIGNAL_EMAIL_LAST_SIGNAL.get(symbol, "WAIT")
+            if previous_signal == signal:
+                print("SIGNAL_EMAIL_SKIPPED_DUPLICATE =", {
+                    "symbol": symbol,
+                    "signal": signal,
+                })
+                continue
+
+            try:
+                send_signal_alert_email(symbol, signal, plan)
+            except Exception as exc:
+                print("SIGNAL_EMAIL_FAILED =", {
+                    "symbol": symbol,
+                    "signal": signal,
+                    "error": str(exc),
+                })
+            finally:
+                SIGNAL_EMAIL_LAST_SIGNAL[symbol] = signal
+
+
 def update_panel_cache(data, source):
     validity = _panel_cache_validity(data)
     if not validity["valid"]:
@@ -416,6 +564,7 @@ def update_panel_cache(data, source):
         "xauusd_signal": (data.get("XAUUSD") or {}).get("signal"),
         "candle_counts": validity["candle_counts"],
     })
+    process_signal_email_alerts(data)
     return updated_at
 
 def calculate_fresh_panel_data(reason, force_refresh=False):

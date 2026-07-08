@@ -43,6 +43,7 @@ FINAL_SIGNAL_HOLD_MAX_SETUP_CANDLES = 3
 FINAL_SIGNAL_HOLD_STALE_5M_CANDLES = 2
 FINAL_SIGNAL_HOLD_MAX_TP1_PROGRESS = 0.60
 FIFTEEN_M_PENDING_MAX_5M_CANDLES = 3
+XAUUSD_FIFTEEN_M_PENDING_MAX_5M_CANDLES = 5
 MIN_LIVE_FRESHNESS_SCORE = 70
 
 # =========================
@@ -73,6 +74,20 @@ def get_pair_strategy_rule(symbol, name, default=None):
         name,
         default,
     )
+
+
+def get_15m_actionable_swing_atr_limit(symbol):
+    normalized_symbol = normalize_symbol(symbol)
+    if normalized_symbol == "XAUUSD":
+        return 3.0
+    return 2.5
+
+
+def get_15m_pending_max_5m_candles(symbol):
+    normalized_symbol = normalize_symbol(symbol)
+    if normalized_symbol == "XAUUSD":
+        return XAUUSD_FIFTEEN_M_PENDING_MAX_5M_CANDLES
+    return FIFTEEN_M_PENDING_MAX_5M_CANDLES
 
 
 def call_pair_strategy_hook(symbol, name, *args, **kwargs):
@@ -1174,6 +1189,244 @@ def detect_swing_liquidity(data):
         swing_points[-12:]
     )
 
+def calculate_atr_values(data, period=14):
+    if data is None or len(data) == 0:
+        return pd.Series(dtype=float)
+
+    high = data["High"].astype(float)
+    low = data["Low"].astype(float)
+    close = data["Close"].astype(float)
+    previous_close = close.shift(1)
+    true_range = pd.concat([
+        (high - low).abs(),
+        (high - previous_close).abs(),
+        (low - previous_close).abs(),
+    ], axis=1).max(axis=1)
+    return true_range.rolling(period, min_periods=1).mean()
+
+def get_actionable_15m_swing_level(
+    closed_data_15m,
+    side,
+    symbol=None,
+    reference_price=None,
+):
+    side = str(side or "").upper()
+    normalized_symbol = normalize_symbol(symbol) if symbol else "UNKNOWN"
+    debug = {
+        "symbol": normalized_symbol,
+        "side": side,
+        "reference_price": reference_price,
+        "atr": None,
+        "selected": None,
+        "candidates": [],
+        "rejected": [],
+        "reason": None,
+    }
+
+    if side not in ["BUY", "SELL"]:
+        debug["reason"] = "No actionable 15m side"
+        return None, debug
+
+    if closed_data_15m is None or len(closed_data_15m) < 10:
+        debug["reason"] = "Not enough closed 15m candles"
+        return None, debug
+
+    try:
+        data = closed_data_15m.copy()
+        if reference_price is None:
+            reference_price = float(data["Close"].iloc[-1])
+        else:
+            reference_price = float(reference_price)
+        debug["reference_price"] = reference_price
+
+        atr_values = calculate_atr_values(data)
+        current_atr = float(atr_values.iloc[-1]) if len(atr_values) else 0.0
+        debug["atr"] = current_atr
+        if current_atr <= 0:
+            debug["reason"] = "15m ATR unavailable"
+            return None, debug
+
+        recent_limit = 50
+        atr_limit = get_15m_actionable_swing_atr_limit(normalized_symbol)
+        max_distance = current_atr * atr_limit
+        close_tie_distance = current_atr * 0.25
+        point_tolerance = max(
+            get_strategy_pip_size(normalized_symbol) or 0.0001,
+            1e-10,
+        )
+        debug["atr_limit"] = atr_limit
+
+        candidates = []
+
+        for i in range(2, len(data) - 2):
+            high_value = float(data["High"].iloc[i])
+            low_value = float(data["Low"].iloc[i])
+            swing_type = None
+            level = None
+
+            if side == "BUY":
+                if (
+                    high_value > float(data["High"].iloc[i - 1])
+                    and high_value > float(data["High"].iloc[i - 2])
+                    and high_value > float(data["High"].iloc[i + 1])
+                    and high_value > float(data["High"].iloc[i + 2])
+                ):
+                    swing_type = "HIGH"
+                    level = high_value
+            else:
+                if (
+                    low_value < float(data["Low"].iloc[i - 1])
+                    and low_value < float(data["Low"].iloc[i - 2])
+                    and low_value < float(data["Low"].iloc[i + 1])
+                    and low_value < float(data["Low"].iloc[i + 2])
+                ):
+                    swing_type = "LOW"
+                    level = low_value
+
+            if level is None:
+                continue
+
+            swing_atr = float(atr_values.iloc[i]) if len(atr_values) > i else current_atr
+            candle_range = high_value - low_value
+            following = data.iloc[i + 1:min(len(data), i + 7)]
+            if side == "BUY":
+                pullback = (
+                    max(0.0, level - float(following["Low"].min()))
+                    if len(following)
+                    else 0.0
+                )
+                correct_side = level > reference_price
+            else:
+                pullback = (
+                    max(0.0, float(following["High"].max()) - level)
+                    if len(following)
+                    else 0.0
+                )
+                correct_side = level < reference_price
+
+            distance = abs(level - reference_price)
+            age_candles = len(data) - 1 - i
+            meaningful_by_range = swing_atr > 0 and candle_range >= swing_atr * 0.8
+            meaningful_by_rejection = swing_atr > 0 and pullback >= swing_atr * 0.5
+            recent = age_candles <= recent_limit
+            reasons = []
+
+            if not correct_side:
+                reasons.append("wrong side of reference price")
+            if distance > max_distance:
+                reasons.append(f"distance > {atr_limit:g}x 15m ATR")
+            if not (meaningful_by_range or meaningful_by_rejection):
+                reasons.append("noise: range <0.8x ATR and rejection <0.5x ATR")
+
+            range_score = min(2.0, candle_range / swing_atr) if swing_atr > 0 else 0
+            rejection_score = min(2.0, pullback / swing_atr) if swing_atr > 0 else 0
+            recency_score = max(0.0, 1.0 - (age_candles / recent_limit))
+            actionability_score = (
+                max(0.0, atr_limit - (distance / current_atr)) / atr_limit
+            )
+            strength_score = (
+                range_score * 35
+                + rejection_score * 35
+                + recency_score * 20
+                + actionability_score * 10
+            )
+            candidate = {
+                "type": swing_type,
+                "price": level,
+                "time": pd.Timestamp(data.index[i]).isoformat(),
+                "index": int(i),
+                "age_candles": int(age_candles),
+                "recent": bool(recent),
+                "distance": distance,
+                "distance_pips": (
+                    distance / point_tolerance if point_tolerance else None
+                ),
+                "atr_multiple": distance / current_atr if current_atr else None,
+                "candle_range": candle_range,
+                "range_atr": candle_range / swing_atr if swing_atr else None,
+                "post_swing_rejection": pullback,
+                "rejection_atr": pullback / swing_atr if swing_atr else None,
+                "strength_score": round(strength_score, 2),
+                "rejected_reasons": list(reasons),
+            }
+            candidates.append(candidate)
+
+        valid_recent = [
+            candidate for candidate in candidates
+            if not candidate["rejected_reasons"] and candidate["recent"]
+        ]
+        valid_older = [
+            candidate for candidate in candidates
+            if not candidate["rejected_reasons"] and not candidate["recent"]
+        ]
+        selection_pool = valid_recent or valid_older
+
+        def candidate_summary(candidate):
+            return {
+                **candidate,
+                "price": round(candidate["price"], get_strategy_decimals(normalized_symbol) or 5),
+                "distance": round(candidate["distance"], get_strategy_decimals(normalized_symbol) or 5),
+                "distance_pips": (
+                    round(candidate["distance_pips"], 2)
+                    if candidate.get("distance_pips") is not None
+                    else None
+                ),
+                "atr_multiple": (
+                    round(candidate["atr_multiple"], 4)
+                    if candidate.get("atr_multiple") is not None
+                    else None
+                ),
+                "candle_range": round(candidate["candle_range"], get_strategy_decimals(normalized_symbol) or 5),
+                "range_atr": (
+                    round(candidate["range_atr"], 4)
+                    if candidate.get("range_atr") is not None
+                    else None
+                ),
+                "post_swing_rejection": round(candidate["post_swing_rejection"], get_strategy_decimals(normalized_symbol) or 5),
+                "rejection_atr": (
+                    round(candidate["rejection_atr"], 4)
+                    if candidate.get("rejection_atr") is not None
+                    else None
+                ),
+            }
+
+        debug["candidates"] = [
+            candidate_summary(candidate)
+            for candidate in sorted(candidates, key=lambda item: item["distance"])[:24]
+        ]
+        debug["rejected"] = [
+            candidate_summary(candidate)
+            for candidate in candidates
+            if candidate["rejected_reasons"]
+        ][-24:]
+
+        if not selection_pool:
+            debug["reason"] = "No actionable 15m swing level within ATR range"
+            print("ACTIONABLE_15M_SWING_SELECTION_DEBUG =", debug)
+            return None, debug
+
+        nearest_distance = min(candidate["distance"] for candidate in selection_pool)
+        close_candidates = [
+            candidate for candidate in selection_pool
+            if candidate["distance"] <= nearest_distance + close_tie_distance
+        ]
+        selected = sorted(
+            close_candidates,
+            key=lambda item: (
+                item["age_candles"],
+                -item["strength_score"],
+                item["distance"],
+            ),
+        )[0]
+        debug["selected"] = candidate_summary(selected)
+        debug["reason"] = "selected actionable 15m swing"
+        print("ACTIONABLE_15M_SWING_SELECTION_DEBUG =", debug)
+        return float(selected["price"]), debug
+    except Exception as exc:
+        debug["reason"] = f"actionable 15m swing selection unavailable: {exc}"
+        print("ACTIONABLE_15M_SWING_SELECTION_DEBUG =", debug)
+        return None, debug
+
 def detect_equal_levels(data, tolerance):
 
     highs = data["High"].tolist()
@@ -2255,6 +2508,7 @@ def evaluate_entry_freshness(
         "freshness_max_distance_pips",
     )
     setup_age_candles = get_five_minute_candle_age(bos_time, current_candle_time)
+    max_setup_age_candles = get_15m_pending_max_5m_candles(normalized_symbol)
     confirmation_age_candles = get_five_minute_candle_age(
         confirmation_time,
         current_candle_time,
@@ -2294,7 +2548,7 @@ def evaluate_entry_freshness(
         score -= 20
         hard_expired = True
         reasons.append("15m BOS/CHOCH time unavailable")
-    elif setup_age_candles > FIFTEEN_M_PENDING_MAX_5M_CANDLES:
+    elif setup_age_candles > max_setup_age_candles:
         score -= 45
         hard_expired = True
         reasons.append("15m close confirmation is stale")
@@ -2328,6 +2582,7 @@ def evaluate_entry_freshness(
         "fresh": fresh,
         "expired": not fresh,
         "setup_age_candles": setup_age_candles,
+        "max_setup_age_candles": max_setup_age_candles,
         "confirmation_age_candles": confirmation_age_candles,
         "distance_from_bos_pips": (
             round(distance_from_bos_pips, 1)
@@ -5030,7 +5285,7 @@ def remove_current_forming_candle(data, timeframe_minutes):
 def calculate_tp1_from_tp2_price(entry, tp2, side):
     entry_value = float(entry)
     tp2_value = float(tp2)
-    tp1_ratio = get_tp1_ratio_of_tp2()
+    tp1_ratio = 0.80
 
     if str(side or "").upper() == "BUY":
         return entry_value + ((tp2_value - entry_value) * tp1_ratio)
@@ -5108,6 +5363,11 @@ def build_15m_swing_risk_levels(
         "sl_source": None,
         "sl_distance": None,
         "sl_distance_pips": None,
+        "sl_candles_searched": None,
+        "sl_swing_candidates_found": 0,
+        "sl_chosen_swing": None,
+        "sl_failure_reason": None,
+        "rejected_tp_candidates": [],
         "broker_min_distance": broker_min_distance,
         "rejected_swing_candidates": [],
         "swing_sl_validation": {
@@ -5124,6 +5384,24 @@ def build_15m_swing_risk_levels(
         "final_tp1": None,
         "final_tp2": None,
     }
+    rejected_candidates = []
+
+    def log_sl_selection():
+        print("SWING_SL_SELECTION_DEBUG =", {
+            "symbol": normalized_symbol,
+            "direction": side,
+            "entry": entry,
+            "candles_searched": debug.get("sl_candles_searched"),
+            "swing_candidates_found": debug.get("sl_swing_candidates_found"),
+            "chosen_swing": debug.get("sl_chosen_swing"),
+            "sl_price": debug.get("final_sl") or debug.get("stop_loss"),
+            "sl_distance_pips": debug.get("sl_distance_pips"),
+            "failure_reason": None if debug.get("ok") else (
+                debug.get("sl_failure_reason")
+                or debug.get("reason")
+                or debug.get("reason_if_wait")
+            ),
+        })
 
     def log_swing_sl_validation():
         validation = debug.get("swing_sl_validation") or {}
@@ -5149,6 +5427,8 @@ def build_15m_swing_risk_levels(
         })
 
     def return_with_swing_log():
+        debug["rejected_swing_candidates"] = rejected_candidates
+        log_sl_selection()
         log_swing_sl_validation()
         return debug
 
@@ -5202,6 +5482,7 @@ def build_15m_swing_risk_levels(
         debug["swing_high"] = swing_high
         rejected_candidates = []
         last_swing_position = len(swing_source) - 1
+        debug["sl_candles_searched"] = len(swing_source)
 
         def record_rule(name, passed, reason=None, candidate=None):
             rule = {
@@ -5310,6 +5591,7 @@ def build_15m_swing_risk_levels(
 
         swing_candidates = [enrich_candidate(candidate) for candidate in swing_candidates]
         debug["swing_sl_validation"]["swing_found"] = "YES" if swing_candidates else "NO"
+        debug["sl_swing_candidates_found"] = len(swing_candidates)
         swing_candidates.sort(
             key=lambda item: (
                 item["age_candles"] is None,
@@ -5317,14 +5599,11 @@ def build_15m_swing_risk_levels(
             )
         )
 
-        def is_recent_candidate(candidate):
-            age = candidate.get("age_candles")
-            return age is None or age <= max_swing_age_candles
-
         def mark_wait(reason):
             debug["reason"] = reason
             debug["reason_if_wait"] = reason
             debug["rejected_swing_candidates"] = rejected_candidates
+            debug["sl_failure_reason"] = reason
             validation = debug["swing_sl_validation"]
             if not validation.get("failed_validation"):
                 validation["failed_validation"] = reason
@@ -5342,6 +5621,13 @@ def build_15m_swing_risk_levels(
             )
             validation["failed_validation"] = None
             validation["why_swing_sl_no"] = None
+            debug["sl_chosen_swing"] = {
+                "price": round(candidate["price"], decimals),
+                "time": candidate.get("time"),
+                "type": candidate.get("type"),
+                "source": candidate.get("source"),
+                "age_candles": candidate.get("age_candles"),
+            }
 
         def clear_selected_swing_sl():
             debug["selected_swing_sl"] = None
@@ -5350,6 +5636,7 @@ def build_15m_swing_risk_levels(
             debug["selected_swing_age_candles"] = None
             debug["sl_source"] = None
             debug["sl_reason"] = None
+            debug["sl_chosen_swing"] = None
 
         def find_swing_meta_for_price(swing_type, price):
             try:
@@ -5382,6 +5669,72 @@ def build_15m_swing_risk_levels(
                     }
 
             return {}
+
+        def add_rejected_candidate(candidate, reason):
+            rejected_candidates.append({
+                "price": (
+                    round(candidate.get("price"), decimals)
+                    if candidate and candidate.get("price") is not None
+                    else None
+                ),
+                "time": candidate.get("time") if candidate else None,
+                "type": candidate.get("type") if candidate else None,
+                "source": candidate.get("source") if candidate else None,
+                "age_candles": candidate.get("age_candles") if candidate else None,
+                "reason": reason,
+            })
+
+        def candidate_stop_loss(candidate, candidate_side):
+            if candidate_side == "BUY":
+                return candidate["price"] - buffer
+            return candidate["price"] + buffer
+
+        def final_sl_valid(candidate, candidate_side):
+            stop = candidate_stop_loss(candidate, candidate_side)
+            distance = abs(stop - entry_price)
+            min_distance = None
+            try:
+                min_distance = float(broker_min_distance)
+            except (TypeError, ValueError):
+                min_distance = None
+
+            if candidate_side == "BUY":
+                side_valid = stop < entry_price
+            else:
+                side_valid = stop > entry_price
+
+            if not side_valid:
+                return False, stop, (
+                    "BUY buffered SL is not below entry"
+                    if candidate_side == "BUY"
+                    else "SELL buffered SL is not above entry"
+                )
+
+            if min_distance is not None and distance < min_distance:
+                return False, stop, (
+                    f"SL distance {round(distance, decimals)} is below "
+                    f"minimum {round(min_distance, decimals)}"
+                )
+
+            return True, stop, None
+
+        def select_sl_candidate(candidate_side):
+            required_type = "low" if candidate_side == "BUY" else "high"
+            strict_candidates = [
+                candidate for candidate in swing_candidates
+                if str(candidate.get("type") or "").lower() == required_type
+            ]
+
+            for candidate in strict_candidates:
+                valid, stop, invalid_reason = final_sl_valid(candidate, candidate_side)
+                if valid:
+                    return candidate, stop, "strict"
+                add_rejected_candidate(
+                    candidate,
+                    invalid_reason or "SL candidate invalid",
+                )
+
+            return None, None, None
 
         def build_target_candidates(target_side):
             target_type = "HIGH" if target_side == "BUY" else "LOW"
@@ -5437,20 +5790,12 @@ def build_15m_swing_risk_levels(
             return valid_targets
 
         if side == "BUY":
-            selected = numeric_candidate(swing_low, "detected_15m_swing_low")
-            if selected:
-                swing_meta = find_swing_meta_for_price("LOW", selected["price"])
-                selected.update({
-                    "index": swing_meta.get("index"),
-                    "time": swing_meta.get("time"),
-                    "type": "low",
-                    "age_candles": swing_meta.get("age_candles"),
-                })
+            selected, stop_loss, selection_source = select_sl_candidate("BUY")
 
             record_rule(
-                "BUY swing_low must exist",
+                "BUY previous swing low or fallback low must exist",
                 selected is not None,
-                None if selected is not None else "BUY swing low missing",
+                None if selected is not None else "BUY previous swing low missing",
                 selected,
             )
 
@@ -5460,13 +5805,17 @@ def build_15m_swing_risk_levels(
 
             mark_selected_swing(selected)
             swing_low = selected["price"]
-            stop_loss = swing_low - buffer
             debug["sl_source"] = selected["source"]
-            debug["sl_reason"] = "BUY SL = last valid structure swing low - 5 pips"
+            debug["sl_reason"] = "BUY SL = last previous swing low - 5 pips"
             debug["selected_swing_sl"] = round(swing_low, decimals)
             debug["sl_source_swing"] = round(swing_low, decimals)
             debug["selected_swing_time"] = selected.get("time")
             debug["selected_swing_age_candles"] = selected.get("age_candles")
+            debug["stop_loss"] = round(stop_loss, decimals)
+            debug["sl_before_broker_adjustment"] = round(stop_loss, decimals)
+            debug["final_sl"] = round(stop_loss, decimals)
+            debug["sl_distance"] = round(abs(stop_loss - entry_price), decimals)
+            debug["sl_distance_pips"] = round(abs(stop_loss - entry_price) / pip_size, 2)
 
             final_sl_below_entry = stop_loss < entry_price
             record_rule(
@@ -5481,20 +5830,12 @@ def build_15m_swing_risk_levels(
                 return return_with_swing_log()
             risk = entry_price - stop_loss
         else:
-            selected = numeric_candidate(swing_high, "detected_15m_swing_high")
-            if selected:
-                swing_meta = find_swing_meta_for_price("HIGH", selected["price"])
-                selected.update({
-                    "index": swing_meta.get("index"),
-                    "time": swing_meta.get("time"),
-                    "type": "high",
-                    "age_candles": swing_meta.get("age_candles"),
-                })
+            selected, stop_loss, selection_source = select_sl_candidate("SELL")
 
             record_rule(
-                "SELL swing_high must exist",
+                "SELL previous swing high or fallback high must exist",
                 selected is not None,
-                None if selected is not None else "SELL swing high missing",
+                None if selected is not None else "SELL previous swing high missing",
                 selected,
             )
 
@@ -5504,13 +5845,17 @@ def build_15m_swing_risk_levels(
 
             mark_selected_swing(selected)
             swing_high = selected["price"]
-            stop_loss = swing_high + buffer
             debug["sl_source"] = selected["source"]
-            debug["sl_reason"] = "SELL SL = last valid structure swing high + 5 pips"
+            debug["sl_reason"] = "SELL SL = last previous swing high + 5 pips"
             debug["selected_swing_sl"] = round(swing_high, decimals)
             debug["sl_source_swing"] = round(swing_high, decimals)
             debug["selected_swing_time"] = selected.get("time")
             debug["selected_swing_age_candles"] = selected.get("age_candles")
+            debug["stop_loss"] = round(stop_loss, decimals)
+            debug["sl_before_broker_adjustment"] = round(stop_loss, decimals)
+            debug["final_sl"] = round(stop_loss, decimals)
+            debug["sl_distance"] = round(abs(stop_loss - entry_price), decimals)
+            debug["sl_distance_pips"] = round(abs(stop_loss - entry_price) / pip_size, 2)
 
             final_sl_above_entry = stop_loss > entry_price
             record_rule(
@@ -5542,10 +5887,51 @@ def build_15m_swing_risk_levels(
             mark_wait("WAIT_VALID_STRUCTURE_TP")
             return return_with_swing_log()
 
-        structure_target = target_candidates[0]
-        structure_reward = abs(structure_target["price"] - entry_price)
         minimum_reward = risk * 1.2
         maximum_reward = risk * 2.0
+        rejected_tp_candidates = []
+        structure_target = None
+        structure_reward = None
+        structure_rr = None
+
+        for candidate in target_candidates:
+            candidate_reward = abs(candidate["price"] - entry_price)
+            candidate_rr = candidate_reward / risk if risk > 0 else 0
+            if candidate_rr + 0.01 < 1.2:
+                rejected_tp_candidates.append({
+                    "price": round(candidate["price"], decimals),
+                    "time": candidate.get("time"),
+                    "source": candidate.get("source"),
+                    "risk_reward_ratio": round(candidate_rr, 4),
+                    "reason": "TP swing reward below 1.20R",
+                })
+                continue
+            if candidate_rr - 0.01 > 2.0:
+                rejected_tp_candidates.append({
+                    "price": round(candidate["price"], decimals),
+                    "time": candidate.get("time"),
+                    "source": candidate.get("source"),
+                    "risk_reward_ratio": round(candidate_rr, 4),
+                    "reason": "TP swing reward above 2.00R",
+                })
+                continue
+
+            structure_target = candidate
+            structure_reward = candidate_reward
+            structure_rr = candidate_rr
+            break
+
+        debug["rejected_tp_candidates"] = rejected_tp_candidates
+        if structure_target is None:
+            debug["reason"] = "WAIT_NO_STRUCTURE_TP_IN_RR_WINDOW"
+            debug["reason_if_wait"] = "WAIT_NO_STRUCTURE_TP_IN_RR_WINDOW"
+            debug["rejection_reason"] = (
+                f"Rejected {normalized_symbol} {side}: no 15m structure TP "
+                "swing produced RR between 1.20 and 2.00."
+            )
+            print(debug["rejection_reason"])
+            return return_with_swing_log()
+
         structure_rr = structure_reward / risk if risk > 0 else 0
         debug.update({
             "risk_reward_ratio": round(structure_rr, 4),
@@ -5556,22 +5942,7 @@ def build_15m_swing_risk_levels(
             "tp_structure_source": structure_target.get("source"),
         })
 
-        if structure_reward + (pip_size * 0.1) < minimum_reward:
-            debug["reason"] = "WAIT_STRUCTURE_REWARD_BELOW_MINIMUM"
-            debug["reason_if_wait"] = "WAIT_STRUCTURE_REWARD_BELOW_MINIMUM"
-            debug["rejection_reason"] = (
-                f"Rejected {normalized_symbol} {side}: structure reward "
-                f"{round(structure_reward, decimals)} is below minimum "
-                f"{round(minimum_reward, decimals)} (1.2R)."
-            )
-            print(debug["rejection_reason"])
-            return return_with_swing_log()
-
-        target_reward = min(structure_reward, maximum_reward)
-        if side == "BUY":
-            tp2 = entry_price + target_reward
-        else:
-            tp2 = entry_price - target_reward
+        tp2 = structure_target["price"]
 
         tp1 = calculate_tp1_from_tp2_price(entry_price, tp2, side)
         reward = abs(tp2 - entry_price)
@@ -5581,6 +5952,22 @@ def build_15m_swing_risk_levels(
             debug["reason"] = "WAIT_RR_OUTSIDE_1_2_TO_2"
             debug["swing_sl_validation"]["why_swing_sl_no"] = "TP reward ratio outside 1.2R-2R window"
             return return_with_swing_log()
+
+        print("STRUCTURE_TP_RR_DEBUG =", {
+            "symbol": normalized_symbol,
+            "direction": side,
+            "entry": round(entry_price, decimals),
+            "sl": round(stop_loss, decimals),
+            "sl_swing": round(swing_low if side == "BUY" else swing_high, decimals),
+            "tp_swing": round(structure_target["price"], decimals),
+            "tp_swing_time": structure_target.get("time"),
+            "risk": round(risk, decimals),
+            "reward": round(reward, decimals),
+            "rr": round(rr, 4),
+            "tp1": round(tp1, decimals),
+            "tp2": round(tp2, decimals),
+            "rejected_tp_candidates": rejected_tp_candidates,
+        })
 
         levels = {
             "ok": True,
@@ -5605,7 +5992,8 @@ def build_15m_swing_risk_levels(
             "tp_structure_age_candles": structure_target.get("age_candles"),
             "structure_reward": round(structure_reward, decimals),
             "structure_reward_ratio": round(structure_rr, 4),
-            "tp_capped_at_2r": structure_reward > maximum_reward,
+            "tp_capped_at_2r": False,
+            "rejected_tp_candidates": rejected_tp_candidates,
             "level_source": debug.get("sl_source"),
             "selected_swing_sl": round(
                 swing_low if side == "BUY" else swing_high,
@@ -5746,6 +6134,32 @@ def get_15m_level_tolerance(symbol):
     normalized_symbol = normalize_symbol(symbol)
     return get_pair_strategy_rule(normalized_symbol, "fifteen_m_level_tolerance")
 
+
+def get_default_15m_level_tolerance(symbol):
+    normalized_symbol = normalize_symbol(symbol)
+    if normalized_symbol == "XAUUSD":
+        return 0.05
+    return 0.00005
+
+
+def resolve_15m_level_tolerance(symbol):
+    normalized_symbol = normalize_symbol(symbol)
+    raw_tolerance = get_15m_level_tolerance(normalized_symbol)
+    default_tolerance = get_default_15m_level_tolerance(normalized_symbol)
+
+    try:
+        tolerance = float(raw_tolerance)
+        if math.isfinite(tolerance):
+            return tolerance, raw_tolerance, None
+    except (TypeError, ValueError) as exc:
+        return default_tolerance, raw_tolerance, str(exc)
+
+    return (
+        default_tolerance,
+        raw_tolerance,
+        f"non-finite tolerance {raw_tolerance}",
+    )
+
 def update_fifteen_m_swing_watch(symbol, side, swing_level, candle_time):
     side = str(side or "").upper()
 
@@ -5817,6 +6231,9 @@ def evaluate_closed_15m_swing_break(closed_data_15m, side, symbol=None):
         previous_close = float(closed_data_15m["Close"].iloc[-2])
         candle_time = pd.Timestamp(closed_data_15m.index[-1]).isoformat()
         swing_source = closed_data_15m.iloc[:-1].copy()
+        max_pending_5m_candles = get_15m_pending_max_5m_candles(
+            normalized_symbol
+        )
 
         if len(swing_source) < 8:
             swing_source = closed_data_15m.copy()
@@ -5829,12 +6246,33 @@ def evaluate_closed_15m_swing_break(closed_data_15m, side, symbol=None):
             _structure,
             _swings,
         ) = detect_swing_liquidity(swing_source)
+        actionable_swing_level, actionable_swing_debug = (
+            get_actionable_15m_swing_level(
+                swing_source,
+                side,
+                normalized_symbol,
+                reference_price=previous_close,
+            )
+        )
+
+        if actionable_swing_level is None:
+            debug.update({
+                "closed_candle_time": candle_time,
+                "closed_candle_close": close_price,
+                "swing_level": None,
+                "comparison": None,
+                "break_happened": False,
+                "close_confirmed": False,
+                "reason": (
+                    actionable_swing_debug.get("reason")
+                    or "No actionable 15m swing level within ATR range"
+                ),
+                "actionable_swing_debug": actionable_swing_debug,
+            })
+            return debug
 
         if side == "BUY":
-            swing_level = swing_high
-
-            if swing_level is None:
-                swing_level = float(swing_source["High"].tail(20).max())
+            swing_level = actionable_swing_level
 
             break_happened = float(closed_data_15m["High"].iloc[-1]) > float(swing_level)
             close_confirmed = close_price > float(swing_level)
@@ -5847,10 +6285,7 @@ def evaluate_closed_15m_swing_break(closed_data_15m, side, symbol=None):
             else:
                 reason = "WAIT_NO_15M_BREAK"
         else:
-            swing_level = swing_low
-
-            if swing_level is None:
-                swing_level = float(swing_source["Low"].tail(20).min())
+            swing_level = actionable_swing_level
 
             break_happened = float(closed_data_15m["Low"].iloc[-1]) < float(swing_level)
             close_confirmed = close_price < float(swing_level)
@@ -5903,52 +6338,8 @@ def evaluate_closed_15m_swing_break(closed_data_15m, side, symbol=None):
                 else:
                     reason = "WAIT_NO_15M_BREAK"
 
-        if eurusd_requires_fresh_5m_entry(normalized_symbol):
-            fresh_cross = (
-                side == "BUY"
-                and confirmed
-                and previous_close <= float(swing_level)
-            ) or (
-                side == "SELL"
-                and confirmed
-                and previous_close >= float(swing_level)
-            )
-
-            returned_through_swing = (
-                side == "BUY"
-                and close_price < float(swing_level)
-            ) or (
-                side == "SELL"
-                and close_price > float(swing_level)
-            )
-
-            if confirmed and not fresh_cross:
-                confirmed = False
-                reason = "WAIT: old EURUSD setup expired"
-                clear_eurusd_entry_memory(
-                    normalized_symbol,
-                    reason,
-                    side,
-                )
-            elif (
-                returned_through_swing
-                and isinstance(watched, dict)
-                and watched.get("break_confirmed")
-            ):
-                reason = "WAIT: held signal cleared"
-                clear_eurusd_entry_memory(
-                    normalized_symbol,
-                    reason,
-                    side,
-                )
-
         if confirmed and watched and not watched.get("break_confirmed"):
             key = get_15m_swing_watch_key(debug.get("symbol"), side)
-            breakout_ts = pd.Timestamp(candle_time)
-            if breakout_ts.tzinfo is None:
-                breakout_ts = breakout_ts.tz_localize("UTC")
-            else:
-                breakout_ts = breakout_ts.tz_convert("UTC")
             FIFTEEN_M_SWING_WATCH[key] = {
                 **watched,
                 "break_confirmed": True,
@@ -5959,17 +6350,24 @@ def evaluate_closed_15m_swing_break(closed_data_15m, side, symbol=None):
                 "break_candle_time": candle_time,
                 "break_close": close_price,
                 "status": "PENDING",
-                "expires_after_5m_candles": FIFTEEN_M_PENDING_MAX_5M_CANDLES,
-                "expires_at": (
-                    breakout_ts
-                    + pd.Timedelta(
-                        minutes=5 * FIFTEEN_M_PENDING_MAX_5M_CANDLES
-                    )
-                ).isoformat(),
+                "expires_after_5m_candles": None,
+                "expires_at": None,
                 "invalidated_at": None,
                 "confirmed_5m_time": None,
             }
             save_fifteen_m_swing_watch()
+
+        print("BOS_CHOCH_15M_DEBUG =", {
+            "symbol": normalized_symbol,
+            "side": side,
+            "swing_level": float(swing_level),
+            "candle_time": candle_time,
+            "candle_close": close_price,
+            "break_happened": bool(break_happened),
+            "close_confirmed": bool(close_confirmed),
+            "confirmed": bool(confirmed),
+            "reason": reason,
+        })
 
         debug.update({
             "confirmed": confirmed,
@@ -5980,6 +6378,8 @@ def evaluate_closed_15m_swing_break(closed_data_15m, side, symbol=None):
             "break_happened": bool(break_happened),
             "close_confirmed": bool(close_confirmed),
             "reason": reason,
+            "pending_max_5m_candles": max_pending_5m_candles,
+            "actionable_swing_debug": actionable_swing_debug,
         })
     except Exception as exc:
         debug["reason"] = f"15m swing-break validation unavailable: {exc}"
@@ -6032,25 +6432,23 @@ def get_pending_15m_swing_setup(symbol, closed_data_5m):
             state_changed = True
             continue
 
-        # A pending setup must be evaluated while its three-candle window is
-        # active. Never resurrect an old breakout by scanning historical 5m
-        # candles after that window has already passed.
-        if len(following) > FIFTEEN_M_PENDING_MAX_5M_CANDLES:
-            watched["status"] = "EXPIRED"
-            watched["expired_at"] = following[
-                FIFTEEN_M_PENDING_MAX_5M_CANDLES
-            ][0].isoformat()
-            watched["expiration_reason"] = (
-                "No 5m confirmation within three candles"
-            )
-            state_changed = True
-            continue
+        pending_age = len(following)
+        print(
+            "FIFTEEN_M_PENDING_SETUP_AGE_DEBUG =",
+            {
+                "symbol": normalized_symbol,
+                "side": side,
+                "pending_setup_age": pending_age,
+                "max_allowed_age": None,
+                "expired": False,
+                "remembered_setup": True,
+            },
+        )
 
         watched["status"] = "PENDING"
-        watched["five_m_candles_elapsed"] = len(following)
-        watched["candles_remaining"] = (
-            max(0, FIFTEEN_M_PENDING_MAX_5M_CANDLES - len(following))
-        )
+        watched["five_m_candles_elapsed"] = pending_age
+        watched["candles_remaining"] = None
+        watched["expires_after_5m_candles"] = None
         candidates.append(watched)
 
     if state_changed:
@@ -6306,7 +6704,12 @@ def confirm_5m_close_after_15m_break(data_5m, side, setup_level, breakout_candle
     normalized_symbol = normalize_symbol(symbol)
     closed_5m = remove_current_forming_candle(data_5m, 5)
     level = setup_level
-    tolerance = get_15m_level_tolerance(normalized_symbol)
+    tolerance, raw_tolerance, tolerance_error = resolve_15m_level_tolerance(
+        normalized_symbol
+    )
+    max_pending_5m_candles = get_15m_pending_max_5m_candles(
+        normalized_symbol
+    )
 
     base = {
         "side": "WAIT",
@@ -6353,7 +6756,21 @@ def confirm_5m_close_after_15m_break(data_5m, side, setup_level, breakout_candle
         except Exception:
             continue
 
-    for candle_ts, candle in following_candles[:FIFTEEN_M_PENDING_MAX_5M_CANDLES]:
+    print(
+        "FIFTEEN_M_PENDING_SETUP_AGE_DEBUG =",
+        {
+            "symbol": normalized_symbol,
+            "side": side,
+            "pending_setup_age": len(following_candles),
+            "max_allowed_age": None,
+            "expired": False,
+            "remembered_setup": True,
+            "tolerance_used": tolerance,
+            "raw_tolerance": raw_tolerance,
+        },
+    )
+
+    for candle_ts, candle in following_candles:
         try:
             open_price = float(candle["Open"])
             close_price = float(candle["Close"])
@@ -6367,20 +6784,6 @@ def confirm_5m_close_after_15m_break(data_5m, side, setup_level, breakout_candle
                 side == "SELL"
                 and close_price > level + tolerance
             )
-
-            if invalidated:
-                return {
-                    **base,
-                    "closed_candle_time": candle_ts.isoformat(),
-                    "reason": f"{side} 15m breakout invalidated by 5m close",
-                    "close": close_price,
-                    "open": open_price,
-                    "high": high_price,
-                    "low": low_price,
-                    "invalidated": True,
-                    "candles_checked": len(following_candles),
-                }
-
             directional_close = (
                 side == "BUY"
                 and close_price > open_price
@@ -6390,6 +6793,29 @@ def confirm_5m_close_after_15m_break(data_5m, side, setup_level, breakout_candle
                 and close_price < open_price
                 and close_price <= level + tolerance
             )
+
+            if tolerance_error:
+                print("FIVE_M_CONFIRMATION_TOLERANCE_FALLBACK =", {
+                    "symbol": normalized_symbol,
+                    "level": level,
+                    "tolerance": raw_tolerance,
+                    "tolerance_used": tolerance,
+                    "candle_time": candle_ts.isoformat(),
+                    "error": tolerance_error,
+                })
+
+            print("FIVE_M_CONFIRMATION_CANDLE_DEBUG =", {
+                "symbol": normalized_symbol,
+                "side": side,
+                "fifteen_m_level": level,
+                "tolerance_used": tolerance,
+                "candle_time": candle_ts.isoformat(),
+                "five_m_close": close_price,
+                "confirmation_pass": bool(directional_close),
+                "confirmation_fail": not bool(directional_close),
+                "invalidation_pass": bool(invalidated),
+                "invalidation_fail": not bool(invalidated),
+            })
 
             if directional_close:
                 key = get_15m_swing_watch_key(normalized_symbol, side)
@@ -6440,27 +6866,26 @@ def confirm_5m_close_after_15m_break(data_5m, side, setup_level, breakout_candle
                     "expired": False,
                     "candles_checked": len(following_candles),
                 }
-        except Exception:
+        except Exception as exc:
+            print("FIVE_M_CONFIRMATION_CANDLE_ERROR =", {
+                "symbol": normalized_symbol,
+                "level": level,
+                "tolerance": raw_tolerance,
+                "tolerance_used": tolerance,
+                "candle_time": (
+                    candle_ts.isoformat()
+                    if "candle_ts" in locals()
+                    else None
+                ),
+                "error": str(exc),
+            })
             continue
-
-    if len(following_candles) >= FIFTEEN_M_PENDING_MAX_5M_CANDLES:
-        return {
-            **base,
-            "closed_candle_time": following_candles[
-                FIFTEEN_M_PENDING_MAX_5M_CANDLES - 1
-            ][0].isoformat(),
-            "reason": "WAIT_15M_SETUP_EXPIRED",
-            "expired": True,
-            "candles_checked": len(following_candles),
-        }
 
     return {
         **base,
-        "reason": f"Waiting for any following directional 5m {side} close",
+        "reason": f"Remembered 15m {side} setup; waiting for directional 5m close",
         "candles_checked": len(following_candles),
-        "candles_remaining": (
-            FIFTEEN_M_PENDING_MAX_5M_CANDLES - len(following_candles)
-        ),
+        "candles_remaining": None,
     }
 
 def evaluate_xauusd_buy_continuation_quality(
@@ -7871,7 +8296,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
                 ),
                 "status": "PENDING",
                 "expires_after_5m_candles": (
-                    FIFTEEN_M_PENDING_MAX_5M_CANDLES
+                    get_15m_pending_max_5m_candles(symbol)
                 ),
             }
     fifteen_m_setup = (
@@ -8154,89 +8579,40 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             result["entry_timing"] = f"WAIT 15M {fifteen_m_setup} SWING CLOSE"
             return False
 
-        if pullback_block_active:
-            clear_trade_plan(result, pullback_block_reason)
+        five_m_valid = (
+            five_m_entry.get("side") == fifteen_m_setup
+            and five_m_entry.get("close_confirmed")
+            and five_m_after_setup
+        )
+        print("SIMPLIFIED_5M_CONFIRMATION_DEBUG =", {
+            "symbol": symbol,
+            "side": fifteen_m_setup,
+            "fifteen_m_level": fifteen_m_entry_level,
+            "fifteen_m_break_time": fifteen_m_swing_break.get("closed_candle_time"),
+            "five_m_side": five_m_entry.get("side"),
+            "five_m_close": five_m_entry.get("close"),
+            "five_m_close_time": five_m_entry.get("closed_candle_time"),
+            "five_m_close_confirmed": five_m_entry.get("close_confirmed"),
+            "five_m_after_setup": five_m_after_setup,
+            "passed": bool(five_m_valid),
+            "remembered_setup": bool(pending_15m_setup),
+            "reason": five_m_entry.get("reason"),
+        })
+        if not five_m_valid:
+            reason = (
+                five_m_entry.get("reason")
+                or f"Remembered 15m {fifteen_m_setup} setup; waiting for 5m confirmation"
+            )
+            clear_trade_plan(result, reason)
             mark_signal_blocker(
                 result,
-                "pullback_without_new_15m_bos",
-                pullback_block_reason,
-                "new_15m_bos_required_after_pullback",
+                "missing_5m_confirmation",
+                reason,
+                "five_m_directional_close_required",
                 fifteen_m_setup,
             )
-            result["entry_timing"] = f"WAIT NEW 15M {fifteen_m_setup} BOS"
+            result["entry_timing"] = "WAIT 5M CONFIRMATION"
             return False
-
-        if eurusd_requires_fresh_5m_entry(symbol):
-            eurusd_current_5m_confirmation = (
-                is_current_5m_entry_confirmation(
-                    closed_data_5m,
-                    five_m_entry,
-                    fifteen_m_setup,
-                )
-            )
-            eurusd_5m_valid = (
-                five_m_entry.get("side") == fifteen_m_setup
-                and five_m_entry.get("close_confirmed")
-                and five_m_after_setup
-                and eurusd_current_5m_confirmation
-            )
-
-            if not eurusd_5m_valid:
-                if five_m_entry.get("invalidated") or five_m_entry.get("expired"):
-                    reason = "WAIT: old EURUSD setup expired"
-                    clear_eurusd_entry_memory(symbol, reason, fifteen_m_setup)
-                elif not five_m_after_setup or not eurusd_current_5m_confirmation:
-                    reason = "WAIT: old EURUSD setup expired"
-                    clear_eurusd_entry_memory(symbol, reason, fifteen_m_setup)
-                else:
-                    reason = "WAIT: 15m break found, waiting for fresh 5m confirmation"
-                    clear_final_signal_hold_for_symbol(
-                        symbol,
-                        "WAIT: held signal cleared",
-                    )
-
-                clear_trade_plan(result, reason)
-                mark_signal_blocker(
-                    result,
-                    "missing_fresh_5m_confirmation",
-                    reason,
-                    "eurusd_fresh_5m_confirmation_required",
-                    fifteen_m_setup,
-                )
-                result["entry_timing"] = "WAIT FRESH 5M CONFIRMATION"
-                result["eurusd_fresh_5m_required"] = True
-                result["eurusd_fresh_5m_debug"] = {
-                    "five_m_side": five_m_entry.get("side"),
-                    "five_m_close_confirmed": five_m_entry.get("close_confirmed"),
-                    "five_m_after_setup": five_m_after_setup,
-                    "current_5m_entry_confirmation": eurusd_current_5m_confirmation,
-                    "five_m_invalidated": five_m_entry.get("invalidated"),
-                    "five_m_expired": five_m_entry.get("expired"),
-                    "reason": reason,
-                }
-                return False
-
-        if normalize_symbol(symbol) == "XAUUSD" and fifteen_m_setup == "BUY":
-            xauusd_buy_quality = evaluate_xauusd_buy_continuation_quality(
-                closed_data_15m,
-                five_m_entry,
-                fifteen_m_swing_break,
-                five_m_after_setup,
-            )
-
-            if xauusd_buy_quality.get("blocked"):
-                reason = xauusd_buy_quality.get("reason")
-                clear_trade_plan(result, reason)
-                mark_signal_blocker(
-                    result,
-                    "xauusd_weak_buy_bos",
-                    reason,
-                    "xauusd_clean_buy_continuation_required",
-                    fifteen_m_setup,
-                )
-                result["entry_timing"] = "WAIT CLEAN XAUUSD BUY CONFIRMATION"
-                result["xauusd_buy_confirmation_debug"] = xauusd_buy_quality
-                return False
 
         risk_levels = build_15m_swing_risk_levels(
             closed_data_15m,
@@ -8262,63 +8638,6 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             result["swing_sl_debug"] = risk_levels
             return False
 
-        current_closed_5m_time = five_m_entry.get("closed_candle_time")
-
-        try:
-            if closed_data_5m is not None and not closed_data_5m.empty:
-                current_closed_5m_time = pd.Timestamp(
-                    closed_data_5m.index[-1]
-                ).isoformat()
-        except Exception:
-            pass
-
-        freshness_debug = evaluate_entry_freshness(
-            fifteen_m_setup,
-            (pending_15m_setup or {}).get("bos_time")
-            or fifteen_m_swing_break.get("closed_candle_time"),
-            (pending_15m_setup or {}).get("bos_price")
-            or fifteen_m_swing_break.get("closed_candle_close"),
-            (pending_15m_setup or {}).get("broken_swing_price")
-            or fifteen_m_swing_break.get("swing_level")
-            or fifteen_m_entry_level,
-            five_m_entry.get("closed_candle_time"),
-            current_closed_5m_time,
-            risk_levels.get("entry"),
-            risk_levels.get("tp1"),
-            symbol,
-        )
-        result.update({
-            "setup_age_candles": freshness_debug.get("setup_age_candles"),
-            "confirmation_age_candles": freshness_debug.get("confirmation_age_candles"),
-            "distance_from_bos_pips": freshness_debug.get("distance_from_bos_pips"),
-            "freshness_score": freshness_debug.get("freshness_score"),
-            "freshness_reason": freshness_debug.get("freshness_reason"),
-            "setup_freshness_debug": freshness_debug,
-        })
-
-        if freshness_debug.get("freshness_score", 0) < MIN_LIVE_FRESHNESS_SCORE:
-            reason = "Setup expired / entry too late. Waiting for new BOS/CHOCH."
-            clear_trade_plan(result, reason)
-            mark_signal_blocker(
-                result,
-                "setup_expired_entry_too_late",
-                reason,
-                "setup_freshness_score_required",
-                fifteen_m_setup,
-            )
-            result["setup_freshness"] = "EXPIRED"
-            result["setup_freshness_reason"] = reason
-            result["entry_timing"] = "WAIT NEW BOS/CHOCH"
-            result.update({
-                "setup_age_candles": freshness_debug.get("setup_age_candles"),
-                "confirmation_age_candles": freshness_debug.get("confirmation_age_candles"),
-                "distance_from_bos_pips": freshness_debug.get("distance_from_bos_pips"),
-                "freshness_score": freshness_debug.get("freshness_score"),
-                "freshness_reason": freshness_debug.get("freshness_reason"),
-                "setup_freshness_debug": freshness_debug,
-            })
-            return False
-
         result["signal"] = fifteen_m_setup
         result["signal_before_filters"] = fifteen_m_setup
         result["plan_bias"] = fifteen_m_setup
@@ -8334,11 +8653,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             else f"SMC {fifteen_m_setup} 15M CONFIRMED"
         )
         result["plan_reason"] = (
-            f"{fifteen_m_setup}: fresh 15m break + fresh 5m confirmation"
-            if eurusd_requires_fresh_5m_entry(symbol)
-            else five_m_entry.get("reason")
-            if five_m_entry.get("close_confirmed")
-            else f"{fifteen_m_setup} after 15m swing break and close confirmation"
+            f"{fifteen_m_setup}: 15m BOS/CHOCH close + 5m directional close confirmed"
         )
         result["strategy_setup_complete"] = True
         result["strategy_setup_type"] = (
@@ -8367,12 +8682,12 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
                 ),
                 decimals,
             )
-            result["risk_reward"] = "1:2"
+            result["risk_reward"] = risk_levels.get("risk_reward")
             result["swing_sl_debug"] = risk_levels
 
             result["level_source"] = "15m swing"
             result["tp1_rule"] = "80% of entry-to-TP2"
-            result["tp2_rule"] = "2R from entry"
+            result["tp2_rule"] = "15m opposite swing target within 1.20R-2.00R"
             result["protected_sl_rule"] = "50% of entry-to-TP2 after TP1"
         except Exception as exc:
             print("TIMEFRAME_ENTRY_LEVEL_WARNING =", {
@@ -9155,6 +9470,71 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             tp1_valid = entry_number > tp1_number >= tp2_number
             tp2_valid = tp2_number < entry_number
 
+    actionable_buy_debug = (
+        (swing_breaks.get("BUY") or {}).get("actionable_swing_debug")
+        or {}
+    )
+    actionable_sell_debug = (
+        (swing_breaks.get("SELL") or {}).get("actionable_swing_debug")
+        or {}
+    )
+    actionable_buy_level = (
+        (swing_breaks.get("BUY") or {}).get("swing_level")
+        or (actionable_buy_debug.get("selected") or {}).get("price")
+    )
+    actionable_sell_level = (
+        (swing_breaks.get("SELL") or {}).get("swing_level")
+        or (actionable_sell_debug.get("selected") or {}).get("price")
+    )
+    actionable_levels_message = None
+    if actionable_buy_level is None and actionable_sell_level is None:
+        actionable_levels_message = "No actionable 15m swing level within ATR range"
+
+    saved_15m_setups = {}
+    expired_15m_setup = None
+    for saved_side in ["BUY", "SELL"]:
+        saved_key = get_15m_swing_watch_key(symbol, saved_side)
+        saved_setup = FIFTEEN_M_SWING_WATCH.get(saved_key)
+        if not isinstance(saved_setup, dict):
+            continue
+
+        saved_setup_debug = {
+            "symbol": saved_setup.get("symbol"),
+            "side": saved_side,
+            "status": str(saved_setup.get("status") or "").upper(),
+            "swing_level": saved_setup.get("swing_level"),
+            "break_confirmed": bool(saved_setup.get("break_confirmed")),
+            "break_candle_time": saved_setup.get("break_candle_time"),
+            "break_close": saved_setup.get("break_close"),
+            "expires_after_5m_candles": saved_setup.get(
+                "expires_after_5m_candles"
+            ),
+            "expires_at": saved_setup.get("expires_at"),
+            "expired_at": saved_setup.get("expired_at"),
+            "expiration_reason": saved_setup.get("expiration_reason"),
+            "confirmed_5m_time": saved_setup.get("confirmed_5m_time"),
+        }
+        saved_15m_setups[saved_side] = saved_setup_debug
+
+        if saved_setup_debug["status"] == "EXPIRED":
+            if expired_15m_setup is None:
+                expired_15m_setup = saved_setup_debug
+            else:
+                current_time = str(
+                    expired_15m_setup.get("expired_at")
+                    or expired_15m_setup.get("expires_at")
+                    or expired_15m_setup.get("break_candle_time")
+                    or ""
+                )
+                candidate_time = str(
+                    saved_setup_debug.get("expired_at")
+                    or saved_setup_debug.get("expires_at")
+                    or saved_setup_debug.get("break_candle_time")
+                    or ""
+                )
+                if candidate_time > current_time:
+                    expired_15m_setup = saved_setup_debug
+
     result["entry_strategy_debug"] = {
         "symbol": normalize_symbol(symbol),
         "final_signal": final_entry_decision,
@@ -9187,6 +9567,21 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
         "fifteen_m_bos_level": (
             (pending_15m_setup or {}).get("swing_level")
             or fifteen_m_swing_break.get("swing_level")
+        ),
+        "actionable_15m_buy_level": actionable_buy_level,
+        "actionable_15m_sell_level": actionable_sell_level,
+        "actionable_15m_levels_message": actionable_levels_message,
+        "actionable_15m_buy_debug": actionable_buy_debug,
+        "actionable_15m_sell_debug": actionable_sell_debug,
+        "saved_15m_setups": saved_15m_setups,
+        "expired_15m_setup": expired_15m_setup,
+        "saved_15m_setup_status": (
+            ((pending_15m_setup or {}).get("status"))
+            or (
+                saved_15m_setups.get(validation_side, {}).get("status")
+                if validation_side in ["BUY", "SELL"]
+                else None
+            )
         ),
         "saved_swing_level": (
             (pending_15m_setup or {}).get("swing_level")
