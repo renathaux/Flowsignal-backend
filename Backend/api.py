@@ -63,6 +63,25 @@ from services.settings_service import (
     load_risk_settings,
 )
 from paths import DATA_DIR
+from risk_management.account_balance import (
+    log_account_balance_verification_failed as risk_log_account_balance_verification_failed,
+    validate_verified_account_snapshot,
+)
+from risk_management.broker_protection import (
+    build_live_protection_audit as risk_build_live_protection_audit,
+    live_prices_match as risk_live_prices_match,
+)
+from risk_management.position_sizing import (
+    calculate_expected_loss_usd_from_risk_size as risk_calculate_expected_loss_usd_from_risk_size,
+    calculate_position_size as risk_calculate_position_size,
+    round_volume_down_to_step as risk_round_volume_down_to_step,
+)
+from risk_management.risk_audit import (
+    build_live_risk_calculation_audit as risk_build_live_risk_calculation_audit,
+    first_valid_live_price as risk_first_valid_live_price,
+    log_live_risk_calculation_audit as risk_log_live_risk_calculation_audit,
+)
+from risk_management.risk_limits import is_expected_loss_oversized
 
 FINAL_SIGNAL_HOLD_FILE = os.path.join(
     DATA_DIR,
@@ -1816,8 +1835,8 @@ MAX_LIVE_TRADE_HISTORY = 50
 LIVE_EXECUTION_COOLDOWN_SECONDS = 30
 BROKER_SYNC_GRACE_SECONDS = 10
 LIVE_RISK_PERCENT = 1.0
-MAX_LIVE_RISK_PERCENT = 1.05
-RISK_TOLERANCE_PERCENT = 0.10
+MAX_LIVE_RISK_PERCENT = 1.0
+RISK_TOLERANCE_PERCENT = 0.0
 MIN_LOT = 0.01
 LIVE_LAST_EXECUTION_TIME = {
     "EURUSD": 0,
@@ -1840,7 +1859,7 @@ def get_maximum_allowed_live_risk_percent(risk_percent=None):
         if risk_percent is None
         else float(risk_percent)
     )
-    return round(target + 0.05, 4)
+    return round(target, 4)
 AUTO_TRADE_LAST_STATUS = {
     "symbol": None,
     "signal": None,
@@ -3068,6 +3087,8 @@ def update_live_trade_tp_protection(trade):
             return None
 
     current_price = optional_float(trade.get("current_price"))
+    bid = optional_float(trade.get("bid"))
+    ask = optional_float(trade.get("ask"))
     current_high = optional_float(trade.get("current_high"))
     current_low = optional_float(trade.get("current_low"))
     tp1 = optional_float(trade.get("tp1"))
@@ -3079,20 +3100,28 @@ def update_live_trade_tp_protection(trade):
     if current_low is None:
         current_low = current_price
 
+    trigger_price = current_price
+    if side == "BUY" and bid is not None:
+        trigger_price = bid
+    elif side == "SELL" and ask is not None:
+        trigger_price = ask
+
     tp1_hit_detected = bool(
         tp1 is not None
+        and trigger_price is not None
         and (
-            (side == "BUY" and current_high is not None and current_high >= tp1)
+            (side == "BUY" and trigger_price >= tp1)
             or
-            (side == "SELL" and current_low is not None and current_low <= tp1)
+            (side == "SELL" and trigger_price <= tp1)
         )
     )
     tp2_hit_detected = bool(
         tp2 is not None
+        and trigger_price is not None
         and (
-            (side == "BUY" and current_high is not None and current_high >= tp2)
+            (side == "BUY" and trigger_price >= tp2)
             or
-            (side == "SELL" and current_low is not None and current_low <= tp2)
+            (side == "SELL" and trigger_price <= tp2)
         )
     )
 
@@ -3132,6 +3161,9 @@ def update_live_trade_tp_protection(trade):
             "position_id": position_id,
             "volume_units": volume_units,
             "tp2": tp2,
+            "bid": bid,
+            "ask": ask,
+            "trigger_price": trigger_price,
             "current_high": current_high,
             "current_low": current_low,
             "close_result": close_result,
@@ -3148,6 +3180,9 @@ def update_live_trade_tp_protection(trade):
             "side": side,
             "position_id": trade.get("position_id") or trade.get("broker_position_id"),
             "tp2": tp2,
+            "bid": bid,
+            "ask": ask,
+            "trigger_price": trigger_price,
             "current_high": current_high,
             "current_low": current_low,
         })
@@ -3161,6 +3196,9 @@ def update_live_trade_tp_protection(trade):
             "symbol": normalize_symbol(trade.get("symbol")),
             "side": side,
             "current_price": current_price,
+            "bid": bid,
+            "ask": ask,
+            "trigger_price": trigger_price,
             "current_high": current_high,
             "current_low": current_low,
             "tp1": tp1,
@@ -3178,6 +3216,9 @@ def update_live_trade_tp_protection(trade):
         "symbol": normalize_symbol(trade.get("symbol")),
         "side": side,
         "current_price": current_price,
+        "bid": bid,
+        "ask": ask,
+        "trigger_price": trigger_price,
         "current_high": current_high,
         "current_low": current_low,
         "tp1": tp1,
@@ -4307,16 +4348,7 @@ def round_down_to_step(value, step):
     return math.floor(numeric / numeric_step) * numeric_step
 
 def round_volume_down_to_step(volume_units, step_units):
-    try:
-        volume = int(float(volume_units))
-        step = int(float(step_units))
-    except (TypeError, ValueError):
-        return 0
-
-    if volume <= 0 or step <= 0:
-        return 0
-
-    return (volume // step) * step
+    return risk_round_volume_down_to_step(volume_units, step_units)
 
 def log_volume_safety_debug(details):
     if not isinstance(details, dict):
@@ -4492,345 +4524,41 @@ def build_live_risk_debug(
 
 def calculate_position_size(symbol, account_balance, risk_percent, stop_loss_pips):
     execution_symbol = normalize_symbol(symbol)
-
-    try:
-        balance_value = float(account_balance)
-        risk_percent_value = float(risk_percent)
-        sl_pips = float(stop_loss_pips)
-    except (TypeError, ValueError):
-        return {
-            "ok": False,
-            "reason": "Invalid risk sizing inputs"
-        }
-
-    if balance_value <= 0:
-        return {
-            "ok": False,
-            "reason": "Cannot calculate risk without account balance"
-        }
-
-    if risk_percent_value <= 0:
-        return {
-            "ok": False,
-            "reason": "Invalid risk percent"
-        }
-
-    if sl_pips <= 0:
-        return {
-            "ok": False,
-            "reason": "Cannot calculate risk without valid SL"
-        }
-
     metadata = get_ctrader_symbol_risk_metadata(execution_symbol)
-
-    if not metadata.get("ok"):
-        return {
-            "ok": False,
-            "reason": metadata.get("reason") or "Cannot calculate risk without broker symbol metadata",
-            "symbol_metadata": metadata,
-        }
-
-    pip_value_per_lot = metadata.get("pip_value_per_lot")
-    lot_contract_size = metadata.get(
-        "lot_size",
-        get_default_broker_lot_size(execution_symbol)
-    )
-    min_volume_units = metadata.get("min_volume_units")
-    max_volume_units = metadata.get("max_volume_units")
-    volume_step_units = metadata.get("volume_step_units")
-
-    try:
-        pip_value_per_lot = float(pip_value_per_lot)
-        lot_contract_size = float(lot_contract_size)
-        min_volume_units = int(float(min_volume_units))
-        max_volume_units = int(float(max_volume_units))
-        volume_step_units = int(float(volume_step_units))
-    except (TypeError, ValueError):
-        return {
-            "ok": False,
-            "reason": "Cannot calculate risk without broker symbol metadata",
-            "symbol_metadata": metadata,
-        }
-
-    if (
-        pip_value_per_lot <= 0
-        or lot_contract_size <= 0
-        or min_volume_units <= 0
-        or max_volume_units <= 0
-        or volume_step_units <= 0
-        or min_volume_units > max_volume_units
-    ):
-        return {
-            "ok": False,
-            "reason": "Invalid broker symbol volume metadata",
-            "symbol_metadata": metadata,
-        }
-
-    risk_money = balance_value * (risk_percent_value / 100)
-    calculated_lots = risk_money / (sl_pips * pip_value_per_lot)
-
-    if calculated_lots <= 0 or not math.isfinite(calculated_lots):
-        return {
-            "ok": False,
-            "reason": "Calculated position size is invalid",
-            "symbol_metadata": metadata,
-        }
-
-    raw_volume_units = convert_lots_to_ctrader_volume(
-        calculated_lots,
-        lot_contract_size
-    )
-    rounded_volume_units = round_volume_down_to_step(
-        raw_volume_units,
-        volume_step_units
-    )
-    calculated_volume_units = rounded_volume_units
-    minimum_volume_rounded_up = rounded_volume_units < min_volume_units
-
-    if minimum_volume_rounded_up:
-        rounded_volume_units = min_volume_units
-
-    rounded_lots = convert_ctrader_volume_to_lots(
-        rounded_volume_units,
-        lot_contract_size
-    )
-    broker_min_lots = convert_ctrader_volume_to_lots(
-        min_volume_units,
-        lot_contract_size,
-    )
-    payload_scale = CTRADER_PAYLOAD_VOLUME_SCALE.get(execution_symbol, 1)
-    payload_volume = int(rounded_volume_units * payload_scale)
-    pip_size = metadata.get("pip_size")
-
-    try:
-        stop_loss_price_distance = round(sl_pips * float(pip_size), 8)
-    except (TypeError, ValueError):
-        stop_loss_price_distance = None
-
-    base_check = {
-        "symbol": execution_symbol,
-        "account_balance": round(balance_value, 2),
-        "risk_percent": risk_percent_value,
-        "risk_amount": round(risk_money, 2),
-        "sl_pips": round(sl_pips, 2),
-        "pip_size": pip_size,
-        "stop_loss_price_distance": stop_loss_price_distance,
-        "pip_value_per_lot": pip_value_per_lot,
-        "calculated_lots": round(calculated_lots, 4),
-        "rounded_lots": round(rounded_lots, 4) if rounded_lots else 0,
-        "broker_min_lots": round(broker_min_lots, 4) if broker_min_lots else None,
-        "broker_min_volume": min_volume_units,
-        "volume_step": volume_step_units,
-        "payload_volume": payload_volume,
-        "requested_units": int(rounded_volume_units),
-        "max_lot_cap_used": False,
-        "lot_contract_size": lot_contract_size,
-        "volume_units": int(rounded_volume_units),
-        "raw_volume_units": int(raw_volume_units),
-        "calculated_volume_units": int(calculated_volume_units),
-        "min_volume_units": min_volume_units,
-        "max_volume_units": max_volume_units,
-        "volume_step_units": volume_step_units,
-        "minimum_volume_rounded_up": minimum_volume_rounded_up,
-    }
-
-    if rounded_volume_units <= 0:
-        result = {
-            **base_check,
-            "ok": False,
-            "reason": "Calculated volume is invalid",
-            "symbol_metadata": metadata,
-        }
-        log_live_execution_safety_check(result)
-        return result
-
-    if rounded_volume_units % volume_step_units != 0:
-        result = {
-            **base_check,
-            "ok": False,
-            "reason": "Calculated volume is not aligned with broker step",
-            "symbol_metadata": metadata,
-        }
-        log_live_execution_safety_check(result)
-        return result
-
-    # Broker limits and final percentage validation are the safety ceiling.
-    # A fixed one-lot cap does not scale correctly when the active account
-    # changes from 10K to 100K.
-    allowed_max_units = max_volume_units
-
-    if rounded_volume_units > allowed_max_units:
-        result = {
-            "ok": False,
-            "reason": "Calculated volume is above broker/safety maximum",
-            "symbol_metadata": metadata,
-            "pip_value_per_lot": pip_value_per_lot,
-            "lot_size": round(calculated_lots, 4),
-            "volume_units": int(rounded_volume_units),
-            "raw_lots": calculated_lots,
-            "raw_volume_units": int(raw_volume_units),
-            "sl_pips": round(sl_pips, 2),
-            "lot_contract_size": lot_contract_size,
-            "volume_step_units": volume_step_units,
-            "calculated_volume_units": rounded_volume_units,
-            "min_volume_units": min_volume_units,
-            "max_volume_units": max_volume_units,
-            "broker_max_volume": max_volume_units,
-            "safety_max_volume_units": allowed_max_units,
-            "max_lot_cap_used": False,
-        }
-        log_live_execution_safety_check({**base_check, **result})
-        return result
-
-    lot_size = convert_ctrader_volume_to_lots(
-        rounded_volume_units,
-        lot_contract_size
+    result = risk_calculate_position_size(
+        execution_symbol,
+        account_balance,
+        risk_percent,
+        stop_loss_pips,
+        metadata,
+        convert_lots_to_volume=convert_lots_to_ctrader_volume,
+        convert_volume_to_lots=convert_ctrader_volume_to_lots,
+        payload_volume_scale=CTRADER_PAYLOAD_VOLUME_SCALE,
+        default_lot_size=get_default_broker_lot_size(execution_symbol),
+        risk_tolerance_percent=RISK_TOLERANCE_PERCENT,
+        maximum_allowed_risk_percent=get_maximum_allowed_live_risk_percent(risk_percent),
     )
 
-    if not lot_size or lot_size <= 0:
-        result = {
-            "ok": False,
-            "reason": "Calculated lot size is invalid",
-            "symbol_metadata": metadata,
-        }
-        log_live_execution_safety_check({**base_check, **result})
-        return result
-
-    final_risk_amount = lot_size * sl_pips * pip_value_per_lot
-    final_risk_percent = (final_risk_amount / balance_value) * 100
-    volume_step_lots = convert_ctrader_volume_to_lots(
-        volume_step_units,
-        lot_contract_size
-    ) or 0
-    allowed_risk_difference = (
-        volume_step_lots
-        * sl_pips
-        * pip_value_per_lot
-    ) + 0.01
-    risk_difference = abs(risk_money - final_risk_amount)
-    maximum_allowed_risk_percent = get_maximum_allowed_live_risk_percent(
-        risk_percent_value
-    )
-    minimum_volume_risk_limit = (
-        maximum_allowed_risk_percent + RISK_TOLERANCE_PERCENT
-    )
-
-    if (
-        minimum_volume_rounded_up
-        and final_risk_percent > minimum_volume_risk_limit
-    ):
-        result = {
-            **base_check,
-            "ok": False,
-            "reason": (
-                "LIVE BLOCKED: calculated volume below broker minimum and "
-                "min volume exceeds allowed risk."
-            ),
-            "symbol_metadata": metadata,
-            "lot_size": round(lot_size, 4),
-            "final_risk_amount": round(final_risk_amount, 2),
-            "final_risk_percent": round(final_risk_percent, 4),
-            "maximum_allowed_risk_percent": maximum_allowed_risk_percent,
-            "allowed_risk_percent": maximum_allowed_risk_percent,
-            "risk_tolerance_percent": RISK_TOLERANCE_PERCENT,
-        }
-        log_live_execution_safety_check(result)
-        return result
-
-    if (
-        final_risk_amount <= 0
-        or not math.isfinite(final_risk_amount)
-        or (
-            not minimum_volume_rounded_up
-            and (
-                risk_difference > allowed_risk_difference
-                or final_risk_amount > risk_money + allowed_risk_difference
-            )
+    if result.get("ok"):
+        print(
+            "LIVE POSITION SIZE:",
+            {
+                "symbol": result["symbol"],
+                "balance": result["account_balance"],
+                "risk_money": result["risk_amount"],
+                "stop_loss_pips": result["sl_pips"],
+                "pip_value": result["pip_value_per_lot"],
+                "calculated_lots": result.get("calculated_lots"),
+                "ctrader_volume_units": result["volume_units"],
+                "raw_volume_units": result["raw_volume_units"],
+                "min_volume_units": result["min_volume_units"],
+                "max_volume_units": result["max_volume_units"],
+                "volume_step_units": result["volume_step_units"],
+                "lot_size": result["lot_contract_size"],
+                "metadata_source": result["metadata_source"],
+            }
         )
-    ):
-        result = {
-            **base_check,
-            "ok": False,
-            "reason": (
-                f"Calculated risk is not close to {risk_percent_value:.2f}% "
-                "after broker rounding"
-            ),
-            "symbol_metadata": metadata,
-            "lot_size": round(lot_size, 4),
-            "final_risk_amount": round(final_risk_amount, 2),
-            "final_risk_percent": round(final_risk_percent, 4),
-            "risk_difference": round(risk_difference, 2),
-            "allowed_risk_difference": round(allowed_risk_difference, 2),
-        }
-        log_live_execution_safety_check(result)
-        return result
-
-    result = {
-        "ok": True,
-        "symbol": execution_symbol,
-        "risk_percent": risk_percent_value,
-        "risk_amount": round(risk_money, 2),
-        "account_balance": round(balance_value, 2),
-        "lot_size": round(lot_size, 4),
-        "calculated_lots": round(calculated_lots, 4),
-        "rounded_lots": round(lot_size, 4),
-        "broker_min_lots": round(broker_min_lots, 4) if broker_min_lots else None,
-        "volume_units": int(rounded_volume_units),
-        "raw_lots": calculated_lots,
-        "raw_volume_units": int(raw_volume_units),
-        "calculated_volume_units": int(calculated_volume_units),
-        "sl_pips": round(sl_pips, 2),
-        "pip_size": metadata.get("pip_size"),
-        "stop_loss_price_distance": base_check.get("stop_loss_price_distance"),
-        "pip_value_per_lot": pip_value_per_lot,
-        "pip_size": metadata.get("pip_size"),
-        "tick_size": metadata.get("tick_size"),
-        "tick_value": metadata.get("tick_value"),
-        "pip_position": metadata.get("pip_position"),
-        "lot_contract_size": lot_contract_size,
-        "volume_step_units": volume_step_units,
-        "broker_min_volume": min_volume_units,
-        "volume_step": volume_step_units,
-        "payload_volume": payload_volume,
-        "requested_units": int(rounded_volume_units),
-        "max_lot_cap_used": False,
-        "min_volume_units": min_volume_units,
-        "max_volume_units": max_volume_units,
-        "broker_max_volume": max_volume_units,
-        "volume_step_lots": metadata.get("volume_step_lots"),
-        "min_lot": metadata.get("min_lot"),
-        "max_lot": metadata.get("max_lot"),
-        "metadata_source": metadata.get("metadata_source"),
-        "final_risk_amount": round(final_risk_amount, 2),
-        "final_risk_percent": round(final_risk_percent, 4),
-        "risk_difference": round(risk_difference, 2),
-        "allowed_risk_difference": round(allowed_risk_difference, 2),
-        "maximum_allowed_risk_percent": maximum_allowed_risk_percent,
-        "allowed_risk_percent": maximum_allowed_risk_percent,
-        "risk_tolerance_percent": RISK_TOLERANCE_PERCENT,
-        "minimum_volume_rounded_up": minimum_volume_rounded_up,
-    }
-
-    print(
-        "LIVE POSITION SIZE:",
-        {
-            "symbol": result["symbol"],
-            "balance": result["account_balance"],
-            "risk_money": result["risk_amount"],
-            "stop_loss_pips": result["sl_pips"],
-            "pip_value": result["pip_value_per_lot"],
-            "calculated_lots": round(calculated_lots, 4),
-            "ctrader_volume_units": result["volume_units"],
-            "raw_volume_units": result["raw_volume_units"],
-            "min_volume_units": min_volume_units,
-            "max_volume_units": max_volume_units,
-            "volume_step_units": volume_step_units,
-            "lot_size": lot_contract_size,
-            "metadata_source": result["metadata_source"],
-        }
-    )
     log_live_execution_safety_check(result)
-
     return result
 
 def log_position_size_example(symbol, account_balance=10000, risk_percent=0.5, stop_loss_pips=10):
@@ -4895,29 +4623,17 @@ def calculate_live_risk_size(symbol, entry, sl):
         }
 
     account = get_ctrader_account_snapshot()
+    account_verification = validate_verified_account_snapshot(account)
+    if not account_verification.get("ok"):
+        risk_log_account_balance_verification_failed(
+            execution_symbol,
+            account,
+            reason=account_verification.get("account_verification_reason"),
+        )
+        return account_verification
 
-    if not account.get("ok"):
-        return {
-            "ok": False,
-            "reason": account.get("reason") or "Cannot calculate risk without account balance",
-            "account": account,
-        }
-
-    equity = account.get("equity")
-    balance = account.get("balance")
-    account_value = equity if equity is not None else balance
-
-    try:
-        account_value = float(account_value)
-    except (TypeError, ValueError):
-        account_value = 0
-
-    if account_value <= 0:
-        return {
-            "ok": False,
-            "reason": "Cannot calculate risk without account equity",
-            "account": account,
-        }
+    balance = account_verification.get("balance")
+    account_value = account_verification.get("account_equity_used")
 
     metadata = get_ctrader_symbol_risk_metadata(execution_symbol)
 
@@ -5974,6 +5690,74 @@ def log_structure_tp_trade_audit(symbol, side, trade_payload, risk_size, plan=No
         "tp_capped_at_2r": plan.get("tp_capped_at_2r"),
     })
 
+def first_valid_live_price(*values):
+    return risk_first_valid_live_price(*values)
+
+def live_prices_match(symbol, left, right):
+    return risk_live_prices_match(symbol, left, right, normalize_symbol=normalize_symbol)
+
+def build_live_protection_audit(
+    symbol,
+    side,
+    entry=None,
+    saved_sl=None,
+    broker_sl=None,
+    displayed_sl=None,
+    tp2=None,
+    broker_tp=None,
+    bid=None,
+    ask=None,
+    lot_size=None,
+    expected_loss_usd=None,
+    max_risk_usd=None,
+    repair_result=None,
+    stage=None,
+):
+    return risk_build_live_protection_audit(
+        symbol,
+        side,
+        normalize_symbol=normalize_symbol,
+        entry=entry,
+        saved_sl=saved_sl,
+        broker_sl=broker_sl,
+        displayed_sl=displayed_sl,
+        tp2=tp2,
+        broker_tp=broker_tp,
+        bid=bid,
+        ask=ask,
+        lot_size=lot_size,
+        expected_loss_usd=expected_loss_usd,
+        max_risk_usd=max_risk_usd,
+        repair_result=repair_result,
+        stage=stage,
+    )
+
+def build_live_risk_calculation_audit(symbol, side, trade_payload, risk_size, reason=None):
+    return risk_build_live_risk_calculation_audit(
+        symbol,
+        side,
+        trade_payload,
+        risk_size,
+        normalize_symbol=normalize_symbol,
+        expected_loss_calculator=calculate_expected_loss_usd_from_risk_size,
+        reason=reason,
+    )
+
+def log_live_risk_calculation_audit(symbol, side, trade_payload, risk_size, reason=None):
+    audit = risk_log_live_risk_calculation_audit(
+        symbol,
+        side,
+        trade_payload,
+        risk_size,
+        normalize_symbol=normalize_symbol,
+        expected_loss_calculator=calculate_expected_loss_usd_from_risk_size,
+        reason=reason,
+    )
+    return audit
+
+def calculate_expected_loss_usd_from_risk_size(risk_size):
+    return risk_calculate_expected_loss_usd_from_risk_size(risk_size)
+
 def is_dev_request(request: Request):
     host = request.client.host if request.client else ""
     forwarded = request.headers.get("x-forwarded-for", "")
@@ -6217,36 +6001,19 @@ def sync_live_positions():
             except (TypeError, ValueError):
                 modification_age = None
 
-            def prices_match(left, right):
-                try:
-                    tolerance = 0.005 if symbol == "XAUUSD" else 0.000005
-                    return abs(float(left) - float(right)) <= tolerance
-                except (TypeError, ValueError):
-                    return False
-
-            def first_valid_price(*values):
-                for value in values:
-                    try:
-                        numeric_value = float(value)
-                    except (TypeError, ValueError):
-                        continue
-                    if math.isfinite(numeric_value) and numeric_value > 0:
-                        return numeric_value
-                return None
-
-            saved_sl = first_valid_price(
+            saved_sl = first_valid_live_price(
                 user_modified_levels.get("sl"),
                 (current_order or {}).get("sl"),
                 (current_order or {}).get("current_sl"),
                 (current_order or {}).get("planned_sl"),
             )
-            saved_tp1 = first_valid_price(
+            saved_tp1 = first_valid_live_price(
                 user_modified_levels.get("tp1"),
                 (current_order or {}).get("tp1"),
                 (current_order or {}).get("take_profit_1"),
                 (current_order or {}).get("planned_tp1"),
             )
-            saved_tp2 = first_valid_price(
+            saved_tp2 = first_valid_live_price(
                 user_modified_levels.get("tp2"),
                 (current_order or {}).get("tp2"),
                 (current_order or {}).get("take_profit_2"),
@@ -6255,22 +6022,8 @@ def sync_live_positions():
             )
             broker_grace_active = modification_age is not None and modification_age <= 120
 
-            if saved_sl is not None and (
-                synced_sl is None
-                or (broker_grace_active and not prices_match(synced_sl, saved_sl))
-            ):
-                synced_sl = saved_sl
-                refresh_overwrite_blocked = True
-
-            if saved_tp2 is not None and (
-                synced_tp2 is None
-                or (broker_grace_active and not prices_match(synced_tp2, saved_tp2))
-            ):
-                synced_tp2 = saved_tp2
-                refresh_overwrite_blocked = True
-
             if saved_tp1 is not None:
-                if synced_tp1 is None or not prices_match(synced_tp1, saved_tp1):
+                if synced_tp1 is None or not live_prices_match(symbol, synced_tp1, saved_tp1):
                     refresh_overwrite_blocked = True
                 synced_tp1 = saved_tp1
             else:
@@ -6288,31 +6041,102 @@ def sync_live_positions():
                 saved_tp2 is not None
                 and (
                     broker_synced_tp2 is None
-                    or not prices_match(broker_synced_tp2, saved_tp2)
+                    or not live_prices_match(symbol, broker_synced_tp2, saved_tp2)
                 )
             )
             broker_sl_missing_or_mismatch = (
                 saved_sl is not None
                 and (
                     broker_synced_sl is None
-                    or not prices_match(broker_synced_sl, saved_sl)
+                    or not live_prices_match(symbol, broker_synced_sl, saved_sl)
                 )
             )
+            broker_sl_repair_result = None
+            broker_tp_before_repair = broker_synced_tp2
+            broker_sl_before_repair = broker_synced_sl
 
-            if position_id and broker_tp_missing_or_mismatch:
+            print("LIVE_ORDER_PROTECTION_AUDIT =", build_live_protection_audit(
+                symbol,
+                side,
+                entry=entry,
+                saved_sl=saved_sl,
+                broker_sl=broker_synced_sl,
+                displayed_sl=broker_synced_sl,
+                tp2=saved_tp2,
+                broker_tp=broker_synced_tp2,
+                bid=live_bid_for_position,
+                ask=live_ask_for_position,
+                lot_size=broker_lot_size,
+                stage="live_sync_compare",
+            ))
+
+            if position_id and broker_sl_missing_or_mismatch:
+                broker_sl_repair_result = modify_position_sltp(
+                    position_id,
+                    stop_loss_price=saved_sl,
+                    take_profit_price=saved_tp2 if broker_tp_missing_or_mismatch else None,
+                )
+                print("LIVE_BROKER_SL_REPAIR =", build_live_protection_audit(
+                    symbol,
+                    side,
+                    entry=entry,
+                    saved_sl=saved_sl,
+                    broker_sl=broker_synced_sl,
+                    displayed_sl=broker_synced_sl,
+                    tp2=saved_tp2,
+                    broker_tp=broker_synced_tp2,
+                    bid=live_bid_for_position,
+                    ask=live_ask_for_position,
+                    lot_size=broker_lot_size,
+                    repair_result=broker_sl_repair_result,
+                    stage="live_sync_sl_repair",
+                ))
+
+                if broker_sl_repair_result.get("ok"):
+                    broker_synced_sl = saved_sl
+                    synced_sl = saved_sl
+                    if broker_tp_missing_or_mismatch and saved_tp2 is not None:
+                        broker_synced_tp2 = saved_tp2
+                        synced_tp2 = saved_tp2
+                        print("LIVE_BROKER_TP_REPAIR =", {
+                            "symbol": symbol,
+                            "side": side,
+                            "position_id": position_id,
+                            "entry": entry,
+                            "saved_sl": saved_sl,
+                            "broker_sl_before": broker_sl_before_repair,
+                            "displayed_sl": synced_sl,
+                            "saved_tp2": saved_tp2,
+                            "broker_tp_before": broker_tp_before_repair,
+                            "bid": live_bid_for_position,
+                            "ask": live_ask_for_position,
+                            "lot_size": broker_lot_size,
+                            "tp1_managed_by_flowsignal": True,
+                            "broker_tp_should_be_tp2": True,
+                            "repair_result": broker_sl_repair_result,
+                        })
+
+            if position_id and broker_tp_missing_or_mismatch and not (
+                broker_sl_repair_result and broker_sl_repair_result.get("ok")
+            ):
                 broker_tp_repair_result = modify_position_sltp(
                     position_id,
-                    stop_loss_price=saved_sl if broker_sl_missing_or_mismatch else None,
+                    stop_loss_price=None,
                     take_profit_price=saved_tp2,
                 )
                 print("LIVE_BROKER_TP_REPAIR =", {
                     "symbol": symbol,
+                    "side": side,
                     "position_id": position_id,
                     "entry": entry,
                     "saved_sl": saved_sl,
                     "broker_sl_before": broker_synced_sl,
+                    "displayed_sl": broker_synced_sl,
                     "saved_tp2": saved_tp2,
                     "broker_tp_before": broker_synced_tp2,
+                    "bid": live_bid_for_position,
+                    "ask": live_ask_for_position,
+                    "lot_size": broker_lot_size,
                     "tp1_managed_by_flowsignal": True,
                     "broker_tp_should_be_tp2": True,
                     "repair_result": broker_tp_repair_result,
@@ -6321,9 +6145,32 @@ def sync_live_positions():
                 if broker_tp_repair_result.get("ok"):
                     broker_synced_tp2 = saved_tp2
                     synced_tp2 = saved_tp2
-                    if broker_sl_missing_or_mismatch:
-                        broker_synced_sl = saved_sl
-                        synced_sl = saved_sl
+
+            if broker_sl_missing_or_mismatch and not (
+                broker_sl_repair_result and broker_sl_repair_result.get("ok")
+            ):
+                synced_sl = None
+                print("BROKER_SL_MISSING_WARNING =", build_live_protection_audit(
+                    symbol,
+                    side,
+                    entry=entry,
+                    saved_sl=saved_sl,
+                    broker_sl=broker_synced_sl,
+                    displayed_sl=None,
+                    tp2=saved_tp2,
+                    broker_tp=broker_synced_tp2,
+                    bid=live_bid_for_position,
+                    ask=live_ask_for_position,
+                    lot_size=broker_lot_size,
+                    repair_result=broker_sl_repair_result,
+                    stage="live_sync_sl_repair_failed",
+                ))
+
+            if broker_tp_missing_or_mismatch and not (
+                (broker_tp_repair_result and broker_tp_repair_result.get("ok"))
+                or (broker_sl_repair_result and broker_sl_repair_result.get("ok"))
+            ):
+                synced_tp2 = None
 
             if synced_tp1 is None or synced_tp2 is None:
                 print("TRADE_LEVEL_WARNING =", {
@@ -6459,13 +6306,22 @@ def sync_live_positions():
                 "planned_sl": planned_sl,
                 "broker_stop_loss_confirmed": synced_sl is not None,
                 "broker_stop_loss_missing": synced_sl is None,
+                "broker_sl_warning": (
+                    "BROKER SL MISSING"
+                    if synced_sl is None and saved_sl is not None
+                    else None
+                ),
+                "broker_sl_repair_result": broker_sl_repair_result,
                 "tp1": synced_tp1,
                 "tp2": synced_tp2,
                 "planned_tp1": planned_tp1,
                 "planned_tp2": planned_tp2,
                 "broker_take_profit_confirmed": synced_tp2 is not None,
                 "broker_take_profit_missing": synced_tp2 is None,
+                "broker_tp_repair_result": broker_tp_repair_result,
                 "current_price": used_current_price,
+                "bid": live_bid_for_position,
+                "ask": live_ask_for_position,
                 "current_high": current_high,
                 "current_low": current_low,
                 "position_current_price": current_price,
@@ -7559,6 +7415,13 @@ def execute_live_order_core(payload: dict, source="manual"):
 
     if not risk_size.get("ok"):
         reason = risk_size.get("reason") or "Live risk sizing failed"
+        risk_calculation_audit = log_live_risk_calculation_audit(
+            symbol,
+            side,
+            trade_payload,
+            risk_size,
+            reason=reason,
+        )
         live_risk_debug = build_live_risk_debug(
             symbol,
             side,
@@ -7573,6 +7436,7 @@ def execute_live_order_core(payload: dict, source="manual"):
                 "blocked_reason": reason,
                 "broker_rejection_reason": reason,
                 "live_risk_debug": live_risk_debug,
+                "live_risk_calculation_audit": risk_calculation_audit,
             },
         )
 
@@ -7590,7 +7454,7 @@ def execute_live_order_core(payload: dict, source="manual"):
                 signal=trade_payload.get("signal"),
                 stage="risk_sizing",
                 reason=reason,
-                details=risk_size,
+                details=risk_block_details,
             )
 
         log_live_xauusd_execution_debug(
@@ -7612,6 +7476,87 @@ def execute_live_order_core(payload: dict, source="manual"):
             reason,
             reason,
             details=risk_block_details,
+        )
+
+    expected_loss_usd = calculate_expected_loss_usd_from_risk_size(risk_size)
+    max_risk_usd = risk_size.get("risk_amount")
+    try:
+        max_risk_value = float(max_risk_usd)
+    except (TypeError, ValueError):
+        max_risk_value = None
+
+    if is_expected_loss_oversized(expected_loss_usd, max_risk_value):
+        reason = "LIVE_RISK_OVERSIZE_BLOCK: expected SL loss exceeds configured max risk"
+        risk_calculation_audit = log_live_risk_calculation_audit(
+            symbol,
+            side,
+            trade_payload,
+            {
+                **risk_size,
+                "expected_loss_usd": expected_loss_usd,
+                "max_risk_usd": max_risk_usd,
+            },
+            reason=reason,
+        )
+        print("LIVE_RISK_OVERSIZE_BLOCK =", build_live_protection_audit(
+            symbol,
+            side,
+            entry=trade_payload.get("entry"),
+            saved_sl=trade_payload.get("sl"),
+            broker_sl=None,
+            displayed_sl=None,
+            tp2=trade_payload.get("tp2"),
+            broker_tp=None,
+            lot_size=risk_size.get("lot_size"),
+            expected_loss_usd=(
+                round(expected_loss_usd, 2)
+                if isinstance(expected_loss_usd, (int, float))
+                else expected_loss_usd
+            ),
+            max_risk_usd=max_risk_usd,
+            repair_result=None,
+            stage="pre_order_risk_validation",
+        ))
+
+        if source == "auto":
+            set_auto_trade_status(
+                symbol=symbol,
+                signal=trade_payload.get("signal"),
+                action=side,
+                status="BLOCKED",
+                reason=reason,
+                details={
+                    **risk_size,
+                    "expected_loss_usd": expected_loss_usd,
+                    "max_risk_usd": max_risk_usd,
+                    "live_risk_calculation_audit": risk_calculation_audit,
+                },
+            )
+            log_auto_trade_blocked_reason(
+                symbol=symbol,
+                signal=trade_payload.get("signal"),
+                stage="risk_oversize",
+                reason=reason,
+                details={
+                    **risk_size,
+                    "expected_loss_usd": expected_loss_usd,
+                    "max_risk_usd": max_risk_usd,
+                    "live_risk_calculation_audit": risk_calculation_audit,
+                },
+            )
+
+        return reject_live_execution_block(
+            symbol,
+            side,
+            trade_payload,
+            reason,
+            reason,
+            details={
+                **risk_size,
+                "expected_loss_usd": expected_loss_usd,
+                "max_risk_usd": max_risk_usd,
+                "live_risk_calculation_audit": risk_calculation_audit,
+            },
         )
 
     trade_payload.update({
@@ -7832,11 +7777,24 @@ def execute_live_order_core(payload: dict, source="manual"):
         "volume_units": risk_size.get("volume_units"),
         "entry": trade_payload.get("entry"),
         "SL": trade_payload.get("sl"),
+        "saved_sl": trade_payload.get("sl"),
+        "broker_sl": None,
+        "displayed_sl": None,
         "TP1": trade_payload.get("tp1"),
         "TP2": trade_payload.get("tp2"),
+        "tp2": trade_payload.get("tp2"),
+        "broker_tp": None,
+        "expected_loss_usd": trade_payload.get("expected_loss_usd"),
+        "max_risk_usd": trade_payload.get("max_risk_usd"),
         "broker_take_profit_source": "TP2",
         "tp1_managed_by_flowsignal": True,
         "tp2_sent_to_broker": True,
+        "expected_loss_usd": (
+            round(expected_loss_usd, 2)
+            if isinstance(expected_loss_usd, (int, float))
+            else expected_loss_usd
+        ),
+        "max_risk_usd": max_risk_usd,
     })
 
     result = place_market_order(
@@ -7856,11 +7814,15 @@ def execute_live_order_core(payload: dict, source="manual"):
         reason = result.get("reason") or result.get("message") or "Order rejected"
 
         if result.get("critical_unprotected_position"):
+            emergency_close_result = None
+            if result.get("position_id"):
+                emergency_close_result = close_position(result.get("position_id"))
             print("LIVE RISK ERROR: trade has no broker SL/TP", {
                 "symbol": symbol,
                 "position_id": result.get("position_id"),
                 "broker_sl_confirmed": result.get("broker_sl_confirmed"),
                 "broker_tp_confirmed": result.get("broker_tp_confirmed"),
+                "emergency_close_result": emergency_close_result,
             })
             sync_live_positions()
 
@@ -8007,6 +7969,25 @@ def execute_live_order_core(payload: dict, source="manual"):
         "sl_protection_error": None,
         "sl_protection_broker_result": None,
     }
+    print("CTRADER_SLTP_CONFIRMATION =", build_live_protection_audit(
+        symbol,
+        side,
+        entry=trade_payload.get("entry"),
+        saved_sl=trade_payload.get("sl"),
+        broker_sl=result.get("broker_stop_loss_attached"),
+        displayed_sl=(
+            result.get("broker_stop_loss_attached")
+            if result.get("broker_sl_confirmed") is True
+            else None
+        ),
+        tp2=trade_payload.get("tp2"),
+        broker_tp=result.get("broker_take_profit_attached"),
+        lot_size=trade_payload.get("lot_size"),
+        expected_loss_usd=trade_payload.get("expected_loss_usd"),
+        max_risk_usd=trade_payload.get("max_risk_usd"),
+        repair_result=result.get("tp_amend_result"),
+        stage="after_order_success",
+    ))
     ensure_live_trade_identity(LIVE_ACTIVE_ORDERS[symbol], symbol)
     ui_signal_state = f"{side} RUNNING" if side in ["BUY", "SELL"] else "TRADE RUNNING"
     LIVE_ACTIVE_ORDERS[symbol]["ui_signal_state"] = ui_signal_state

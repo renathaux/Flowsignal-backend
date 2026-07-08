@@ -190,6 +190,8 @@ DEFAULT_CTRADER_ACCOUNT_SETTINGS = {
     "accounts": [],
     "forgotten_account_ids": [],
     "last_refresh": None,
+    "active_account_snapshot": None,
+    "active_account_snapshot_refreshed_at": None,
 }
 
 CTRADER_UNAUTHORIZED_ACCOUNT_MESSAGE = (
@@ -414,6 +416,23 @@ def save_ctrader_account_settings(settings):
     payload.update(settings or {})
     CTRADER_ACCOUNTS_PATH.write_text(json.dumps(payload, indent=2, default=str))
     return payload
+
+def clear_active_ctrader_account_balance_cache(settings=None, persist=True):
+    current_settings = settings if isinstance(settings, dict) else load_ctrader_account_settings()
+    current_settings["active_account_snapshot"] = None
+    current_settings["active_account_snapshot_refreshed_at"] = None
+
+    for account in current_settings.get("accounts", []):
+        if not isinstance(account, dict):
+            continue
+        account["balance_verified"] = False
+        account["equity_verified"] = False
+        account["balance_source"] = "stale_cache_cleared"
+        account["equity_source"] = "stale_cache_cleared"
+
+    if persist:
+        save_ctrader_account_settings(current_settings)
+    return current_settings
 
 def get_selected_ctrader_account_source():
     settings = load_ctrader_account_settings()
@@ -808,6 +827,7 @@ def set_active_ctrader_account(account_id):
 
     settings["active_account_id"] = account_id
     settings["active_account_env"] = account_env
+    clear_active_ctrader_account_balance_cache(settings, persist=False)
     save_ctrader_account_settings(settings)
     os.environ["ACTIVE_CTRADER_ACCOUNT_ID"] = account_id
     os.environ["ACTIVE_CTRADER_ACCOUNT_ENV"] = account_env
@@ -821,17 +841,38 @@ def set_active_ctrader_account(account_id):
     CONNECTED["mode"] = account_env
     CONNECTED["execution_ready"] = True
     clear_ctrader_connection_cache()
+    try:
+        fresh_snapshot = get_ctrader_account_snapshot()
+    except Exception as exc:
+        fresh_snapshot = {
+            "ok": False,
+            "broker": "ctrader",
+            "mode": account_env,
+            "account_id": account_id,
+            "reason": describe_ctrader_error(exc),
+            "balance": None,
+            "equity": None,
+            "balance_verified": False,
+            "equity_verified": False,
+            "cached_balance_used": False,
+        }
+        print("ACCOUNT_BALANCE_VERIFICATION_FAILED =", fresh_snapshot)
 
     print("ACTIVE_ACCOUNT_SELECTED_DEBUG =", {
         "ok": True,
         "account_id": account_id,
         "env": account_env,
+        "fresh_balance_verified": fresh_snapshot.get("balance_verified"),
+        "fresh_equity_verified": fresh_snapshot.get("equity_verified"),
+        "fresh_balance": fresh_snapshot.get("balance"),
+        "fresh_equity": fresh_snapshot.get("equity"),
     })
 
     return {
         "ok": True,
         "account_id": account_id,
         "env": account_env,
+        "fresh_account_snapshot": fresh_snapshot,
         **get_ctrader_account_selection_debug(),
     }
 
@@ -2331,7 +2372,7 @@ def build_ctrader_order_payload_volume_check(symbol, calculated_volume_units, vo
         final_risk_percent_value is not None
         and final_risk_percent_value > 0
         and final_risk_percent_value
-        <= maximum_allowed_risk_percent_value + risk_tolerance_percent_value + 1e-9
+        <= maximum_allowed_risk_percent_value + 1e-9
     )
     risk_difference = (
         final_risk_percent_value - maximum_allowed_risk_percent_value
@@ -2848,6 +2889,19 @@ def place_market_order(
                 "amend_result": tp_amend_result,
                 "broker_position": broker_position_after_send,
             })
+            print("CTRADER_SLTP_CONFIRMATION =", {
+                "stage": "broker_response_unprotected_after_repair",
+                "symbol": normalized_symbol,
+                "side": normalized_action,
+                "entry": entry,
+                "saved_sl": sl,
+                "broker_sl": broker_sl_after_send,
+                "displayed_sl": None,
+                "tp2": broker_take_profit,
+                "broker_tp": broker_tp_after_send,
+                "lot_size": volume,
+                "repair_result": tp_amend_result,
+            })
             return {
                 "ok": False,
                 "broker": "ctrader",
@@ -2915,6 +2969,19 @@ def place_market_order(
                 if broker_tp_confirmed
                 else "Broker TP2 was not present after send/amend verification"
             ),
+        })
+        print("CTRADER_SLTP_CONFIRMATION =", {
+            "stage": "broker_response_verified",
+            "symbol": normalized_symbol,
+            "side": normalized_action,
+            "entry": entry,
+            "saved_sl": sl,
+            "broker_sl": broker_sl_after_send,
+            "displayed_sl": broker_sl_after_send if broker_sl_confirmed else None,
+            "tp2": broker_take_profit,
+            "broker_tp": broker_tp_after_send,
+            "lot_size": volume,
+            "repair_result": tp_amend_result,
         })
 
         return {
@@ -3010,6 +3077,7 @@ def parse_ctrader_money(value, money_digits=2):
 
 def get_ctrader_account_snapshot():
     config = get_ctrader_config()
+    settings = load_ctrader_account_settings()
 
     if not config:
         return {
@@ -3018,9 +3086,14 @@ def get_ctrader_account_snapshot():
             "reason": "Missing or invalid cTrader config",
             "balance": None,
             "equity": None,
+            "balance_verified": False,
+            "equity_verified": False,
+            "cached_balance_used": False,
+            "account_list_last_refresh": settings.get("last_refresh"),
         }
 
     account_id = int(config["account_id"])
+    saved_account = get_saved_ctrader_account(account_id) or {}
     host, port = CTRADER_JSON_ENDPOINTS[config["env"]]
     sock = open_ctrader_json_socket(host, port)
 
@@ -3037,15 +3110,18 @@ def get_ctrader_account_snapshot():
         payload = response.get("payload", {})
         trader = payload.get("trader") or payload
         money_digits = trader.get("moneyDigits", payload.get("moneyDigits", 2))
+        raw_balance = trader.get("balance") if "balance" in trader else payload.get("balance")
+        raw_equity = trader.get("equity") if "equity" in trader else payload.get("equity")
         balance = parse_ctrader_money(
-            trader.get("balance") or payload.get("balance"),
+            raw_balance,
             money_digits
         )
         equity = parse_ctrader_money(
-            trader.get("equity") or payload.get("equity"),
+            raw_equity,
             money_digits
         )
         equity_source = "broker"
+        equity_verified = equity is not None
 
         if equity is None and balance is not None:
             try:
@@ -3060,20 +3136,60 @@ def get_ctrader_account_snapshot():
                 )
                 equity = float(balance) + open_net_pnl
                 equity_source = "balance_plus_unrealized_pnl"
+                equity_verified = True
             except Exception as equity_error:
                 print("CTRADER_EQUITY_CALCULATION_ERROR:", str(equity_error))
                 equity = balance
                 equity_source = "balance_fallback"
+                equity_verified = False
+
+        snapshot_refreshed_at = datetime.now(timezone.utc).isoformat()
+        audit = {
+            "active_account_id": str(account_id),
+            "account_number": (
+                trader.get("accountNumber")
+                or trader.get("account_number")
+                or trader.get("traderLogin")
+                or saved_account.get("account_number")
+                or saved_account.get("traderLogin")
+            ),
+            "broker_environment": config["env"],
+            "env_from_selection": get_active_ctrader_account_env(),
+            "env_from_env_file": os.getenv("CTRADER_ENV"),
+            "raw_balance_from_ctrader": raw_balance,
+            "raw_equity_from_ctrader": raw_equity,
+            "money_digits": money_digits,
+            "balance_returned_by_ctrader": balance,
+            "equity_returned_by_ctrader": equity,
+            "equity_source": equity_source,
+            "balance_verified": balance is not None,
+            "equity_verified": equity_verified,
+            "cached_balance_used": False,
+            "cached_balance": saved_account.get("balance"),
+            "cached_equity": saved_account.get("equity"),
+            "account_list_last_refresh": settings.get("last_refresh"),
+            "snapshot_refreshed_at": snapshot_refreshed_at,
+        }
+        print("CTRADER_ACCOUNT_BALANCE_AUDIT =", audit)
+        settings["active_account_snapshot"] = audit
+        settings["active_account_snapshot_refreshed_at"] = snapshot_refreshed_at
+        save_ctrader_account_settings(settings)
 
         return {
             "ok": True,
             "broker": "ctrader",
             "mode": config["env"],
             "account_id": account_id,
+            "account_number": audit["account_number"],
             "currency": trader.get("depositAssetId") or trader.get("currency"),
             "balance": balance,
             "equity": equity,
             "equity_source": equity_source,
+            "balance_verified": balance is not None,
+            "equity_verified": equity_verified,
+            "cached_balance_used": False,
+            "account_list_last_refresh": settings.get("last_refresh"),
+            "snapshot_refreshed_at": snapshot_refreshed_at,
             "money_digits": money_digits,
             "raw": {
                 key: trader.get(key)
@@ -3093,9 +3209,19 @@ def get_ctrader_account_snapshot():
             "broker": "ctrader",
             "mode": config["env"],
             "account_id": account_id,
+            "account_number": (
+                saved_account.get("account_number")
+                or saved_account.get("traderLogin")
+            ),
             "reason": str(e),
             "balance": None,
             "equity": None,
+            "balance_verified": False,
+            "equity_verified": False,
+            "cached_balance_used": False,
+            "cached_balance": saved_account.get("balance"),
+            "cached_equity": saved_account.get("equity"),
+            "account_list_last_refresh": settings.get("last_refresh"),
         }
     finally:
         try:
