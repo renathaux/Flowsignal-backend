@@ -3106,22 +3106,25 @@ def update_live_trade_tp_protection(trade):
     elif side == "SELL" and ask is not None:
         trigger_price = ask
 
+    buy_trigger_high = current_high if current_high is not None else trigger_price
+    sell_trigger_low = current_low if current_low is not None else trigger_price
+
     tp1_hit_detected = bool(
         tp1 is not None
-        and trigger_price is not None
+        and (trigger_price is not None or buy_trigger_high is not None or sell_trigger_low is not None)
         and (
-            (side == "BUY" and trigger_price >= tp1)
+            (side == "BUY" and buy_trigger_high is not None and buy_trigger_high >= tp1)
             or
-            (side == "SELL" and trigger_price <= tp1)
+            (side == "SELL" and sell_trigger_low is not None and sell_trigger_low <= tp1)
         )
     )
     tp2_hit_detected = bool(
         tp2 is not None
-        and trigger_price is not None
+        and (trigger_price is not None or buy_trigger_high is not None or sell_trigger_low is not None)
         and (
-            (side == "BUY" and trigger_price >= tp2)
+            (side == "BUY" and buy_trigger_high is not None and buy_trigger_high >= tp2)
             or
-            (side == "SELL" and trigger_price <= tp2)
+            (side == "SELL" and sell_trigger_low is not None and sell_trigger_low <= tp2)
         )
     )
 
@@ -3164,6 +3167,8 @@ def update_live_trade_tp_protection(trade):
             "bid": bid,
             "ask": ask,
             "trigger_price": trigger_price,
+            "buy_trigger_high": buy_trigger_high,
+            "sell_trigger_low": sell_trigger_low,
             "current_high": current_high,
             "current_low": current_low,
             "close_result": close_result,
@@ -3183,6 +3188,8 @@ def update_live_trade_tp_protection(trade):
             "bid": bid,
             "ask": ask,
             "trigger_price": trigger_price,
+            "buy_trigger_high": buy_trigger_high,
+            "sell_trigger_low": sell_trigger_low,
             "current_high": current_high,
             "current_low": current_low,
         })
@@ -3199,6 +3206,8 @@ def update_live_trade_tp_protection(trade):
             "bid": bid,
             "ask": ask,
             "trigger_price": trigger_price,
+            "buy_trigger_high": buy_trigger_high,
+            "sell_trigger_low": sell_trigger_low,
             "current_high": current_high,
             "current_low": current_low,
             "tp1": tp1,
@@ -3219,6 +3228,8 @@ def update_live_trade_tp_protection(trade):
         "bid": bid,
         "ask": ask,
         "trigger_price": trigger_price,
+        "buy_trigger_high": buy_trigger_high,
+        "sell_trigger_low": sell_trigger_low,
         "current_high": current_high,
         "current_low": current_low,
         "tp1": tp1,
@@ -4699,6 +4710,45 @@ def calculate_live_risk_size(symbol, entry, sl):
         "lots": position_size.get("lot_size"),
         "volume_units": position_size.get("volume_units"),
     })
+    print("LIVE_RISK_POSITION_SIZING_AUDIT", {
+        "symbol": execution_symbol,
+        "account_equity": position_size.get("account_equity"),
+        "account_equity_used": position_size.get("account_equity_used"),
+        "risk_percent": position_size.get("risk_percent"),
+        "max_risk_dollars": (
+            position_size.get("max_risk_dollars")
+            or position_size.get("risk_amount")
+        ),
+        "sl_pips": position_size.get("sl_pips"),
+        "pip_value_per_1_lot": position_size.get("pip_value_per_lot"),
+        "raw_lot": (
+            position_size.get("raw_lot")
+            if position_size.get("raw_lot") is not None
+            else position_size.get("raw_lots")
+        ),
+        "rounded_lot": (
+            position_size.get("rounded_lot")
+            if position_size.get("rounded_lot") is not None
+            else position_size.get("lot_size")
+        ),
+        "raw_volume_units": position_size.get("raw_volume_units"),
+        "rounded_volume_units": position_size.get("volume_units"),
+        "broker_min_volume_units": position_size.get("min_volume_units"),
+        "broker_volume_step_units": position_size.get("volume_step_units"),
+        "expected_risk_percent": (
+            position_size.get("expected_risk_percent")
+            if position_size.get("expected_risk_percent") is not None
+            else position_size.get("final_risk_percent")
+        ),
+        "reason_if_blocked": (
+            None
+            if position_size.get("ok")
+            else (
+                position_size.get("reason_if_blocked")
+                or position_size.get("reason")
+            )
+        ),
+    })
     return position_size
 
 def log_xauusd_live_risk_diagnostics(symbol, trade_payload, risk_size):
@@ -6149,14 +6199,14 @@ def sync_live_positions():
             if broker_sl_missing_or_mismatch and not (
                 broker_sl_repair_result and broker_sl_repair_result.get("ok")
             ):
-                synced_sl = None
+                synced_sl = saved_sl
                 print("BROKER_SL_MISSING_WARNING =", build_live_protection_audit(
                     symbol,
                     side,
                     entry=entry,
                     saved_sl=saved_sl,
                     broker_sl=broker_synced_sl,
-                    displayed_sl=None,
+                    displayed_sl=synced_sl,
                     tp2=saved_tp2,
                     broker_tp=broker_synced_tp2,
                     bid=live_bid_for_position,
@@ -6170,7 +6220,7 @@ def sync_live_positions():
                 (broker_tp_repair_result and broker_tp_repair_result.get("ok"))
                 or (broker_sl_repair_result and broker_sl_repair_result.get("ok"))
             ):
-                synced_tp2 = None
+                synced_tp2 = saved_tp2
 
             if synced_tp1 is None or synced_tp2 is None:
                 print("TRADE_LEVEL_WARNING =", {
@@ -6220,6 +6270,21 @@ def sync_live_positions():
                 if numeric_observed_prices
                 else used_current_price
             )
+
+            broker_stop_loss_confirmed = not (
+                broker_sl_missing_or_mismatch
+                and not (
+                    broker_sl_repair_result
+                    and broker_sl_repair_result.get("ok")
+                )
+            ) and synced_sl is not None
+            broker_take_profit_confirmed = not (
+                broker_tp_missing_or_mismatch
+                and not (
+                    (broker_tp_repair_result and broker_tp_repair_result.get("ok"))
+                    or (broker_sl_repair_result and broker_sl_repair_result.get("ok"))
+                )
+            ) and synced_tp2 is not None
 
             if symbol == "EURUSD":
                 detected_pl_fields = {
@@ -6304,11 +6369,11 @@ def sync_live_positions():
                     or planned_sl
                 ),
                 "planned_sl": planned_sl,
-                "broker_stop_loss_confirmed": synced_sl is not None,
-                "broker_stop_loss_missing": synced_sl is None,
+                "broker_stop_loss_confirmed": broker_stop_loss_confirmed,
+                "broker_stop_loss_missing": not broker_stop_loss_confirmed,
                 "broker_sl_warning": (
                     "BROKER SL MISSING"
-                    if synced_sl is None and saved_sl is not None
+                    if not broker_stop_loss_confirmed and saved_sl is not None
                     else None
                 ),
                 "broker_sl_repair_result": broker_sl_repair_result,
@@ -6316,8 +6381,8 @@ def sync_live_positions():
                 "tp2": synced_tp2,
                 "planned_tp1": planned_tp1,
                 "planned_tp2": planned_tp2,
-                "broker_take_profit_confirmed": synced_tp2 is not None,
-                "broker_take_profit_missing": synced_tp2 is None,
+                "broker_take_profit_confirmed": broker_take_profit_confirmed,
+                "broker_take_profit_missing": not broker_take_profit_confirmed,
                 "broker_tp_repair_result": broker_tp_repair_result,
                 "current_price": used_current_price,
                 "bid": live_bid_for_position,
