@@ -14,6 +14,19 @@ def round_volume_down_to_step(volume_units, step_units):
     return (volume // step) * step
 
 
+def calculate_raw_volume_units_down(lots, lot_contract_size):
+    try:
+        raw_units = float(lots) * float(lot_contract_size)
+    except (TypeError, ValueError):
+        return 0
+
+    if not math.isfinite(raw_units) or raw_units <= 0:
+        return 0
+
+    epsilon = max(1e-9, abs(raw_units) * 1e-9)
+    return int(math.floor(raw_units + epsilon))
+
+
 def calculate_max_risk_usd(account_equity, risk_percent):
     try:
         equity = float(account_equity)
@@ -123,13 +136,13 @@ def calculate_position_size(
             "symbol_metadata": metadata,
         }
 
-    raw_volume_units = convert_lots_to_volume(calculated_lots, lot_contract_size)
+    raw_volume_units = calculate_raw_volume_units_down(
+        calculated_lots,
+        lot_contract_size,
+    )
     rounded_volume_units = round_volume_down_to_step(raw_volume_units, volume_step_units)
     calculated_volume_units = rounded_volume_units
     minimum_volume_rounded_up = rounded_volume_units < min_volume_units
-
-    if minimum_volume_rounded_up:
-        rounded_volume_units = min_volume_units
 
     rounded_lots = convert_volume_to_lots(rounded_volume_units, lot_contract_size)
     broker_min_lots = convert_volume_to_lots(min_volume_units, lot_contract_size)
@@ -146,12 +159,15 @@ def calculate_position_size(
         "symbol": execution_symbol,
         "account_balance": round(equity_value, 2),
         "risk_percent": risk_percent_value,
+        "max_risk_dollars": round(risk_money, 2),
         "risk_amount": round(risk_money, 2),
         "sl_pips": round(sl_pips, 2),
         "pip_size": pip_size,
         "stop_loss_price_distance": stop_loss_price_distance,
         "pip_value_per_lot": pip_value_per_lot,
+        "raw_lot": calculated_lots,
         "calculated_lots": round(calculated_lots, 4),
+        "rounded_lot": round(rounded_lots, 4) if rounded_lots else 0,
         "rounded_lots": round(rounded_lots, 4) if rounded_lots else 0,
         "broker_min_lots": round(broker_min_lots, 4) if broker_min_lots else None,
         "broker_min_volume": min_volume_units,
@@ -169,11 +185,41 @@ def calculate_position_size(
         "minimum_volume_rounded_up": minimum_volume_rounded_up,
     }
 
+    if minimum_volume_rounded_up:
+        return {
+            **base_check,
+            "ok": False,
+            "reason": (
+                "LIVE BLOCKED: calculated volume below broker minimum and "
+                "rounding down would be below broker minimum."
+            ),
+            "reason_if_blocked": (
+                "Rounded-down risk-based volume is below broker minimum"
+            ),
+            "symbol_metadata": metadata,
+            "lot_size": round(rounded_lots, 4) if rounded_lots else 0,
+            "final_risk_amount": 0,
+            "final_risk_percent": 0,
+            "expected_risk_percent": 0,
+            "maximum_allowed_risk_percent": (
+                maximum_allowed_risk_percent
+                if maximum_allowed_risk_percent is not None
+                else risk_percent_value
+            ),
+            "allowed_risk_percent": (
+                maximum_allowed_risk_percent
+                if maximum_allowed_risk_percent is not None
+                else risk_percent_value
+            ),
+            "risk_tolerance_percent": risk_tolerance_percent,
+        }
+
     if rounded_volume_units <= 0:
         return {
             **base_check,
             "ok": False,
             "reason": "Calculated volume is invalid",
+            "reason_if_blocked": "Calculated volume is invalid",
             "symbol_metadata": metadata,
         }
 
@@ -182,6 +228,7 @@ def calculate_position_size(
             **base_check,
             "ok": False,
             "reason": "Calculated volume is not aligned with broker step",
+            "reason_if_blocked": "Calculated volume is not aligned with broker step",
             "symbol_metadata": metadata,
         }
 
@@ -190,6 +237,7 @@ def calculate_position_size(
             **base_check,
             "ok": False,
             "reason": "Calculated volume is above broker/safety maximum",
+            "reason_if_blocked": "Calculated volume is above broker/safety maximum",
             "symbol_metadata": metadata,
             "pip_value_per_lot": pip_value_per_lot,
             "lot_size": round(calculated_lots, 4),
@@ -205,6 +253,7 @@ def calculate_position_size(
             **base_check,
             "ok": False,
             "reason": "Calculated lot size is invalid",
+            "reason_if_blocked": "Calculated lot size is invalid",
             "symbol_metadata": metadata,
         }
 
@@ -216,25 +265,6 @@ def calculate_position_size(
     max_allowed_percent = maximum_allowed_risk_percent
     if max_allowed_percent is None:
         max_allowed_percent = risk_percent_value + 0.01
-    minimum_volume_risk_limit = max_allowed_percent + risk_tolerance_percent
-
-    if minimum_volume_rounded_up and final_risk_percent > minimum_volume_risk_limit:
-        return {
-            **base_check,
-            "ok": False,
-            "reason": (
-                "LIVE BLOCKED: calculated volume below broker minimum and "
-                "min volume exceeds allowed risk."
-            ),
-            "symbol_metadata": metadata,
-            "lot_size": round(lot_size, 4),
-            "final_risk_amount": round(final_risk_amount, 2),
-            "final_risk_percent": round(final_risk_percent, 4),
-            "maximum_allowed_risk_percent": max_allowed_percent,
-            "allowed_risk_percent": max_allowed_percent,
-            "risk_tolerance_percent": risk_tolerance_percent,
-        }
-
     if (
         final_risk_amount is None
         or final_risk_amount <= 0
@@ -255,8 +285,13 @@ def calculate_position_size(
                 f"Calculated risk is not close to {risk_percent_value:.2f}% "
                 "after broker rounding"
             ),
+            "reason_if_blocked": (
+                f"Calculated risk is not close to {risk_percent_value:.2f}% "
+                "after broker rounding"
+            ),
             "symbol_metadata": metadata,
             "lot_size": round(lot_size, 4),
+            "expected_risk_percent": round(final_risk_percent, 4),
             "final_risk_amount": round(final_risk_amount, 2),
             "final_risk_percent": round(final_risk_percent, 4),
             "risk_difference": round(risk_difference, 2),
@@ -267,10 +302,13 @@ def calculate_position_size(
         "ok": True,
         "symbol": execution_symbol,
         "risk_percent": risk_percent_value,
+        "max_risk_dollars": round(risk_money, 2),
         "risk_amount": round(risk_money, 2),
         "account_balance": round(equity_value, 2),
         "lot_size": round(lot_size, 4),
+        "raw_lot": calculated_lots,
         "calculated_lots": round(calculated_lots, 4),
+        "rounded_lot": round(lot_size, 4),
         "rounded_lots": round(lot_size, 4),
         "broker_min_lots": round(broker_min_lots, 4) if broker_min_lots else None,
         "volume_units": int(rounded_volume_units),
@@ -298,6 +336,7 @@ def calculate_position_size(
         "min_lot": metadata.get("min_lot"),
         "max_lot": metadata.get("max_lot"),
         "metadata_source": metadata.get("metadata_source"),
+        "expected_risk_percent": round(final_risk_percent, 4),
         "final_risk_amount": round(final_risk_amount, 2),
         "final_risk_percent": round(final_risk_percent, 4),
         "risk_difference": round(risk_difference, 2),
@@ -306,6 +345,7 @@ def calculate_position_size(
         "allowed_risk_percent": max_allowed_percent,
         "risk_tolerance_percent": risk_tolerance_percent,
         "minimum_volume_rounded_up": minimum_volume_rounded_up,
+        "reason_if_blocked": None,
     }
 
 
