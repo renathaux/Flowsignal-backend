@@ -2671,6 +2671,22 @@ def place_market_order(
             print(json.dumps(order_payload, indent=2, default=str))
         print("CTRADER NEW ORDER REQUEST:", safe_payload)
         print("CTRADER NEW ORDER JSON:", json.dumps(safe_payload, default=str))
+        print("CTRADER_TP_PROTECTION_AUDIT =", {
+            "stage": "payload_built",
+            "symbol": normalized_symbol,
+            "side": normalized_action,
+            "entry": entry,
+            "SL": sl,
+            "TP1": selected_tp1,
+            "TP2": tp2,
+            "broker_take_profit": broker_take_profit,
+            "payload_tp_field": "relativeTakeProfit",
+            "payload_relativeTakeProfit": order_payload.get("relativeTakeProfit"),
+            "payload_sl_field": "relativeStopLoss",
+            "payload_relativeStopLoss": order_payload.get("relativeStopLoss"),
+            "tp1_managed_by_flowsignal": True,
+            "tp2_sent_to_broker": True,
+        })
         print("CTRADER_ORDER_PAYLOAD_VOLUME_CHECK:", volume_check)
         log_volume_safety_debug(volume_check)
 
@@ -2880,6 +2896,26 @@ def place_market_order(
                 "broker_take_profit": broker_tp_after_send,
             }
         )
+        print("CTRADER_TP_PROTECTION_AUDIT =", {
+            "stage": "broker_response_verified",
+            "symbol": normalized_symbol,
+            "side": normalized_action,
+            "entry": entry,
+            "SL": sl,
+            "TP1": selected_tp1,
+            "TP2": tp2,
+            "broker_take_profit_expected": broker_take_profit,
+            "broker_take_profit_response": broker_tp_after_send,
+            "broker_tp_confirmed": broker_tp_confirmed,
+            "tp_amend_result": tp_amend_result,
+            "tp1_managed_by_flowsignal": True,
+            "tp2_sent_to_broker": True,
+            "tp_missing_reason": (
+                None
+                if broker_tp_confirmed
+                else "Broker TP2 was not present after send/amend verification"
+            ),
+        })
 
         return {
             "ok": True,

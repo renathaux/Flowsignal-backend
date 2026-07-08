@@ -6283,6 +6283,48 @@ def sync_live_positions():
                 except (TypeError, ValueError):
                     pass
 
+            broker_tp_repair_result = None
+            broker_tp_missing_or_mismatch = (
+                saved_tp2 is not None
+                and (
+                    broker_synced_tp2 is None
+                    or not prices_match(broker_synced_tp2, saved_tp2)
+                )
+            )
+            broker_sl_missing_or_mismatch = (
+                saved_sl is not None
+                and (
+                    broker_synced_sl is None
+                    or not prices_match(broker_synced_sl, saved_sl)
+                )
+            )
+
+            if position_id and broker_tp_missing_or_mismatch:
+                broker_tp_repair_result = modify_position_sltp(
+                    position_id,
+                    stop_loss_price=saved_sl if broker_sl_missing_or_mismatch else None,
+                    take_profit_price=saved_tp2,
+                )
+                print("LIVE_BROKER_TP_REPAIR =", {
+                    "symbol": symbol,
+                    "position_id": position_id,
+                    "entry": entry,
+                    "saved_sl": saved_sl,
+                    "broker_sl_before": broker_synced_sl,
+                    "saved_tp2": saved_tp2,
+                    "broker_tp_before": broker_synced_tp2,
+                    "tp1_managed_by_flowsignal": True,
+                    "broker_tp_should_be_tp2": True,
+                    "repair_result": broker_tp_repair_result,
+                })
+
+                if broker_tp_repair_result.get("ok"):
+                    broker_synced_tp2 = saved_tp2
+                    synced_tp2 = saved_tp2
+                    if broker_sl_missing_or_mismatch:
+                        broker_synced_sl = saved_sl
+                        synced_sl = saved_sl
+
             if synced_tp1 is None or synced_tp2 is None:
                 print("TRADE_LEVEL_WARNING =", {
                     "symbol": symbol,
@@ -7778,6 +7820,24 @@ def execute_live_order_core(payload: dict, source="manual"):
         order_sent=True,
         order_accepted=False,
     )
+    print("LIVE_ORDER_PROTECTION_AUDIT =", {
+        "stage": "before_place_market_order",
+        "symbol": symbol,
+        "side": side,
+        "account_balance": risk_size.get("account_balance"),
+        "account_equity": risk_size.get("account_equity"),
+        "account_equity_used": risk_size.get("account_equity_used"),
+        "configured_risk_percent": risk_size.get("risk_percent"),
+        "calculated_lot_size": risk_size.get("lot_size"),
+        "volume_units": risk_size.get("volume_units"),
+        "entry": trade_payload.get("entry"),
+        "SL": trade_payload.get("sl"),
+        "TP1": trade_payload.get("tp1"),
+        "TP2": trade_payload.get("tp2"),
+        "broker_take_profit_source": "TP2",
+        "tp1_managed_by_flowsignal": True,
+        "tp2_sent_to_broker": True,
+    })
 
     result = place_market_order(
         symbol=symbol,
@@ -7996,6 +8056,23 @@ def execute_live_order_core(payload: dict, source="manual"):
         "SL": trade_payload["sl"],
         "TP1": trade_payload["tp1"],
         "TP2": trade_payload["tp2"],
+        "account_balance": risk_size.get("account_balance"),
+        "account_equity": risk_size.get("account_equity"),
+        "configured_risk_percent": risk_size.get("risk_percent"),
+        "calculated_lot_size": risk_size.get("lot_size"),
+        "volume_units": risk_size.get("volume_units"),
+        "payload_tp_field": "relativeTakeProfit",
+        "payload_tp_source": "TP2",
+        "broker_response_tp_field": result.get("broker_take_profit_attached"),
+        "broker_tp_confirmed": result.get("broker_tp_confirmed"),
+        "broker_tp_exists": result.get("broker_tp_confirmed") is True,
+        "tp1_managed_by_flowsignal": True,
+        "tp2_sent_to_broker": True,
+        "tp_missing_reason": (
+            None
+            if result.get("broker_tp_confirmed") is True
+            else "Broker TP2 was not confirmed after order placement"
+        ),
         "email_sent": bool(email_sent),
         "ui_signal_state": ui_signal_state,
         "active_trade_state": active_trade_state,
