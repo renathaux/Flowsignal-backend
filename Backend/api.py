@@ -506,6 +506,33 @@ def send_signal_alert_email(symbol, signal, plan):
     })
 
 
+def send_order_confirmation_email(symbol, signal, plan):
+    normalized_symbol = normalize_symbol(symbol)
+    normalized_signal = str(signal or "").upper()
+
+    try:
+        send_signal_alert_email(normalized_symbol, normalized_signal, plan)
+        with SIGNAL_EMAIL_LOCK:
+            SIGNAL_EMAIL_LAST_SIGNAL[normalized_symbol] = normalized_signal
+        return True
+    except Exception as exc:
+        print("ORDER_CONFIRMATION_EMAIL_FAILED =", {
+            "symbol": normalized_symbol,
+            "signal": normalized_signal,
+            "error": str(exc),
+        })
+        return False
+
+
+def get_email_signal_side(signal):
+    normalized = str(signal or "WAIT").upper()
+    if normalized in ["BUY", "BUY RUNNING"]:
+        return "BUY"
+    if normalized in ["SELL", "SELL RUNNING"]:
+        return "SELL"
+    return "WAIT"
+
+
 def process_signal_email_alerts(panel_data):
     if not signal_email_alerts_enabled():
         return
@@ -519,7 +546,7 @@ def process_signal_email_alerts(panel_data):
             if not isinstance(plan, dict):
                 continue
 
-            signal = str(plan.get("signal") or "WAIT").upper()
+            signal = get_email_signal_side(plan.get("signal") or "WAIT")
             if signal not in ["BUY", "SELL"]:
                 SIGNAL_EMAIL_LAST_SIGNAL[symbol] = "WAIT"
                 continue
@@ -756,11 +783,12 @@ def apply_trade_signal_lifecycle(panel_data):
     def apply_active_trade_display(plan, active_trade, side, status):
         original_signal = str(plan.get("signal") or "WAIT").upper()
         setup_still_confirmed = original_signal in ["BUY", "SELL"]
-        display_signal = original_signal if setup_still_confirmed else "WAIT"
+        strategy_signal = original_signal if setup_still_confirmed else "WAIT"
+        display_signal = strategy_signal
 
         plan["market_signal"] = original_signal
-        plan["signal"] = "WAIT"
-        plan["final_signal"] = "WAIT"
+        plan["signal"] = strategy_signal
+        plan["final_signal"] = strategy_signal
         plan["signal_display_state"] = display_signal
         plan["display_signal"] = display_signal
         plan["history_signal"] = display_signal
@@ -775,13 +803,13 @@ def apply_trade_signal_lifecycle(panel_data):
         )
         plan["blocker_rule_name"] = "active_trade_running"
         plan["signal_text"] = (
-            f"{display_signal} {'🟢' if display_signal == 'BUY' else '🔴'} (setup confirmed, trade running)"
-            if display_signal in ["BUY", "SELL"]
+            f"{strategy_signal} {'🟢' if strategy_signal == 'BUY' else '🔴'} (trade already running)"
+            if strategy_signal in ["BUY", "SELL"]
             else "WAIT ⚪ (trade running; setup no longer fresh)"
         )
-        plan["plan_type"] = "WAIT - TRADE RUNNING"
-        plan["plan_bias"] = display_signal
-        plan["entry_timing"] = "WAIT FOR NEW 15M SWING BREAK"
+        plan["plan_type"] = "TRADE ALREADY RUNNING"
+        plan["plan_bias"] = strategy_signal if strategy_signal in ["BUY", "SELL"] else side
+        plan["entry_timing"] = "TRADE ALREADY RUNNING"
         plan["strategy_setup_complete"] = False
 
         level_map = {
@@ -842,7 +870,7 @@ def apply_trade_signal_lifecycle(panel_data):
                     "display_signal": display_signal,
                     "fresh_entry_available": plan.get("fresh_entry_available"),
                     "trade_already_running": plan.get("trade_already_running"),
-                    "reason": "active trade display replaces fresh signal",
+                    "reason": "active trade display keeps current strategy signal",
                 })
                 continue
 
@@ -7920,6 +7948,8 @@ def execute_live_order_core(payload: dict, source="manual"):
         "sl_protection_broker_result": None,
     }
     ensure_live_trade_identity(LIVE_ACTIVE_ORDERS[symbol], symbol)
+    ui_signal_state = f"{side} RUNNING" if side in ["BUY", "SELL"] else "TRADE RUNNING"
+    LIVE_ACTIVE_ORDERS[symbol]["ui_signal_state"] = ui_signal_state
     log_live_trade_audit("order_opened", LIVE_ACTIVE_ORDERS[symbol], reason="broker order accepted")
     clear_persisted_final_signal_hold(symbol, reason="broker order accepted")
     log_live_xauusd_execution_debug(
@@ -7938,6 +7968,38 @@ def execute_live_order_core(payload: dict, source="manual"):
     )
 
     log_trade_visual_levels(LIVE_ACTIVE_ORDERS[symbol])
+    email_plan = {
+        **(plan if isinstance(plan, dict) else {}),
+        "signal": side,
+        "entry_price": trade_payload["entry"],
+        "stop_loss": trade_payload["sl"],
+        "tp1": trade_payload["tp1"],
+        "tp2": trade_payload["tp2"],
+        "risk_percent": trade_payload.get("risk_percent"),
+        "risk_dollars": trade_payload.get("risk_amount"),
+        "plan_reason": "Live order placed successfully",
+    }
+    email_sent = send_order_confirmation_email(symbol, side, email_plan)
+    active_trade_state = {
+        "status": get_live_trade_status(LIVE_ACTIVE_ORDERS[symbol]),
+        "result": LIVE_ACTIVE_ORDERS[symbol].get("result"),
+        "trade_id": get_live_trade_identity(LIVE_ACTIVE_ORDERS[symbol]),
+        "position_id": (
+            LIVE_ACTIVE_ORDERS[symbol].get("position_id")
+            or LIVE_ACTIVE_ORDERS[symbol].get("broker_position_id")
+        ),
+    }
+    print("ORDER_PLACED_SUCCESS =", {
+        "symbol": symbol,
+        "side": side,
+        "entry": trade_payload["entry"],
+        "SL": trade_payload["sl"],
+        "TP1": trade_payload["tp1"],
+        "TP2": trade_payload["tp2"],
+        "email_sent": bool(email_sent),
+        "ui_signal_state": ui_signal_state,
+        "active_trade_state": active_trade_state,
+    })
 
     save_live_backup()
 
