@@ -5897,7 +5897,26 @@ def build_15m_swing_risk_levels(
         for candidate in target_candidates:
             candidate_reward = abs(candidate["price"] - entry_price)
             candidate_rr = candidate_reward / risk if risk > 0 else 0
+            tp_candidate_log = {
+                "symbol": normalized_symbol,
+                "direction": side,
+                "entry": round(entry_price, decimals),
+                "sl": round(stop_loss, decimals),
+                "risk": round(risk, decimals),
+                "candidate_price": round(candidate["price"], decimals),
+                "candidate_time": candidate.get("time"),
+                "candidate_source": candidate.get("source"),
+                "reward": round(candidate_reward, decimals),
+                "rr": round(candidate_rr, 4),
+                "required_rr_min": 1.2,
+                "required_rr_max": 2.0,
+            }
             if candidate_rr + 0.01 < 1.2:
+                print("STRUCTURE_TP_CANDIDATE_DEBUG =", {
+                    **tp_candidate_log,
+                    "decision": "rejected",
+                    "reason": "TP swing reward below 1.20R",
+                })
                 rejected_tp_candidates.append({
                     "price": round(candidate["price"], decimals),
                     "time": candidate.get("time"),
@@ -5907,6 +5926,11 @@ def build_15m_swing_risk_levels(
                 })
                 continue
             if candidate_rr - 0.01 > 2.0:
+                print("STRUCTURE_TP_CANDIDATE_DEBUG =", {
+                    **tp_candidate_log,
+                    "decision": "rejected",
+                    "reason": "TP swing reward above 2.00R",
+                })
                 rejected_tp_candidates.append({
                     "price": round(candidate["price"], decimals),
                     "time": candidate.get("time"),
@@ -5916,6 +5940,11 @@ def build_15m_swing_risk_levels(
                 })
                 continue
 
+            print("STRUCTURE_TP_CANDIDATE_DEBUG =", {
+                **tp_candidate_log,
+                "decision": "accepted",
+                "reason": "TP swing RR inside 1.20 to 2.00 window",
+            })
             structure_target = candidate
             structure_reward = candidate_reward
             structure_rr = candidate_rr
