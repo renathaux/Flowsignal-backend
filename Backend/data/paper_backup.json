@@ -1,0 +1,149 @@
+{
+  "paper_trades": {
+    "EURUSD": null,
+    "XAUUSD": {
+      "trade_id": "paper-a3533687-5afd-4c0a-90ae-5ae6650bb507",
+      "signal_key": "XAUUSD:BUY:4115.31:4093.1:4147.99",
+      "setup_lock_key": "XAUUSD:BUY:levels:4115.31:4093.1:4147.99",
+      "level_lock_key": "XAUUSD:BUY:levels:4115.31:4093.1:4147.99",
+      "symbol": "XAUUSD",
+      "side": "BUY",
+      "source": "paper",
+      "entry": 4115.31,
+      "sl": 4093.1,
+      "original_sl": 4093.1,
+      "tp1": 4141.45,
+      "tp2": 4147.99,
+      "opened_at": "2026-07-09 12:44:51 UTC",
+      "closed_at": null,
+      "closed_price": null,
+      "status": "OPEN",
+      "result": "RUNNING",
+      "pips": 0,
+      "hit_tp1": false,
+      "profit_protected": false,
+      "protected_sl_price": null
+    }
+  },
+  "paper_active_trades": [
+    {
+      "trade_id": "paper-a3533687-5afd-4c0a-90ae-5ae6650bb507",
+      "signal_key": "XAUUSD:BUY:4115.31:4093.1:4147.99",
+      "setup_lock_key": "XAUUSD:BUY:levels:4115.31:4093.1:4147.99",
+      "level_lock_key": "XAUUSD:BUY:levels:4115.31:4093.1:4147.99",
+      "symbol": "XAUUSD",
+      "side": "BUY",
+      "source": "paper",
+      "entry": 4115.31,
+      "sl": 4093.1,
+      "original_sl": 4093.1,
+      "tp1": 4141.45,
+      "tp2": 4147.99,
+      "opened_at": "2026-07-09 12:44:51 UTC",
+      "closed_at": null,
+      "closed_price": null,
+      "status": "OPEN",
+      "result": "RUNNING",
+      "pips": 0,
+      "hit_tp1": false,
+      "profit_protected": false,
+      "protected_sl_price": null
+    }
+  ],
+  "paper_trade_history": [
+    {
+      "trade_id": "paper-3a09cad6-f33e-4062-8168-424d3fe780c8",
+      "signal_key": "XAUUSD:SELL:2026-07-09T10:50:00+00:00",
+      "setup_lock_key": "XAUUSD:SELL:SELL_5M_ENTRY:4103.08:2026-07-09T10:45:00+00:00",
+      "level_lock_key": "XAUUSD:SELL:levels:4097.1:4109.92:4071.75",
+      "symbol": "XAUUSD",
+      "side": "SELL",
+      "source": "paper",
+      "entry": 4097.1,
+      "sl": 4109.92,
+      "original_sl": 4109.92,
+      "tp1": 4076.82,
+      "tp2": 4071.75,
+      "opened_at": "2026-07-09 11:12:08 UTC",
+      "closed_at": null,
+      "closed_price": null,
+      "status": "CLOSED",
+      "result": "LOSS",
+      "pips": -13.1,
+      "hit_tp1": false,
+      "profit_protected": false,
+      "protected_sl_price": null
+    },
+    {
+      "trade_id": "paper-a3533687-5afd-4c0a-90ae-5ae6650bb507",
+      "signal_key": "XAUUSD:BUY:4115.31:4093.1:4147.99",
+      "setup_lock_key": "XAUUSD:BUY:levels:4115.31:4093.1:4147.99",
+      "level_lock_key": "XAUUSD:BUY:levels:4115.31:4093.1:4147.99",
+      "symbol": "XAUUSD",
+      "side": "BUY",
+      "source": "paper",
+      "entry": 4115.31,
+      "sl": 4093.1,
+      "original_sl": 4093.1,
+      "tp1": 4141.45,
+      "tp2": 4147.99,
+      "opened_at": "2026-07-09 12:44:51 UTC",
+      "closed_at": null,
+      "closed_price": null,
+      "status": "OPEN",
+      "result": "RUNNING",
+      "pips": 0,
+      "hit_tp1": false,
+      "profit_protected": false,
+      "protected_sl_price": null
+    }
+  ],
+  "paper_setup_locks": {
+    "XAUUSD:SELL:SELL_5M_ENTRY:4103.08:2026-07-09T10:45:00+00:00": {
+      "symbol": "XAUUSD",
+      "side": "SELL",
+      "trade_id": "paper-3a09cad6-f33e-4062-8168-424d3fe780c8",
+      "opened_at": "2026-07-09 11:12:08 UTC",
+      "entry": 4097.1,
+      "sl": 4109.92,
+      "tp2": 4071.75
+    },
+    "XAUUSD:SELL:levels:4097.1:4109.92:4071.75": {
+      "symbol": "XAUUSD",
+      "side": "SELL",
+      "trade_id": "paper-3a09cad6-f33e-4062-8168-424d3fe780c8",
+      "opened_at": "2026-07-09 11:12:08 UTC",
+      "entry": 4097.1,
+      "sl": 4109.92,
+      "tp2": 4071.75
+    },
+    "XAUUSD:SELL:2026-07-09T10:50:00+00:00": {
+      "symbol": "XAUUSD",
+      "side": "SELL",
+      "trade_id": "paper-3a09cad6-f33e-4062-8168-424d3fe780c8",
+      "opened_at": "2026-07-09 11:12:08 UTC",
+      "entry": 4097.1,
+      "sl": 4109.92,
+      "tp2": 4071.75
+    },
+    "XAUUSD:BUY:levels:4115.31:4093.1:4147.99": {
+      "symbol": "XAUUSD",
+      "side": "BUY",
+      "trade_id": "paper-a3533687-5afd-4c0a-90ae-5ae6650bb507",
+      "opened_at": "2026-07-09 12:44:51 UTC",
+      "entry": 4115.31,
+      "sl": 4093.1,
+      "tp2": 4147.99
+    },
+    "XAUUSD:BUY:4115.31:4093.1:4147.99": {
+      "symbol": "XAUUSD",
+      "side": "BUY",
+      "trade_id": "paper-a3533687-5afd-4c0a-90ae-5ae6650bb507",
+      "opened_at": "2026-07-09 12:44:51 UTC",
+      "entry": 4115.31,
+      "sl": 4093.1,
+      "tp2": 4147.99
+    }
+  },
+  "last_paper_reset": 1783285200.0
+}

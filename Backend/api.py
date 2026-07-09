@@ -239,6 +239,9 @@ LIVE_PANEL_META_CACHE = {
     "last_update": None,
     "last_error": None,
 }
+
+MIN_LIVE_TRADE_RR = 1.20
+MAX_LIVE_TRADE_RR = 2.00
 LIVE_MONTHLY_HISTORY_CACHE = {
     "history": [],
     "updated_at": 0,
@@ -388,10 +391,14 @@ def _panel_cache_validity(data):
             plan.get("sell_pct", plan.get("sell_percentage", 0)),
             plan.get("confidence", 0),
         ]
+        signal = str(plan.get("signal") or "").upper()
+        wait_reason = plan.get("blocked_reason") or plan.get("blocked_by")
         try:
-            has_scores = any(float(value or 0) > 0 for value in scores)
+            has_scores = (
+                signal == "WAIT" and bool(wait_reason)
+            ) or any(float(value or 0) > 0 for value in scores)
         except (TypeError, ValueError):
-            has_scores = False
+            has_scores = signal == "WAIT" and bool(wait_reason)
         has_candles = any(candle_counts[symbol].values())
 
         if not has_price:
@@ -408,6 +415,24 @@ def _panel_cache_validity(data):
         "reason": "; ".join(problems) if problems else None,
         "candle_counts": candle_counts,
     }
+
+
+def _json_safe_panel_value(value):
+    if isinstance(value, dict):
+        return {
+            str(key): _json_safe_panel_value(child)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [_json_safe_panel_value(child) for child in value]
+    if isinstance(value, tuple):
+        return [_json_safe_panel_value(child) for child in value]
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except (TypeError, ValueError):
+            pass
+    return value
 
 def _is_startup_panel_payload(data):
     if not _is_valid_panel_payload(data):
@@ -717,6 +742,40 @@ def refresh_panel_cache_direct(reason, force_refresh=True):
         return None
 
 
+def schedule_panel_cache_refresh(reason, force_refresh=True):
+    running_since = PANEL_REFRESH_STATE.get("last_started")
+    running_seconds = (
+        time.time() - float(running_since)
+        if PANEL_REFRESH_STATE.get("running") and running_since
+        else 0
+    )
+    refresh_stuck = running_seconds >= PANEL_REFRESH_STUCK_SECONDS
+
+    if PANEL_REFRESH_STATE.get("running") and not refresh_stuck:
+        print("PANEL_REFRESH_BACKGROUND_ALREADY_RUNNING =", {
+            "reason": reason,
+            "active_reason": PANEL_REFRESH_STATE.get("reason"),
+            "running_seconds": round(running_seconds, 1),
+        })
+        return False
+
+    thread = threading.Thread(
+        target=refresh_panel_cache,
+        kwargs={
+            "reason": reason,
+            "force_refresh": force_refresh,
+        },
+        daemon=True,
+    )
+    thread.start()
+    print("PANEL_REFRESH_BACKGROUND_SCHEDULED =", {
+        "reason": reason,
+        "force_refresh": bool(force_refresh),
+        "previous_refresh_stuck": bool(refresh_stuck),
+    })
+    return True
+
+
 def warm_panel_cache_from_persisted_candles():
     try:
         from brain import hydrate_market_data_cache_from_disk
@@ -727,12 +786,49 @@ def warm_panel_cache_from_persisted_candles():
 
         return refresh_panel_cache(
             reason="startup_disk_cache",
-            force_refresh=True,
+            force_refresh=False,
         )
     except Exception as exc:
         PANEL_REFRESH_STATE["last_error"] = str(exc)
         print("PANEL_STARTUP_WARM_ERROR =", str(exc))
         return False
+
+
+def refresh_panel_cache_from_disk(reason):
+    try:
+        from brain import get_panel_data, hydrate_market_data_cache_from_disk
+
+        if not hydrate_market_data_cache_from_disk():
+            return None
+
+        data = get_panel_data(force_refresh=False)
+        refresh_live_panel_meta(data)
+        validity = _panel_cache_validity(data)
+
+        if not validity["valid"]:
+            PANEL_REFRESH_STATE["last_error"] = (
+                f"Disk candle fallback unusable: {validity['reason']}"
+            )
+            print("PANEL_DISK_FALLBACK_UNUSABLE =", {
+                "reason": reason,
+                "validation_error": validity["reason"],
+                "candle_counts": validity["candle_counts"],
+            })
+            return None
+
+        update_panel_cache(data, reason)
+        print("PANEL_DISK_FALLBACK_SUCCESS =", {
+            "reason": reason,
+            "candle_counts": validity["candle_counts"],
+        })
+        return data
+    except Exception as exc:
+        PANEL_REFRESH_STATE["last_error"] = str(exc)
+        print("PANEL_DISK_FALLBACK_ERROR =", {
+            "reason": reason,
+            "error": str(exc),
+        })
+        return None
 
 
 def schedule_panel_refresh(reason="api_cache_stale"):
@@ -1298,7 +1394,7 @@ def panel_data(force: int = 0):
             else "api_cache_stale_direct"
         )
 
-    if direct_reason:
+    if force_requested:
         fresh_data = refresh_panel_cache_direct(
             direct_reason,
             force_refresh=True,
@@ -1319,6 +1415,27 @@ def panel_data(force: int = 0):
                 "refresh_stuck": refresh_stuck,
                 "error": PANEL_REFRESH_STATE.get("last_error"),
             })
+    elif direct_reason:
+        if not cache_valid:
+            schedule_panel_cache_refresh(
+                direct_reason,
+                force_refresh=False,
+            )
+        elif cache_stale:
+            schedule_panel_cache_refresh(
+                direct_reason,
+                force_refresh=True,
+            )
+        print("PANEL_CACHE_RETURN_IMMEDIATE =", {
+            "reason": direct_reason,
+            "cache_age_seconds": round(age, 1),
+            "startup_cache": startup_cache,
+            "cache_valid": cache_valid,
+            "cache_validation_error": cache_validity.get("reason"),
+            "refresh_running": PANEL_REFRESH_STATE.get("running"),
+            "refresh_running_seconds": round(running_seconds, 1),
+            "refresh_stuck": refresh_stuck,
+        })
 
     data = copy.deepcopy(cached_data)
     data = apply_trade_signal_lifecycle(data)
@@ -1503,7 +1620,7 @@ def panel_data(force: int = 0):
             LIVE_PANEL_META_CACHE.get("last_execution_time", 0)
     }
 
-    return data
+    return _json_safe_panel_value(data)
 
 
 @app.get("/brain-status")
@@ -4113,6 +4230,74 @@ def reject_ctrader_order(symbol, action, entry, sl, tp1, tp2, reason):
         "message": reason
     }
 
+def validate_live_trade_risk_reward(symbol, action, entry, sl, tp2):
+    try:
+        entry_value = float(entry)
+        sl_value = float(sl)
+        tp2_value = float(tp2)
+    except (TypeError, ValueError):
+        return {
+            "ok": False,
+            "reason": "Entry, SL, and TP2 must be valid numbers",
+            "risk_reward_ratio": None,
+        }
+
+    if not all(math.isfinite(value) for value in [entry_value, sl_value, tp2_value]):
+        return {
+            "ok": False,
+            "reason": "Entry, SL, and TP2 must be finite real numbers",
+            "risk_reward_ratio": None,
+        }
+
+    side = str(action or "").upper()
+    if side == "BUY":
+        risk_distance = entry_value - sl_value
+        reward_distance = tp2_value - entry_value
+    elif side == "SELL":
+        risk_distance = sl_value - entry_value
+        reward_distance = entry_value - tp2_value
+    else:
+        return {
+            "ok": False,
+            "reason": "Action must be BUY or SELL",
+            "risk_reward_ratio": None,
+        }
+
+    if risk_distance <= 0 or reward_distance <= 0:
+        return {
+            "ok": False,
+            "reason": "LIVE BLOCKED: invalid SL/TP direction.",
+            "risk_reward_ratio": None,
+        }
+
+    risk_reward = reward_distance / risk_distance
+    details = {
+        "ok": True,
+        "symbol": normalize_symbol(symbol),
+        "action": side,
+        "risk_distance": risk_distance,
+        "reward_distance": reward_distance,
+        "risk_reward_ratio": round(risk_reward, 4),
+        "minimum_risk_reward": MIN_LIVE_TRADE_RR,
+        "maximum_risk_reward": MAX_LIVE_TRADE_RR,
+    }
+
+    if risk_reward < MIN_LIVE_TRADE_RR - 1e-9:
+        return {
+            **details,
+            "ok": False,
+            "reason": "LIVE BLOCKED: TP2 reward must be at least 1:1.20 before execution.",
+        }
+
+    if risk_reward > MAX_LIVE_TRADE_RR + 1e-9:
+        return {
+            **details,
+            "ok": False,
+            "reason": "LIVE BLOCKED: TP2 reward must stay at or below 1:2.00 before execution.",
+        }
+
+    return details
+
 def get_live_trade_status(trade):
     if not isinstance(trade, dict):
         return ""
@@ -5122,6 +5307,17 @@ def trade_payload_has_required_levels(trade_payload):
     if not normalized.get("ok"):
         return False, "LIVE BLOCKED: invalid SL/TP distance."
 
+    rr_validation = validate_live_trade_risk_reward(
+        trade_payload.get("symbol"),
+        side,
+        normalized.get("entry"),
+        normalized.get("sl"),
+        normalized.get("tp2"),
+    )
+
+    if not rr_validation.get("ok"):
+        return False, rr_validation.get("reason")
+
     return True, None
 
 def log_paper_live_signal_compare(
@@ -5670,6 +5866,27 @@ def prepare_ctrader_trade(payload, volume=0.01):
             normalized.get("reason")
         )
         return normalized
+
+    rr_validation = validate_live_trade_risk_reward(
+        symbol,
+        action,
+        normalized.get("entry"),
+        normalized.get("sl"),
+        normalized.get("tp2"),
+    )
+    if not rr_validation.get("ok"):
+        rejected = reject_ctrader_order(
+            symbol,
+            action,
+            normalized.get("entry"),
+            normalized.get("sl"),
+            normalized.get("tp1"),
+            normalized.get("tp2"),
+            rr_validation.get("reason"),
+        )
+        rejected["details"] = rr_validation
+        rejected["risk_reward_ratio"] = rr_validation.get("risk_reward_ratio")
+        return rejected
 
     normalized["volume"] = None
 
@@ -7093,6 +7310,22 @@ def modify_live_position_levels(payload: dict):
     if side not in {"BUY", "SELL"}:
         return {"ok": False, "reason": "Unknown live trade side"}
 
+    risk_distance = abs(entry - stop_loss)
+    reward_distance = abs(tp2 - entry)
+    risk_reward = reward_distance / risk_distance if risk_distance > 0 else 0
+    if risk_reward < 1.20 - 1e-9:
+        return {
+            "ok": False,
+            "reason": "Risk / Reward must be at least 1:1.20",
+            "risk_reward": round(risk_reward, 4),
+        }
+    if risk_reward > 2.00 + 1e-9:
+        return {
+            "ok": False,
+            "reason": "Risk / Reward must stay at or below 1:2.00",
+            "risk_reward": round(risk_reward, 4),
+        }
+
     changed_level = str(payload.get("changed_level") or "").lower()
     if changed_level not in {"sl", "tp1", "tp2"}:
         return {"ok": False, "reason": "Unknown trade level"}
@@ -7670,6 +7903,61 @@ def execute_live_order_core(payload: dict, source="manual"):
                 "max_risk_usd": max_risk_usd,
                 "live_risk_calculation_audit": risk_calculation_audit,
             },
+        )
+
+    rr_validation = validate_live_trade_risk_reward(
+        symbol,
+        side,
+        trade_payload.get("entry"),
+        trade_payload.get("sl"),
+        trade_payload.get("tp2"),
+    )
+
+    if not rr_validation.get("ok"):
+        reason = rr_validation.get("reason")
+        details = {
+            **rr_validation,
+            "entry": trade_payload.get("entry"),
+            "sl": trade_payload.get("sl"),
+            "tp2": trade_payload.get("tp2"),
+        }
+
+        if source == "auto":
+            set_auto_trade_status(
+                symbol=symbol,
+                signal=trade_payload.get("signal"),
+                action=side,
+                status="BLOCKED",
+                reason=reason,
+                details=details,
+            )
+            log_auto_trade_blocked_reason(
+                symbol=symbol,
+                signal=trade_payload.get("signal"),
+                stage="risk_reward_validation",
+                reason=reason,
+                details=details,
+            )
+
+        log_live_xauusd_execution_debug(
+            symbol,
+            plan=plan,
+            trade_payload=trade_payload,
+            risk_size=risk_size,
+            stage="risk_reward_validation",
+            blocked_by="risk_reward_validation",
+            blocked_reason=reason,
+            payload_valid=False,
+            order_sent=False,
+            order_accepted=False,
+        )
+        return reject_live_execution_block(
+            symbol,
+            side,
+            trade_payload,
+            reason,
+            reason,
+            details=details,
         )
 
     trade_payload.update({

@@ -2083,13 +2083,11 @@ def hydrate_market_data_cache_from_disk():
 
     cache = _empty_market_data_cache()
     cache.update(restored)
-    # Disk hydration is not a market-data refresh. Leaving these timestamps
-    # empty forces the startup pass to request the missing bars immediately
-    # instead of treating an old persisted candle as freshly fetched.
+    hydrated_at = datetime.now(timezone.utc)
     cache.update({
-        "last_5m_update": None,
-        "last_15m_update": None,
-        "last_1h_update": None,
+        "last_5m_update": hydrated_at,
+        "last_15m_update": hydrated_at,
+        "last_1h_update": hydrated_at,
     })
     fetch_market_data._cache = cache
     MARKET_DATA_STATUS["last_fetch_source"] = "ctrader_cache"
