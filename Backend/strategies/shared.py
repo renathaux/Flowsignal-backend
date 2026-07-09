@@ -6300,28 +6300,40 @@ def evaluate_closed_15m_swing_break(closed_data_15m, side, symbol=None):
             })
             return debug
 
+        tolerance, raw_tolerance, tolerance_error = resolve_15m_level_tolerance(
+            normalized_symbol
+        )
+
         if side == "BUY":
             swing_level = actionable_swing_level
+            trigger_level = float(swing_level) + tolerance
 
-            break_happened = float(closed_data_15m["High"].iloc[-1]) > float(swing_level)
-            close_confirmed = close_price > float(swing_level)
+            break_happened = float(closed_data_15m["High"].iloc[-1]) > trigger_level
+            close_confirmed = close_price > trigger_level
             confirmed = break_happened and close_confirmed
-            comparison = "close > swing high"
+            comparison = "close > swing high + tolerance"
             if confirmed:
-                reason = f"15m candle closed above swing high {float(swing_level):.5f}"
+                reason = (
+                    f"15m candle closed above swing high "
+                    f"{float(swing_level):.5f} + tolerance {tolerance:g}"
+                )
             elif break_happened:
                 reason = "WAIT_NO_15M_CLOSE_CONFIRMATION"
             else:
                 reason = "WAIT_NO_15M_BREAK"
         else:
             swing_level = actionable_swing_level
+            trigger_level = float(swing_level) - tolerance
 
-            break_happened = float(closed_data_15m["Low"].iloc[-1]) < float(swing_level)
-            close_confirmed = close_price < float(swing_level)
+            break_happened = float(closed_data_15m["Low"].iloc[-1]) < trigger_level
+            close_confirmed = close_price < trigger_level
             confirmed = break_happened and close_confirmed
-            comparison = "close < swing low"
+            comparison = "close < swing low - tolerance"
             if confirmed:
-                reason = f"15m candle closed below swing low {float(swing_level):.5f}"
+                reason = (
+                    f"15m candle closed below swing low "
+                    f"{float(swing_level):.5f} - tolerance {tolerance:g}"
+                )
             elif break_happened:
                 reason = "WAIT_NO_15M_CLOSE_CONFIRMATION"
             else:
@@ -6343,25 +6355,33 @@ def evaluate_closed_15m_swing_break(closed_data_15m, side, symbol=None):
 
         if watched_level is not None:
             if side == "BUY":
-                break_happened = float(closed_data_15m["High"].iloc[-1]) > watched_level
-                close_confirmed = close_price > watched_level
+                trigger_level = watched_level + tolerance
+                break_happened = float(closed_data_15m["High"].iloc[-1]) > trigger_level
+                close_confirmed = close_price > trigger_level
                 confirmed = break_happened and close_confirmed
                 swing_level = watched_level
-                comparison = "close > saved swing high"
+                comparison = "close > saved swing high + tolerance"
                 if confirmed:
-                    reason = f"15m candle closed above saved swing high {watched_level:.5f}"
+                    reason = (
+                        f"15m candle closed above saved swing high "
+                        f"{watched_level:.5f} + tolerance {tolerance:g}"
+                    )
                 elif break_happened:
                     reason = "WAIT_NO_15M_CLOSE_CONFIRMATION"
                 else:
                     reason = "WAIT_NO_15M_BREAK"
             else:
-                break_happened = float(closed_data_15m["Low"].iloc[-1]) < watched_level
-                close_confirmed = close_price < watched_level
+                trigger_level = watched_level - tolerance
+                break_happened = float(closed_data_15m["Low"].iloc[-1]) < trigger_level
+                close_confirmed = close_price < trigger_level
                 confirmed = break_happened and close_confirmed
                 swing_level = watched_level
-                comparison = "close < saved swing low"
+                comparison = "close < saved swing low - tolerance"
                 if confirmed:
-                    reason = f"15m candle closed below saved swing low {watched_level:.5f}"
+                    reason = (
+                        f"15m candle closed below saved swing low "
+                        f"{watched_level:.5f} - tolerance {tolerance:g}"
+                    )
                 elif break_happened:
                     reason = "WAIT_NO_15M_CLOSE_CONFIRMATION"
                 else:
@@ -6392,6 +6412,10 @@ def evaluate_closed_15m_swing_break(closed_data_15m, side, symbol=None):
             "swing_level": float(swing_level),
             "candle_time": candle_time,
             "candle_close": close_price,
+            "tolerance": tolerance,
+            "raw_tolerance": raw_tolerance,
+            "tolerance_error": tolerance_error,
+            "trigger_level": trigger_level,
             "break_happened": bool(break_happened),
             "close_confirmed": bool(close_confirmed),
             "confirmed": bool(confirmed),
@@ -6404,6 +6428,10 @@ def evaluate_closed_15m_swing_break(closed_data_15m, side, symbol=None):
             "closed_candle_close": close_price,
             "swing_level": float(swing_level),
             "comparison": comparison,
+            "tolerance": tolerance,
+            "raw_tolerance": raw_tolerance,
+            "tolerance_error": tolerance_error,
+            "trigger_level": trigger_level,
             "break_happened": bool(break_happened),
             "close_confirmed": bool(close_confirmed),
             "reason": reason,
