@@ -7310,22 +7310,6 @@ def modify_live_position_levels(payload: dict):
     if side not in {"BUY", "SELL"}:
         return {"ok": False, "reason": "Unknown live trade side"}
 
-    risk_distance = abs(entry - stop_loss)
-    reward_distance = abs(tp2 - entry)
-    risk_reward = reward_distance / risk_distance if risk_distance > 0 else 0
-    if risk_reward < 1.20 - 1e-9:
-        return {
-            "ok": False,
-            "reason": "Risk / Reward must be at least 1:1.20",
-            "risk_reward": round(risk_reward, 4),
-        }
-    if risk_reward > 2.00 + 1e-9:
-        return {
-            "ok": False,
-            "reason": "Risk / Reward must stay at or below 1:2.00",
-            "risk_reward": round(risk_reward, 4),
-        }
-
     changed_level = str(payload.get("changed_level") or "").lower()
     if changed_level not in {"sl", "tp1", "tp2"}:
         return {"ok": False, "reason": "Unknown trade level"}
