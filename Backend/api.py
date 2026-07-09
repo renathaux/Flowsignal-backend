@@ -1047,7 +1047,7 @@ def overlay_live_forming_candles(panel_data, live_price_status, now=None):
 
 def refresh_live_panel_meta(panel_data):
     try:
-        live_positions = sync_live_positions()
+        live_positions = sync_live_positions(panel_data)
         apply_trade_signal_lifecycle(panel_data)
         apply_broker_closed_to_panel_signal_history(panel_data)
         run_ctrader_auto_trade_checks(panel_data)
@@ -3012,7 +3012,11 @@ def protect_live_trade_after_tp1(trade):
 
         return trade
 
-    modify_result = modify_position_stop_loss(position_id, protected_sl)
+    modify_result = modify_position_stop_loss(
+        position_id,
+        protected_sl,
+        take_profit_price=trade.get("tp2"),
+    )
 
     trade["hit_tp1"] = True
     trade["protected_sl_price"] = protected_sl
@@ -5012,10 +5016,8 @@ def normalize_broker_volume_to_lots(volume, symbol=None):
         return None
 
     if symbol and numeric >= 1:
-        read_scale = get_ctrader_volume_read_scale(symbol)
-        scaled_numeric = numeric / read_scale if read_scale else numeric
         lots = convert_ctrader_volume_to_lots(
-            scaled_numeric,
+            numeric,
             get_default_broker_lot_size(symbol)
         )
         return round(lots, 2) if lots is not None else None
@@ -5827,7 +5829,43 @@ def is_dev_request(request: Request):
         or any(referer.startswith(f"http://{local}") for local in local_hosts)
     )
 
-def sync_live_positions():
+def get_panel_candle_extremes(symbol, panel_data=None, timeframe="5m"):
+    data = panel_data if isinstance(panel_data, dict) else PANEL_CACHE.get("data")
+    candles_root = data.get("candles") if isinstance(data, dict) else None
+    symbol_candles = (
+        candles_root.get(normalize_symbol(symbol))
+        if isinstance(candles_root, dict)
+        else None
+    )
+
+    if not isinstance(symbol_candles, dict):
+        return {}
+
+    candles = symbol_candles.get(timeframe)
+    if not isinstance(candles, list) or not candles:
+        return {}
+
+    latest = candles[-1]
+    if not isinstance(latest, dict):
+        return {}
+
+    def as_float(value):
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        return numeric if math.isfinite(numeric) else None
+
+    return {
+        "high": as_float(latest.get("high") or latest.get("High")),
+        "low": as_float(latest.get("low") or latest.get("Low")),
+        "close": as_float(latest.get("close") or latest.get("Close")),
+        "time": latest.get("time") or latest.get("datetime") or latest.get("Datetime"),
+        "timeframe": timeframe,
+    }
+
+
+def sync_live_positions(panel_data=None):
     sync_ctrader_account_state()
 
     connected = bool(LIVE_ACCOUNT_STATE.get("connected"))
@@ -5934,6 +5972,11 @@ def sync_live_positions():
                 or position.get("low")
                 or raw_position_for_levels.get("currentLow")
                 or raw_position_for_levels.get("low")
+            )
+            panel_candle_extremes = get_panel_candle_extremes(
+                symbol,
+                panel_data=panel_data,
+                timeframe="5m",
             )
             position_id = (
                 position.get("position_id")
@@ -6124,7 +6167,7 @@ def sync_live_positions():
                 broker_sl_repair_result = modify_position_sltp(
                     position_id,
                     stop_loss_price=saved_sl,
-                    take_profit_price=saved_tp2 if broker_tp_missing_or_mismatch else None,
+                    take_profit_price=saved_tp2,
                 )
                 print("LIVE_BROKER_SL_REPAIR =", build_live_protection_audit(
                     symbol,
@@ -6171,7 +6214,7 @@ def sync_live_positions():
             ):
                 broker_tp_repair_result = modify_position_sltp(
                     position_id,
-                    stop_loss_price=None,
+                    stop_loss_price=saved_sl,
                     take_profit_price=saved_tp2,
                 )
                 print("LIVE_BROKER_TP_REPAIR =", {
@@ -6240,6 +6283,9 @@ def sync_live_positions():
                 "broker_tp2": broker_synced_tp2,
                 "saved_tp2": saved_tp2,
                 "saved_tp1": saved_tp1,
+                "panel_5m_high": panel_candle_extremes.get("high"),
+                "panel_5m_low": panel_candle_extremes.get("low"),
+                "panel_5m_time": panel_candle_extremes.get("time"),
             })
             observed_prices = [
                 value
@@ -6247,6 +6293,8 @@ def sync_live_positions():
                     used_current_price,
                     broker_current_high,
                     broker_current_low,
+                    panel_candle_extremes.get("high"),
+                    panel_candle_extremes.get("low"),
                     current_order.get("current_high") if current_order else None,
                     current_order.get("current_low") if current_order else None,
                 ]
@@ -7054,8 +7102,8 @@ def modify_live_position_levels(payload: dict):
     if changed_level in {"sl", "tp2"}:
         broker_result = modify_position_sltp(
             position_id,
-            stop_loss_price=stop_loss if changed_level == "sl" else None,
-            take_profit_price=tp2 if changed_level == "tp2" else None,
+            stop_loss_price=stop_loss,
+            take_profit_price=tp2,
         )
         if not broker_result.get("ok"):
             print("backendUpdate fail", {

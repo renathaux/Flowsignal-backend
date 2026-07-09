@@ -4977,8 +4977,12 @@ def modify_position_sltp(position_id, stop_loss_price=None, take_profit_price=No
         except Exception:
             pass
 
-def modify_position_stop_loss(position_id, protected_sl_price):
-    return modify_position_sltp(position_id, stop_loss_price=protected_sl_price)
+def modify_position_stop_loss(position_id, protected_sl_price, take_profit_price=None):
+    return modify_position_sltp(
+        position_id,
+        stop_loss_price=protected_sl_price,
+        take_profit_price=take_profit_price,
+    )
 
 def fetch_ctrader_symbol_map(sock, account_id):
     try:
