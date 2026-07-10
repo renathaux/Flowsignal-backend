@@ -895,6 +895,32 @@ def apply_trade_signal_lifecycle(panel_data):
     if not isinstance(panel_data, dict):
         return panel_data
 
+    def sync_plan_diagnostics(plan):
+        if not isinstance(plan, dict):
+            return
+
+        reason = plan.get("blocked_reason") or plan.get("block_reason")
+        signal = str(plan.get("signal") or "WAIT").upper()
+        final_signal = str(plan.get("final_signal") or signal or "WAIT").upper()
+        blocked = final_signal not in ["BUY", "SELL"]
+
+        for key in ["signal_diagnostics", "entry_strategy_debug", "strategy_debug"]:
+            debug = plan.get(key)
+            if not isinstance(debug, dict):
+                debug = {}
+            debug.update({
+                "final_signal": final_signal if final_signal in ["BUY", "SELL"] else "WAIT",
+                "signal_after_filters": final_signal if final_signal in ["BUY", "SELL"] else "WAIT",
+                "blocked": blocked,
+                "blocked_by": plan.get("blocked_by"),
+                "blocked_reason": reason if blocked else None,
+                "block_reason": reason if blocked else None,
+                "trade_already_running": bool(plan.get("trade_already_running")),
+                "active_trade_side": plan.get("active_trade_side"),
+                "active_trade_status": plan.get("active_trade_status"),
+            })
+            plan[key] = debug
+
     def apply_active_trade_display(plan, active_trade, side, status):
         original_signal = str(plan.get("signal") or "WAIT").upper()
         setup_still_confirmed = original_signal in ["BUY", "SELL"]
@@ -942,6 +968,7 @@ def apply_trade_signal_lifecycle(panel_data):
                     plan[plan_key] = value
                     break
 
+        sync_plan_diagnostics(plan)
         return display_signal
 
     for symbol in ["EURUSD", "XAUUSD"]:
@@ -1019,6 +1046,7 @@ def apply_trade_signal_lifecycle(panel_data):
         )
         plan["blocker_rule_name"] = "fresh_setup_required_after_trade_close"
         plan["trade_setup_consumed"] = True
+        sync_plan_diagnostics(plan)
         print("CLOSED_TRADE_SIGNAL_RESET_DEBUG =", {
             "symbol": symbol,
             "side": current_signal,

@@ -16,9 +16,12 @@ FALLBACK_RR = 2.00
 
 def point_size(symbol):
     try:
-        size = float(shared.get_strategy_pip_size(symbol))
-    except (TypeError, ValueError):
-        size = 0.0001
+        size = 10 ** (-decimals(symbol))
+    except (TypeError, ValueError, OverflowError):
+        try:
+            size = float(shared.get_strategy_pip_size(symbol))
+        except (TypeError, ValueError):
+            size = 0.0001
     return size if math.isfinite(size) and size > 0 else 0.0001
 
 
@@ -82,9 +85,8 @@ def trend_filter(data_15m, symbol):
 
 
 def detect_valid_swings(data_15m, symbol, left=2, right=2):
-    swings = []
     if data_15m is None or len(data_15m) < left + right + 3:
-        return swings
+        return []
 
     min_size = minimum_swing_size(symbol)
     highs = data_15m["High"].astype(float).tolist()
@@ -130,11 +132,56 @@ def detect_valid_swings(data_15m, symbol, left=2, right=2):
 
         swing["swing_size"] = valid_size
         swing["valid"] = valid_size >= min_size
-
-        if swing["valid"]:
-            swings.append(swing)
+        swing["valid_reason"] = (
+            "single_100_point_swing"
+            if swing["valid"]
+            else None
+        )
 
         previous_by_type[swing["type"]] = swing
+
+    composite_indexes = set()
+    for end in range(len(raw)):
+        prefix = raw[:end + 1]
+        prefix_highs = [s for s in prefix if s.get("type") == "HIGH"]
+        prefix_lows = [s for s in prefix if s.get("type") == "LOW"]
+        if len(prefix_highs) < 2 or len(prefix_lows) < 2:
+            continue
+
+        previous_high, last_high = prefix_highs[-2], prefix_highs[-1]
+        previous_low, last_low = prefix_lows[-2], prefix_lows[-1]
+        hh = float(last_high["price"]) > float(previous_high["price"])
+        hl = float(last_low["price"]) > float(previous_low["price"])
+        lh = float(last_high["price"]) < float(previous_high["price"])
+        ll = float(last_low["price"]) < float(previous_low["price"])
+
+        bullish_composite_size = (
+            abs(float(last_high["price"]) - float(previous_high["price"]))
+            + abs(float(last_low["price"]) - float(previous_low["price"]))
+        )
+        bearish_composite_size = (
+            abs(float(previous_high["price"]) - float(last_high["price"]))
+            + abs(float(previous_low["price"]) - float(last_low["price"]))
+        )
+
+        if hh and hl and bullish_composite_size >= min_size:
+            for swing in [previous_high, last_high, previous_low, last_low]:
+                swing["valid"] = True
+                swing["valid_reason"] = "composite_hh_hl_100_point_structure"
+                swing["composite_swing_size"] = bullish_composite_size
+                composite_indexes.add(swing["index"])
+
+        if lh and ll and bearish_composite_size >= min_size:
+            for swing in [previous_high, last_high, previous_low, last_low]:
+                swing["valid"] = True
+                swing["valid_reason"] = "composite_lh_ll_100_point_structure"
+                swing["composite_swing_size"] = bearish_composite_size
+                composite_indexes.add(swing["index"])
+
+    swings = []
+    for swing in raw:
+        if swing["valid"] or swing["index"] in composite_indexes:
+            swings.append(swing)
 
     return swings
 
@@ -146,6 +193,60 @@ def latest_swing(swings, swing_type):
 
 def older_swings(swings, swing_type):
     return [s for s in swings if s.get("type") == swing_type]
+
+
+def detect_swing_structure(swings):
+    highs = [s for s in swings if s.get("type") == "HIGH"]
+    lows = [s for s in swings if s.get("type") == "LOW"]
+    structure = {
+        "pattern": "NEUTRAL",
+        "bias": "NEUTRAL",
+        "hh": False,
+        "hl": False,
+        "lh": False,
+        "ll": False,
+        "previous_high": None,
+        "last_high": None,
+        "previous_low": None,
+        "last_low": None,
+        "reason": "WAIT_NEED_TWO_VALID_HIGHS_AND_LOWS",
+    }
+    if len(highs) < 2 or len(lows) < 2:
+        return structure
+
+    previous_high = highs[-2]
+    last_high = highs[-1]
+    previous_low = lows[-2]
+    last_low = lows[-1]
+    hh = float(last_high["price"]) > float(previous_high["price"])
+    hl = float(last_low["price"]) > float(previous_low["price"])
+    lh = float(last_high["price"]) < float(previous_high["price"])
+    ll = float(last_low["price"]) < float(previous_low["price"])
+
+    structure.update({
+        "hh": hh,
+        "hl": hl,
+        "lh": lh,
+        "ll": ll,
+        "previous_high": previous_high,
+        "last_high": last_high,
+        "previous_low": previous_low,
+        "last_low": last_low,
+        "reason": "WAIT_NO_CLEAR_HH_HL_OR_LH_LL_STRUCTURE",
+    })
+    if hh and hl:
+        structure.update({
+            "pattern": "HH_HL",
+            "bias": "BULLISH",
+            "reason": "BULLISH_HH_HL_CONFIRMED",
+        })
+    elif lh and ll:
+        structure.update({
+            "pattern": "LH_LL",
+            "bias": "BEARISH",
+            "reason": "BEARISH_LH_LL_CONFIRMED",
+        })
+    return structure
 
 
 def get_watch_key(symbol, side):
@@ -206,6 +307,7 @@ def evaluate_15m_breakout(data_15m, symbol):
         "remembered": False,
         "reason": "WAIT_NO_15M_BREAK",
         "swings": [],
+        "structure": {},
         "breakouts": [],
     }
 
@@ -221,6 +323,11 @@ def evaluate_15m_breakout(data_15m, symbol):
         result["reason"] = "WAIT_NO_VALID_100_POINT_SWING"
         return result
 
+    structure = detect_swing_structure(swings)
+    result["structure"] = structure
+    bullish_structure = structure.get("pattern") == "HH_HL"
+    bearish_structure = structure.get("pattern") == "LH_LL"
+
     last = data_15m.iloc[-1]
     previous = data_15m.iloc[-2]
     last_close = float(last["Close"])
@@ -233,7 +340,7 @@ def evaluate_15m_breakout(data_15m, symbol):
     low_swing = latest_swing(swings, "LOW")
     candidates = []
 
-    if high_swing:
+    if high_swing and bullish_structure:
         level = float(high_swing["price"])
         confirmed = last_high > level and last_close > level and previous_close <= level
         if confirmed:
@@ -243,10 +350,11 @@ def evaluate_15m_breakout(data_15m, symbol):
                 "break_time": break_time,
                 "break_close": last_close,
                 "swing": high_swing,
+                "structure": structure,
                 "remembered": False,
             })
 
-    if low_swing:
+    if low_swing and bearish_structure:
         level = float(low_swing["price"])
         confirmed = last_low < level and last_close < level and previous_close >= level
         if confirmed:
@@ -256,32 +364,38 @@ def evaluate_15m_breakout(data_15m, symbol):
                 "break_time": break_time,
                 "break_close": last_close,
                 "swing": low_swing,
+                "structure": structure,
                 "remembered": False,
             })
 
-    for side in ["BUY", "SELL"]:
-        remembered = remembered_breakout(symbol, side)
-        if not remembered:
-            continue
-        level = remembered["level"]
-        rebreak = (
-            side == "BUY"
-            and last_high > level
-            and last_close > level
-        ) or (
-            side == "SELL"
-            and last_low < level
-            and last_close < level
-        )
-        if rebreak:
+    if not candidates:
+        for side in ["BUY", "SELL"]:
+            remembered = remembered_breakout(symbol, side)
+            if not remembered:
+                continue
             candidates.append({
                 **remembered,
-                "break_time": break_time,
-                "break_close": last_close,
+                "structure": structure,
             })
 
     result["breakouts"] = candidates
     if not candidates:
+        raw_buy_break = bool(
+            high_swing
+            and last_high > float(high_swing["price"])
+            and last_close > float(high_swing["price"])
+            and previous_close <= float(high_swing["price"])
+        )
+        raw_sell_break = bool(
+            low_swing
+            and last_low < float(low_swing["price"])
+            and last_close < float(low_swing["price"])
+            and previous_close >= float(low_swing["price"])
+        )
+        if raw_buy_break and not bullish_structure:
+            result["reason"] = "WAIT_NO_HH_HL_STRUCTURE"
+        elif raw_sell_break and not bearish_structure:
+            result["reason"] = "WAIT_NO_LH_LL_STRUCTURE"
         return result
 
     chosen = candidates[-1]
@@ -293,6 +407,7 @@ def evaluate_15m_breakout(data_15m, symbol):
         "break_close": chosen["break_close"],
         "remembered": bool(chosen.get("remembered")),
         "swing": chosen.get("swing"),
+        "structure": chosen.get("structure") or structure,
         "reason": "15M_SWING_BREAK_CLOSED",
     })
     return result
@@ -521,9 +636,13 @@ def bias_scores_from_context(trend=None, breakout=None, confirmation=None):
 
 
 def wait_result(symbol, reason, extra=None):
+    normalized_symbol = shared.normalize_symbol(symbol)
     payload = {
-        "symbol": shared.normalize_symbol(symbol),
+        "symbol": normalized_symbol,
         "signal": "WAIT",
+        "final_signal": "WAIT",
+        "signal_before_filters": "WAIT",
+        "signal_after_filters": "WAIT",
         "signal_text": "WAIT",
         "buy_pct": 0,
         "sell_pct": 0,
@@ -540,13 +659,76 @@ def wait_result(symbol, reason, extra=None):
         "confirmation_5m": "WAIT",
         "confirmation_5m_raw": "WAIT",
         "current_5m_entry_confirmation": False,
+        "strategy_setup_complete": False,
         "blocked_by": reason,
         "blocked_reason": reason,
+        "block_reason": reason,
         "blocker_rule_name": reason,
         "debug_reasons": [reason],
     }
     if extra:
         payload.update(extra)
+
+    breakout = payload.get("fifteen_m_swing_break")
+    confirmation = payload.get("confirmation_5m")
+    trend = payload.get("trend_15m") or {}
+    structure = breakout.get("structure") if isinstance(breakout, dict) else {}
+    if not isinstance(structure, dict):
+        structure = {}
+    setup_side = str((breakout or {}).get("side") or payload.get("fifteen_m_setup") or "WAIT").upper()
+    if setup_side not in ["BUY", "SELL"]:
+        setup_side = "WAIT"
+
+    diagnostics = {
+        "symbol": normalized_symbol,
+        "final_signal": "WAIT",
+        "signal_before_filters": payload.get("signal_before_filters") or setup_side,
+        "signal_after_filters": "WAIT",
+        "blocked": True,
+        "blocked_by": payload.get("blocked_by"),
+        "blocked_reason": payload.get("blocked_reason"),
+        "block_reason": payload.get("blocked_reason"),
+        "fifteen_m_setup": setup_side,
+        "fifteen_m_swing_break": bool(
+            isinstance(breakout, dict) and breakout.get("side") in ["BUY", "SELL"]
+        ),
+        "fifteen_m_swing_break_confirmed": bool(
+            isinstance(breakout, dict) and breakout.get("side") in ["BUY", "SELL"]
+        ),
+        "fifteen_m_close_confirmed": bool(
+            isinstance(breakout, dict) and breakout.get("side") in ["BUY", "SELL"]
+        ),
+        "fifteen_m_structure_pattern": structure.get("pattern"),
+        "fifteen_m_structure_bias": structure.get("bias"),
+        "hh_hl_confirmed": structure.get("pattern") == "HH_HL",
+        "lh_ll_confirmed": structure.get("pattern") == "LH_LL",
+        "fifteen_m_break_level": (
+            breakout.get("level")
+            if isinstance(breakout, dict)
+            else None
+        ),
+        "fifteen_m_break_time": (
+            breakout.get("break_time")
+            if isinstance(breakout, dict)
+            else None
+        ),
+        "five_m_confirmation": bool(
+            isinstance(confirmation, dict) and confirmation.get("close_confirmed")
+        ),
+        "five_m_signal": (
+            confirmation.get("side")
+            if isinstance(confirmation, dict)
+            else "WAIT"
+        ),
+        "trend_bias": str(trend.get("trend") or "NEUTRAL").lower(),
+        "entry": payload.get("entry_price"),
+        "sl": payload.get("stop_loss"),
+        "tp1": payload.get("tp1"),
+        "tp2": payload.get("tp2"),
+    }
+    payload["signal_diagnostics"] = diagnostics
+    payload["entry_strategy_debug"] = diagnostics.copy()
+    payload["strategy_debug"] = diagnostics.copy()
     return payload
 
 
@@ -599,12 +781,6 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
         "trend_15m": trend,
         "fifteen_m_swing_break": breakout,
     }
-    ema_ok = trend["buy_allowed"] if side == "BUY" else trend["sell_allowed"]
-    if not ema_ok:
-        clear_opposite_watch(normalized_symbol, side, "opposite_15m_breakout")
-        return wait_result(normalized_symbol, "WAIT_EMA_AGAINST_TRADE", {
-            **breakout_meta,
-        })
 
     five_m = confirm_5m(
         closed_5m,
@@ -651,7 +827,9 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
     return {
         "symbol": normalized_symbol,
         "signal": side,
+        "final_signal": side,
         "signal_before_filters": side,
+        "signal_after_filters": side,
         "signal_text": f"{side} (15m swing + 5m close)",
         "buy_pct": buy_pct,
         "sell_pct": sell_pct,
@@ -671,7 +849,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
         "strategy_setup_complete": True,
         "strategy_setup_type": f"{side}_15M_SWING_BREAK_5M_CONFIRMED",
         "plan_type": f"STRICT {side}",
-        "plan_reason": f"{side}: 15m EMA, closed swing break, and 5m close confirmed",
+        "plan_reason": f"{side}: 15m HH/HL or LH/LL, closed swing break, and 5m close confirmed",
         "entry_price": levels["entry"],
         "price": levels["entry"],
         "stop_loss": levels["stop_loss"],
@@ -684,6 +862,8 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
         "fifteen_m_swing_break": breakout,
         "fifteen_m_swing_break_confirmed": True,
         "fifteen_m_swing_level": breakout["level"],
+        "fifteen_m_structure_pattern": (breakout.get("structure") or {}).get("pattern"),
+        "fifteen_m_structure_bias": (breakout.get("structure") or {}).get("bias"),
         "fifteen_m_closed_candle_close": breakout["break_close"],
         "confirmation_5m": five_m,
         "confirmation_5m_raw": five_m.get("side"),
@@ -694,7 +874,35 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
         "protected_sl_rule": levels["protected_sl_rule"],
         "blocked_by": None,
         "blocked_reason": None,
+        "block_reason": None,
         "blocker_rule_name": None,
+        "signal_diagnostics": {
+            "symbol": normalized_symbol,
+            "final_signal": side,
+            "signal_before_filters": side,
+            "signal_after_filters": side,
+            "blocked": False,
+            "blocked_by": None,
+            "blocked_reason": None,
+            "block_reason": None,
+            "fifteen_m_setup": side,
+            "fifteen_m_swing_break": True,
+            "fifteen_m_swing_break_confirmed": True,
+            "fifteen_m_close_confirmed": True,
+            "fifteen_m_structure_pattern": (breakout.get("structure") or {}).get("pattern"),
+            "fifteen_m_structure_bias": (breakout.get("structure") or {}).get("bias"),
+            "hh_hl_confirmed": (breakout.get("structure") or {}).get("pattern") == "HH_HL",
+            "lh_ll_confirmed": (breakout.get("structure") or {}).get("pattern") == "LH_LL",
+            "fifteen_m_break_level": breakout["level"],
+            "fifteen_m_break_time": breakout["break_time"],
+            "five_m_confirmation": True,
+            "five_m_signal": side,
+            "trend_bias": str(trend.get("trend") or "NEUTRAL").lower(),
+            "entry": levels["entry"],
+            "sl": levels["stop_loss"],
+            "tp1": levels["tp1"],
+            "tp2": levels["tp2"],
+        },
         "debug_reasons": [
             "15m EMA supports trade",
             "15m candle closed beyond valid 100-point swing",
