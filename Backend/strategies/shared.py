@@ -3481,9 +3481,9 @@ def update_paper_trade(
 
     def calculate_protected_sl(entry, tp2, side):
         if side == "BUY":
-            return entry + ((tp2 - entry) * 0.50)
+            return entry + ((tp2 - entry) * 0.40)
 
-        return entry - ((entry - tp2) * 0.50)
+        return entry - ((entry - tp2) * 0.40)
 
     def protect_trade_after_tp1(trade):
         if trade.get("hit_tp1"):
@@ -5295,9 +5295,9 @@ def calculate_protected_sl_from_tp2_price(entry, tp2, side):
     tp2_value = float(tp2)
 
     if str(side or "").upper() == "BUY":
-        return entry_value + ((tp2_value - entry_value) * 0.50)
+        return entry_value + ((tp2_value - entry_value) * 0.40)
 
-    return entry_value - ((entry_value - tp2_value) * 0.50)
+    return entry_value - ((entry_value - tp2_value) * 0.40)
 
 def get_strategy_pip_size(symbol):
     normalized_symbol = normalize_symbol(symbol)
@@ -8743,7 +8743,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             result["level_source"] = "15m swing"
             result["tp1_rule"] = "80% of entry-to-TP2"
             result["tp2_rule"] = "15m opposite swing target within 1.20R-2.00R"
-            result["protected_sl_rule"] = "50% of entry-to-TP2 after TP1"
+            result["protected_sl_rule"] = "40% of entry-to-TP2 after TP1"
         except Exception as exc:
             print("TIMEFRAME_ENTRY_LEVEL_WARNING =", {
                 "symbol": symbol,
