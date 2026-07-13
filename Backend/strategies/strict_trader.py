@@ -570,10 +570,10 @@ def build_risk_levels(data_15m, side, entry, symbol):
     tp1_ratio = shared.get_tp1_ratio_of_tp2()
     if side == "BUY":
         tp1 = float(entry) + ((tp2_price - float(entry)) * tp1_ratio)
-        protected = float(entry) + ((tp2_price - float(entry)) * 0.50)
+        protected = float(entry) + ((tp2_price - float(entry)) * 0.40)
     else:
         tp1 = float(entry) - ((float(entry) - tp2_price) * tp1_ratio)
-        protected = float(entry) - ((float(entry) - tp2_price) * 0.50)
+        protected = float(entry) - ((float(entry) - tp2_price) * 0.40)
 
     return {
         "ok": True,
@@ -599,7 +599,7 @@ def build_risk_levels(data_15m, side, entry, symbol):
         "tp_structure_source": tp2["source"],
         "rejected_tp_candidates": tp2.get("rejected_tp_candidates", []),
         "tp1_rule": "80% of entry-to-TP2 unless admin overrides it",
-        "protected_sl_rule": "50% of entry-to-TP2 after TP1 wick touch",
+        "protected_sl_rule": "40% of entry-to-TP2 after TP1 wick touch",
     }
 
 
@@ -824,7 +824,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
 
     buy_pct = 85 if side == "BUY" else 15
     sell_pct = 85 if side == "SELL" else 15
-    return {
+    result = {
         "symbol": normalized_symbol,
         "signal": side,
         "final_signal": side,
@@ -910,6 +910,15 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             "SL/TP built from strict swing rules",
         ],
     }
+    diagnostics = dict(result["signal_diagnostics"])
+    result["entry_strategy_debug"] = diagnostics.copy()
+    result["strategy_debug"] = diagnostics.copy()
+    result["bos_detected"] = True
+    result["choch_detected"] = False
+    result["smc_direction"] = side
+    result["fifteen_m_close_confirmed"] = True
+    result["five_m_confirmation"] = True
+    return result
 
 
 def update_trade_with_wick_management(trade, candle):
@@ -966,5 +975,5 @@ def build_protected_sl(entry, tp2, side):
     entry = float(entry)
     tp2 = float(tp2)
     if side == "BUY":
-        return entry + ((tp2 - entry) * 0.50)
-    return entry - ((entry - tp2) * 0.50)
+        return entry + ((tp2 - entry) * 0.40)
+    return entry - ((entry - tp2) * 0.40)
