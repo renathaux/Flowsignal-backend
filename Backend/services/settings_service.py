@@ -12,7 +12,7 @@ DEFAULT_RISK_SETTINGS = {
     "maxWeeklyLoss": None,
     "maxOpenTrades": 1,
     "tp1PercentOfTp2": 80,
-    "protectedSlPercentOfTp2": 50,
+    "protectedSlPercentOfTp2": 40,
     "breakEvenEnabled": True,
     "allowedSymbols": ["EURUSD", "XAUUSD"],
     "defaultTradingMode": "PAPER",
