@@ -891,6 +891,129 @@ def get_latest_consumed_signal_setup(symbol):
     return None
 
 
+def first_snapshot_value(*values):
+    for value in values:
+        if value not in [None, "", "--"]:
+            return copy.deepcopy(value)
+    return None
+
+
+def build_executed_trade_setup_snapshot(symbol, side, plan, trade_payload, position_id, timestamp=None):
+    plan = plan if isinstance(plan, dict) else {}
+    trade_payload = trade_payload if isinstance(trade_payload, dict) else {}
+    debug = plan.get("strategy_debug") or plan.get("entry_strategy_debug") or {}
+    debug = debug if isinstance(debug, dict) else {}
+    swing_break = plan.get("fifteen_m_swing_break") or debug.get("fifteen_m_swing_break_detail") or {}
+    swing_break = swing_break if isinstance(swing_break, dict) else {}
+    execution_time = float(timestamp or time.time())
+    if execution_time > 100000000000:
+        execution_time /= 1000.0
+    normalized_symbol = normalize_symbol(symbol)
+
+    return {
+        "snapshot_version": 1,
+        "immutable": True,
+        "symbol": normalized_symbol,
+        "direction": str(side or "").upper(),
+        "structure": first_snapshot_value(
+            plan.get("structure_trend"),
+            plan.get("structure_type"),
+            debug.get("htf_structure"),
+            debug.get("structure_type"),
+        ),
+        "bos_choch": first_snapshot_value(
+            debug.get("smc_direction"),
+            "CHOCH" if debug.get("choch_detected") else None,
+            "BOS" if debug.get("bos_detected") else None,
+            side,
+        ),
+        "bos_detected": bool(debug.get("bos_detected") or not debug.get("choch_detected")),
+        "choch_detected": bool(debug.get("choch_detected")),
+        "break_level": first_snapshot_value(
+            debug.get("fifteen_m_break_level"),
+            debug.get("fifteen_m_swing_level"),
+            debug.get("fifteen_m_bos_level"),
+            plan.get("fifteen_m_swing_level"),
+            plan.get("fifteen_m_bos_level"),
+            swing_break.get("level"),
+        ),
+        "fifteen_m_close": first_snapshot_value(
+            debug.get("fifteen_m_close"),
+            debug.get("fifteen_m_close_price"),
+            plan.get("fifteen_m_close"),
+            True,
+        ),
+        "fifteen_m_close_confirmed": True,
+        "five_m_confirmation": first_snapshot_value(
+            debug.get("five_m_confirmation_detail"),
+            debug.get("five_m_confirmation_price"),
+            plan.get("five_m_confirmation"),
+            True,
+        ),
+        "five_m_confirmation_confirmed": True,
+        "swing_sl": first_snapshot_value(
+            debug.get("selected_swing_sl"),
+            debug.get("final_sl"),
+            plan.get("selected_swing_sl"),
+            trade_payload.get("sl"),
+        ),
+        "entry": first_snapshot_value(trade_payload.get("entry"), plan.get("entry_price"), plan.get("entry")),
+        "sl": first_snapshot_value(trade_payload.get("sl"), plan.get("stop_loss"), plan.get("sl")),
+        "tp1": first_snapshot_value(trade_payload.get("tp1"), plan.get("tp1")),
+        "tp2": first_snapshot_value(trade_payload.get("tp2"), plan.get("tp2")),
+        "timestamp": execution_time,
+        "executed_at": datetime.fromtimestamp(execution_time, tz=timezone.utc).isoformat(),
+        "trade_id": f"ctrader-pos-{position_id}" if position_id else None,
+        "position_id": position_id,
+        "broker_position_id": position_id,
+        "status": "EXECUTED",
+        "progress": 100,
+        "conditions": {
+            "bos_choch": True,
+            "structure_break": True,
+            "fifteen_m_close": True,
+            "five_m_confirmation": True,
+            "swing_sl": True,
+            "tp_rr_validation": True,
+        },
+    }
+
+
+def executed_snapshot_matches_trade(snapshot, trade):
+    if not isinstance(snapshot, dict) or not isinstance(trade, dict):
+        return False
+    snapshot_position_id = snapshot.get("broker_position_id") or snapshot.get("position_id")
+    trade_position_id = trade.get("broker_position_id") or trade.get("position_id")
+    return (
+        normalize_symbol(snapshot.get("symbol")) == normalize_symbol(trade.get("symbol"))
+        and snapshot_position_id is not None
+        and str(snapshot_position_id) == str(trade_position_id)
+    )
+
+
+def ensure_executed_snapshot_for_active_trade(trade, plan=None):
+    if not isinstance(trade, dict):
+        return trade
+    snapshot = trade.get("executed_trade_setup_snapshot")
+    if executed_snapshot_matches_trade(snapshot, trade):
+        return trade
+    position_id = trade.get("broker_position_id") or trade.get("position_id")
+    side = trade.get("side") or trade.get("action")
+    if position_id is None or str(side or "").upper() not in ["BUY", "SELL"]:
+        return trade
+    snapshot = build_executed_trade_setup_snapshot(
+        trade.get("symbol"),
+        side,
+        plan or {},
+        trade,
+        position_id,
+        timestamp=trade.get("opened_at") or time.time(),
+    )
+    snapshot["recovered_from_active_position"] = True
+    trade["executed_trade_setup_snapshot"] = snapshot
+    return trade
+
+
 def apply_trade_signal_lifecycle(panel_data):
     if not isinstance(panel_data, dict):
         return panel_data
@@ -922,6 +1045,48 @@ def apply_trade_signal_lifecycle(panel_data):
             plan[key] = debug
 
     def apply_active_trade_display(plan, active_trade, side, status):
+        current_setup_state = copy.deepcopy({
+            key: value
+            for key, value in plan.items()
+            if key not in [
+                "current_setup_state",
+                "executed_trade_setup_snapshot",
+                "smc_plan_state_source",
+            ]
+        })
+        plan["current_setup_state"] = current_setup_state
+        snapshot = active_trade.get("executed_trade_setup_snapshot")
+        if executed_snapshot_matches_trade(snapshot, active_trade):
+            plan["executed_trade_setup_snapshot"] = copy.deepcopy(snapshot)
+            plan["smc_plan_state_source"] = "executed_trade_setup_snapshot"
+            plan["plan_type"] = "EXECUTED" if status == "OPEN" else "RUNNING"
+            plan["plan_bias"] = snapshot.get("direction") or side
+            plan["entry_price"] = snapshot.get("entry")
+            plan["stop_loss"] = snapshot.get("sl")
+            plan["tp1"] = snapshot.get("tp1")
+            plan["tp2"] = snapshot.get("tp2")
+            plan["strategy_setup_complete"] = True
+            plan["trade_already_running"] = True
+            plan["active_trade_side"] = side
+            plan["active_trade_status"] = status
+            plan["smc_progress"] = 100
+            plan["smc_status"] = "EXECUTED" if status == "OPEN" else "RUNNING"
+            plan["next_trigger"] = None
+            plan["strategy_debug"] = {
+                **(plan.get("strategy_debug") or {}),
+                "smc_direction": snapshot.get("direction") or side,
+                "bos_detected": bool(snapshot.get("bos_detected")),
+                "choch_detected": bool(snapshot.get("choch_detected")),
+                "fifteen_m_swing_break_confirmed": True,
+                "fifteen_m_break_level": snapshot.get("break_level"),
+                "fifteen_m_close_confirmed": True,
+                "five_m_confirmation": True,
+                "selected_swing_sl": snapshot.get("swing_sl") or snapshot.get("sl"),
+                "sl_valid": True,
+                "final_signal": snapshot.get("direction") or side,
+            }
+            return snapshot.get("direction") or side
+
         original_signal = str(plan.get("signal") or "WAIT").upper()
         setup_still_confirmed = original_signal in ["BUY", "SELL"]
         strategy_signal = original_signal if setup_still_confirmed else "WAIT"
@@ -2456,6 +2621,16 @@ def save_live_backup():
     except Exception as e:
         print("LIVE BACKUP SAVE ERROR:", e)
 
+
+def persist_live_trade_state(trade):
+    if not isinstance(trade, dict):
+        return
+    symbol = normalize_symbol(trade.get("symbol"))
+    active = LIVE_ACTIVE_ORDERS.get(symbol)
+    if isinstance(active, dict) and broker_position_matches_trade(active, trade):
+        LIVE_ACTIVE_ORDERS[symbol] = copy.deepcopy(trade)
+    save_live_backup()
+
 def get_live_week_start_ts(now=None):
     if now is None:
         now = datetime.now(LIVE_MARKET_TIMEZONE)
@@ -3071,12 +3246,83 @@ def calculate_protected_sl_price(entry, tp2, side):
     tp2_value = float(tp2)
 
     if str(side or "").upper() == "BUY":
-        return entry_value + ((tp2_value - entry_value) * 0.50)
+        return entry_value + ((tp2_value - entry_value) * 0.40)
 
-    return entry_value - ((entry_value - tp2_value) * 0.50)
+    return entry_value - ((entry_value - tp2_value) * 0.40)
+
+
+def get_trade_price_increment(trade):
+    symbol = normalize_symbol((trade or {}).get("symbol"))
+    fallback_digits = 2 if symbol == "XAUUSD" else 5
+    fallback_tick = 10 ** -fallback_digits
+    metadata = (trade or {}).get("symbol_metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+
+    try:
+        tick_size = float(
+            (trade or {}).get("tick_size")
+            or metadata.get("tick_size")
+            or fallback_tick
+        )
+        if not math.isfinite(tick_size) or tick_size <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        tick_size = fallback_tick
+
+    try:
+        digits = int((trade or {}).get("digits") or metadata.get("digits"))
+    except (TypeError, ValueError):
+        tick_text = f"{tick_size:.12f}".rstrip("0")
+        tick_decimals = len(tick_text.split(".", 1)[1]) if "." in tick_text else 0
+        digits = max(fallback_digits, tick_decimals)
+
+    return tick_size, digits
+
+
+def normalize_price_to_broker_increment(price, trade):
+    tick_size, digits = get_trade_price_increment(trade)
+    normalized = round(round(float(price) / tick_size) * tick_size, digits)
+    return normalized, tick_size, digits
+
+
+def read_back_broker_stop_loss(trade):
+    position_id = (trade or {}).get("position_id") or (trade or {}).get("broker_position_id")
+    symbol = normalize_symbol((trade or {}).get("symbol"))
+
+    try:
+        positions = get_open_positions() or []
+    except Exception as exc:
+        return None, {"ok": False, "reason": str(exc), "positions": []}
+
+    for position in positions:
+        candidate_id = (
+            position.get("position_id")
+            or position.get("positionId")
+            or position.get("id")
+        )
+        if str(candidate_id) != str(position_id):
+            continue
+        if normalize_symbol(position.get("symbol")) != symbol:
+            continue
+        raw = position.get("raw") if isinstance(position.get("raw"), dict) else {}
+        broker_sl = first_valid_live_price(
+            position.get("stop_loss"),
+            position.get("stopLoss"),
+            position.get("sl"),
+            raw.get("stopLoss"),
+            raw.get("sl"),
+        )
+        return broker_sl, {"ok": True, "position": position}
+
+    return None, {
+        "ok": False,
+        "reason": "Matching cTrader position was not returned after amendment",
+        "position_id": position_id,
+        "symbol": symbol,
+    }
 
 def live_sl_protection_confirmed(trade):
-    if not isinstance(trade, dict) or not trade.get("profit_protected"):
+    if not isinstance(trade, dict) or not trade.get("protection_confirmed"):
         return False
 
     broker_result = trade.get("sl_protection_broker_result")
@@ -3115,14 +3361,13 @@ def protect_live_trade_after_tp1(trade):
 
     try:
         symbol = normalize_symbol(trade.get("symbol"))
-        decimals = 2 if symbol == "XAUUSD" else 5
-        protected_sl = round(
+        protected_sl, tick_size, digits = normalize_price_to_broker_increment(
             calculate_protected_sl_price(
                 trade.get("entry"),
                 trade.get("tp2"),
                 trade.get("side") or trade.get("action")
             ),
-            decimals
+            trade,
         )
     except (TypeError, ValueError):
         return trade
@@ -3135,27 +3380,46 @@ def protect_live_trade_after_tp1(trade):
 
     if not position_id:
         trade["hit_tp1"] = True
+        trade["tp1_hit"] = True
+        trade["protection_requested"] = False
+        trade["protection_confirmed"] = False
         trade["profit_protected"] = False
         trade["protected_sl_price"] = protected_sl
         trade["original_sl"] = original_sl
         trade["result"] = "TP1 HIT"
         trade["sl_protection_failed"] = True
-        trade["sl_protection_warning"] = "TP1 hit, but broker SL protection failed"
+        trade["sl_protection_warning"] = "BROKER SL PROTECTION FAILED"
         trade["sl_protection_error"] = "Missing cTrader position id"
 
         print("LIVE_SL_PROTECTION_FAILED:", {
             "symbol": symbol,
-            "side": trade.get("side") or trade.get("action"),
+            "direction": trade.get("side") or trade.get("action"),
             "position_id": position_id,
+            "bid": trade.get("bid"),
+            "ask": trade.get("ask"),
+            "candle_high": trade.get("current_high"),
+            "candle_low": trade.get("current_low"),
             "entry": trade.get("entry"),
             "tp1": trade.get("tp1"),
             "tp2": trade.get("tp2"),
-            "original_sl": original_sl,
-            "protected_sl_price": protected_sl,
+            "old_sl": original_sl,
+            "calculated_protected_sl": protected_sl,
+            "broker_response": None,
+            "verification_result": {"ok": False},
             "reason": "Missing cTrader position id",
         })
 
+        persist_live_trade_state(trade)
         return trade
+
+    trade["hit_tp1"] = True
+    trade["tp1_hit"] = True
+    trade["protection_requested"] = True
+    trade["protection_confirmed"] = False
+    trade["protected_sl_price"] = protected_sl
+    trade["original_sl"] = original_sl
+    trade["result"] = "TP1 HIT"
+    persist_live_trade_state(trade)
 
     modify_result = modify_position_stop_loss(
         position_id,
@@ -3163,34 +3427,80 @@ def protect_live_trade_after_tp1(trade):
         take_profit_price=trade.get("tp2"),
     )
 
-    trade["hit_tp1"] = True
-    trade["protected_sl_price"] = protected_sl
-    trade["original_sl"] = original_sl
-    trade["result"] = "TP1 HIT"
-
     if not modify_result.get("ok"):
         trade["profit_protected"] = False
         trade["sl_protection_failed"] = True
-        trade["sl_protection_warning"] = "TP1 hit, but broker SL protection failed"
+        trade["sl_protection_warning"] = "BROKER SL PROTECTION FAILED"
         trade["sl_protection_error"] = modify_result.get("reason") or "Unknown cTrader SL modify error"
         trade["sl_protection_broker_result"] = modify_result
 
         print("LIVE_SL_PROTECTION_FAILED:", {
             "symbol": symbol,
-            "side": trade.get("side") or trade.get("action"),
+            "direction": trade.get("side") or trade.get("action"),
             "position_id": position_id,
+            "bid": trade.get("bid"),
+            "ask": trade.get("ask"),
+            "candle_high": trade.get("current_high"),
+            "candle_low": trade.get("current_low"),
             "entry": trade.get("entry"),
             "tp1": trade.get("tp1"),
             "tp2": trade.get("tp2"),
-            "original_sl": original_sl,
-            "protected_sl_price": protected_sl,
+            "old_sl": original_sl,
+            "calculated_protected_sl": protected_sl,
             "reason": trade["sl_protection_error"],
-            "broker_result": modify_result,
+            "broker_response": modify_result,
+            "verification_result": {"ok": False},
         })
 
+        persist_live_trade_state(trade)
+        return trade
+
+    broker_sl, readback_result = read_back_broker_stop_loss(trade)
+    verification_ok = (
+        broker_sl is not None
+        and abs(float(broker_sl) - protected_sl) <= (tick_size + 1e-12)
+    )
+    verification = {
+        "ok": verification_ok,
+        "requested_sl": protected_sl,
+        "broker_sl": broker_sl,
+        "tick_size": tick_size,
+        "digits": digits,
+        "within_tick_tolerance": verification_ok,
+        "readback": readback_result,
+    }
+    trade["sl_protection_verification"] = verification
+
+    if not verification_ok:
+        trade["profit_protected"] = False
+        trade["protection_confirmed"] = False
+        trade["sl_protection_failed"] = True
+        trade["sl_protection_warning"] = "BROKER SL PROTECTION FAILED"
+        trade["sl_protection_error"] = (
+            readback_result.get("reason")
+            or f"Broker SL {broker_sl} did not match requested SL {protected_sl}"
+        )
+        trade["sl_protection_broker_result"] = modify_result
+        print("BROKER SL PROTECTION FAILED", {
+            "symbol": symbol,
+            "direction": trade.get("side") or trade.get("action"),
+            "position_id": position_id,
+            "bid": trade.get("bid"),
+            "ask": trade.get("ask"),
+            "candle_high": trade.get("current_high"),
+            "candle_low": trade.get("current_low"),
+            "tp1": trade.get("tp1"),
+            "tp2": trade.get("tp2"),
+            "old_sl": original_sl,
+            "calculated_protected_sl": protected_sl,
+            "broker_response": modify_result,
+            "verification_result": verification,
+        })
+        persist_live_trade_state(trade)
         return trade
 
     trade["profit_protected"] = True
+    trade["protection_confirmed"] = True
     trade["sl"] = protected_sl
     trade["sl_protection_failed"] = False
     trade["sl_protection_warning"] = None
@@ -3199,13 +3509,19 @@ def protect_live_trade_after_tp1(trade):
 
     print("TP1_HIT_PROTECT_PROFIT:", {
         "symbol": symbol,
-        "side": trade.get("side") or trade.get("action"),
+        "direction": trade.get("side") or trade.get("action"),
+        "bid": trade.get("bid"),
+        "ask": trade.get("ask"),
+        "candle_high": trade.get("current_high"),
+        "candle_low": trade.get("current_low"),
         "entry": trade.get("entry"),
         "tp1": trade.get("tp1"),
         "tp2": trade.get("tp2"),
-        "original_sl": original_sl,
-        "protected_sl_price": protected_sl,
+        "old_sl": original_sl,
+        "calculated_protected_sl": protected_sl,
         "profit_protected": True,
+        "broker_response": modify_result,
+        "verification_result": verification,
     })
 
     print("LIVE_SL_PROTECTED_ON_BROKER:", {
@@ -3220,13 +3536,15 @@ def protect_live_trade_after_tp1(trade):
         "broker_result": modify_result,
     })
 
+    persist_live_trade_state(trade)
+
     return trade
 
 def update_live_trade_tp_protection(trade):
     if not isinstance(trade, dict):
         return trade
 
-    hit_tp1_before = bool(trade.get("hit_tp1"))
+    hit_tp1_before = bool(trade.get("tp1_hit") or trade.get("hit_tp1"))
     side = str(trade.get("side") or trade.get("action") or "").upper()
 
     def optional_float(value):
@@ -3255,16 +3573,19 @@ def update_live_trade_tp_protection(trade):
     elif side == "SELL" and ask is not None:
         trigger_price = ask
 
-    buy_trigger_high = current_high if current_high is not None else trigger_price
-    sell_trigger_low = current_low if current_low is not None else trigger_price
+    wick_touch_enabled = trade.get("wick_touch_enabled", True) is not False
+    buy_tick_hit = side == "BUY" and trigger_price is not None and trigger_price >= tp1 if tp1 is not None else False
+    sell_tick_hit = side == "SELL" and trigger_price is not None and trigger_price <= tp1 if tp1 is not None else False
+    buy_wick_hit = wick_touch_enabled and side == "BUY" and current_high is not None and current_high >= tp1 if tp1 is not None else False
+    sell_wick_hit = wick_touch_enabled and side == "SELL" and current_low is not None and current_low <= tp1 if tp1 is not None else False
+    buy_trigger_high = current_high if wick_touch_enabled else trigger_price
+    sell_trigger_low = current_low if wick_touch_enabled else trigger_price
 
     tp1_hit_detected = bool(
         tp1 is not None
         and (trigger_price is not None or buy_trigger_high is not None or sell_trigger_low is not None)
         and (
-            (side == "BUY" and buy_trigger_high is not None and buy_trigger_high >= tp1)
-            or
-            (side == "SELL" and sell_trigger_low is not None and sell_trigger_low <= tp1)
+            buy_tick_hit or sell_tick_hit or buy_wick_hit or sell_wick_hit
         )
     )
     tp2_hit_detected = bool(
@@ -3344,7 +3665,7 @@ def update_live_trade_tp_protection(trade):
         })
         return trade
 
-    if hit_tp1_before and not live_sl_protection_confirmed(trade):
+    if hit_tp1_before and not trade.get("protection_requested"):
         trade = protect_live_trade_after_tp1(trade)
 
     if hit_tp1_before or tp1 is None or tp2 is None:
@@ -4104,14 +4425,21 @@ def load_live_backup():
         if not isinstance(active_orders, dict):
             return
 
+        recovered_snapshot = False
         for symbol, trade in active_orders.items():
             execution_symbol = normalize_symbol(symbol)
 
             if execution_symbol in LIVE_ACTIVE_ORDERS and trade:
-                LIVE_ACTIVE_ORDERS[execution_symbol] = {
+                restored_trade = {
                     **trade,
                     "symbol": execution_symbol
                 }
+                had_matching_snapshot = executed_snapshot_matches_trade(
+                    restored_trade.get("executed_trade_setup_snapshot"),
+                    restored_trade,
+                )
+                LIVE_ACTIVE_ORDERS[execution_symbol] = ensure_executed_snapshot_for_active_trade(restored_trade)
+                recovered_snapshot = recovered_snapshot or not had_matching_snapshot
 
         if isinstance(history, list):
             LIVE_TRADE_HISTORY[:] = [
@@ -4134,6 +4462,8 @@ def load_live_backup():
                         pass
 
         print("LIVE BACKUP LOADED:", get_persistable_live_active_orders())
+        if recovered_snapshot:
+            save_live_backup()
         run_weekly_live_reset()
 
     except Exception as e:
@@ -4391,6 +4721,10 @@ def build_broker_closed_trade(trade, closed_at):
         ),
         "note": "Broker position no longer found in cTrader open positions."
     }
+    executed_snapshot = closed_trade.pop("executed_trade_setup_snapshot", None)
+    if executed_snapshot_matches_trade(executed_snapshot, trade):
+        closed_trade["archived_executed_trade_setup_snapshot"] = executed_snapshot
+        closed_trade["executed_trade_setup_snapshot_archived_at"] = closed_at
     ensure_live_trade_identity(closed_trade)
     log_live_trade_audit("broker_closed_build", closed_trade, reason=closed_trade.get("note"))
     return closed_trade
@@ -6701,6 +7035,7 @@ def sync_live_positions(panel_data=None):
                 "user_modified_levels": user_modified_levels,
                 "raw": position.get("raw", position),
             }
+            ensure_executed_snapshot_for_active_trade(mirrored_order, signal_plan)
             ensure_live_trade_identity(mirrored_order, symbol)
 
             if current_order and broker_position_matches_trade(position, current_order):
@@ -8373,8 +8708,12 @@ def execute_live_order_core(payload: dict, source="manual"):
         "opened_at": time.time(),
         "result": "RUNNING",
         "signal_setup_id": get_signal_setup_id(plan, side),
+        "symbol_metadata": copy.deepcopy(risk_size.get("symbol_metadata") or {}),
         "broker_result": result,
         "hit_tp1": False,
+        "tp1_hit": False,
+        "protection_requested": False,
+        "protection_confirmed": False,
         "profit_protected": False,
         "protected_sl_price": None,
         "sl_protection_failed": False,
@@ -8382,6 +8721,16 @@ def execute_live_order_core(payload: dict, source="manual"):
         "sl_protection_error": None,
         "sl_protection_broker_result": None,
     }
+    LIVE_ACTIVE_ORDERS[symbol]["executed_trade_setup_snapshot"] = (
+        build_executed_trade_setup_snapshot(
+            symbol,
+            side,
+            plan,
+            trade_payload,
+            broker_position_id,
+            timestamp=LIVE_LAST_EXECUTION_TIME[symbol],
+        )
+    )
     print("CTRADER_SLTP_CONFIRMATION =", build_live_protection_audit(
         symbol,
         side,
