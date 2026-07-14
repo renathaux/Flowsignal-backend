@@ -12,6 +12,8 @@ MIN_SL_POINTS = 100
 MIN_RR = 1.20
 MAX_RR = 2.00
 FALLBACK_RR = 2.00
+PULLBACK_MIN_POINTS = 30
+BOS_MIN_BUFFER_POINTS = 10
 
 
 def point_size(symbol):
@@ -29,7 +31,7 @@ def decimals(symbol):
     try:
         value = int(shared.get_strategy_decimals(symbol))
     except (TypeError, ValueError):
-        value = 5
+        value = 2 if shared.normalize_symbol(symbol) == "XAUUSD" else 5
     return value
 
 
@@ -45,6 +47,35 @@ def minimum_sl_distance(symbol):
     return MIN_SL_POINTS * point_size(symbol)
 
 
+def atr14(data):
+    if data is None or len(data) < 14:
+        return None
+    high = data["High"].astype(float)
+    low = data["Low"].astype(float)
+    close = data["Close"].astype(float)
+    previous_close = close.shift(1)
+    true_range = pd.concat(
+        [
+            high - low,
+            (high - previous_close).abs(),
+            (low - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    value = true_range.tail(14).mean()
+    return float(value) if pd.notna(value) and value > 0 else None
+
+
+def bos_buffer(data_15m, symbol):
+    atr = atr14(data_15m) or 0.0
+    return max(BOS_MIN_BUFFER_POINTS * point_size(symbol), 0.10 * atr)
+
+
+def minimum_pullback_size(data_15m, symbol):
+    atr = atr14(data_15m) or 0.0
+    return max(PULLBACK_MIN_POINTS * point_size(symbol), 0.25 * atr)
+
+
 def closed_frame(data, minutes):
     return shared.remove_current_forming_candle(data, minutes)
 
@@ -53,6 +84,38 @@ def candle_time(index_value):
     try:
         return pd.Timestamp(index_value).isoformat()
     except Exception:
+        return None
+
+
+def candle_close_time(index_value, minutes):
+    try:
+        timestamp = pd.Timestamp(index_value)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("UTC")
+        else:
+            timestamp = timestamp.tz_convert("UTC")
+        return (timestamp + pd.Timedelta(minutes=minutes)).isoformat()
+    except Exception:
+        return None
+
+
+def utc_timestamp(value):
+    try:
+        timestamp = pd.Timestamp(value)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("UTC")
+        else:
+            timestamp = timestamp.tz_convert("UTC")
+        return timestamp
+    except Exception:
+        return None
+
+
+def last_position_closed_time(symbol):
+    try:
+        value = float(shared.LAST_POSITION_CLOSED_AT.get(shared.normalize_symbol(symbol), 0) or 0)
+        return pd.Timestamp(value, unit="s", tz="UTC") if value > 0 else None
+    except (AttributeError, TypeError, ValueError):
         return None
 
 
@@ -84,7 +147,7 @@ def trend_filter(data_15m, symbol):
     }
 
 
-def detect_valid_swings(data_15m, symbol, left=2, right=2):
+def detect_raw_swings(data_15m, symbol, left=2, right=2):
     if data_15m is None or len(data_15m) < left + right + 3:
         return []
 
@@ -140,50 +203,15 @@ def detect_valid_swings(data_15m, symbol, left=2, right=2):
 
         previous_by_type[swing["type"]] = swing
 
-    composite_indexes = set()
-    for end in range(len(raw)):
-        prefix = raw[:end + 1]
-        prefix_highs = [s for s in prefix if s.get("type") == "HIGH"]
-        prefix_lows = [s for s in prefix if s.get("type") == "LOW"]
-        if len(prefix_highs) < 2 or len(prefix_lows) < 2:
-            continue
+    return raw
 
-        previous_high, last_high = prefix_highs[-2], prefix_highs[-1]
-        previous_low, last_low = prefix_lows[-2], prefix_lows[-1]
-        hh = float(last_high["price"]) > float(previous_high["price"])
-        hl = float(last_low["price"]) > float(previous_low["price"])
-        lh = float(last_high["price"]) < float(previous_high["price"])
-        ll = float(last_low["price"]) < float(previous_low["price"])
 
-        bullish_composite_size = (
-            abs(float(last_high["price"]) - float(previous_high["price"]))
-            + abs(float(last_low["price"]) - float(previous_low["price"]))
-        )
-        bearish_composite_size = (
-            abs(float(previous_high["price"]) - float(last_high["price"]))
-            + abs(float(previous_low["price"]) - float(last_low["price"]))
-        )
-
-        if hh and hl and bullish_composite_size >= min_size:
-            for swing in [previous_high, last_high, previous_low, last_low]:
-                swing["valid"] = True
-                swing["valid_reason"] = "composite_hh_hl_100_point_structure"
-                swing["composite_swing_size"] = bullish_composite_size
-                composite_indexes.add(swing["index"])
-
-        if lh and ll and bearish_composite_size >= min_size:
-            for swing in [previous_high, last_high, previous_low, last_low]:
-                swing["valid"] = True
-                swing["valid_reason"] = "composite_lh_ll_100_point_structure"
-                swing["composite_swing_size"] = bearish_composite_size
-                composite_indexes.add(swing["index"])
-
-    swings = []
-    for swing in raw:
-        if swing["valid"] or swing["index"] in composite_indexes:
-            swings.append(swing)
-
-    return swings
+def detect_valid_swings(data_15m, symbol, left=2, right=2):
+    return [
+        swing
+        for swing in detect_raw_swings(data_15m, symbol, left=left, right=right)
+        if swing.get("valid")
+    ]
 
 
 def latest_swing(swings, swing_type):
@@ -249,6 +277,162 @@ def detect_swing_structure(swings):
     return structure
 
 
+def validate_continuation_structure(raw_swings, data_15m, symbol):
+    base = {
+        "pattern": "NEUTRAL",
+        "bias": "NEUTRAL",
+        "reason": "WAIT_NO_CLEAR_HH_HL_OR_LH_LL_STRUCTURE",
+        "completed_impulse_size": None,
+        "completed_impulse_points": None,
+        "pullback_size": None,
+        "pullback_points": None,
+        "minimum_pullback_size": minimum_pullback_size(data_15m, symbol),
+        "minimum_impulse_size": minimum_swing_size(symbol),
+        "sequence": [],
+    }
+    if len(raw_swings) < 4:
+        return base
+
+    sequence = raw_swings[-4:]
+    types = [swing.get("type") for swing in sequence]
+    base["sequence"] = sequence
+    bullish_sequence = types == ["HIGH", "LOW", "HIGH", "LOW"]
+    bearish_sequence = types == ["LOW", "HIGH", "LOW", "HIGH"]
+
+    if bullish_sequence:
+        previous_high, previous_low, last_high, last_low = sequence
+        if float(last_high["price"]) <= float(previous_high["price"]):
+            return base
+        side = "BUY"
+        pattern = "HH_HL"
+        impulse_size = float(last_high["price"]) - float(previous_low["price"])
+        pullback_size = float(last_high["price"]) - float(last_low["price"])
+        preserved_structure = float(last_low["price"]) > float(previous_low["price"])
+        invalidation_level = float(last_low["price"])
+        pullback_closes = data_15m.iloc[int(last_low["index"]) + 1:]["Close"].astype(float)
+        invalidated = bool(
+            not pullback_closes.empty
+            and (pullback_closes < invalidation_level).any()
+        )
+    elif bearish_sequence:
+        previous_low, previous_high, last_low, last_high = sequence
+        if float(last_low["price"]) >= float(previous_low["price"]):
+            return base
+        side = "SELL"
+        pattern = "LH_LL"
+        impulse_size = float(previous_high["price"]) - float(last_low["price"])
+        pullback_size = float(last_high["price"]) - float(last_low["price"])
+        preserved_structure = float(last_high["price"]) < float(previous_high["price"])
+        invalidation_level = float(last_high["price"])
+        pullback_closes = data_15m.iloc[int(last_high["index"]) + 1:]["Close"].astype(float)
+        invalidated = bool(
+            not pullback_closes.empty
+            and (pullback_closes > invalidation_level).any()
+        )
+    else:
+        return base
+
+    point = point_size(symbol)
+    minimum_impulse = minimum_swing_size(symbol)
+    minimum_pullback = minimum_pullback_size(data_15m, symbol)
+    base.update({
+        "pattern": pattern,
+        "bias": "BULLISH" if side == "BUY" else "BEARISH",
+        "side": side,
+        "completed_impulse_size": impulse_size,
+        "completed_impulse_points": impulse_size / point,
+        "pullback_size": pullback_size,
+        "pullback_points": pullback_size / point,
+        "invalidation_level": invalidation_level,
+    })
+
+    if impulse_size < minimum_impulse:
+        base["reason"] = "WAIT_NO_VALID_100_POINT_IMPULSE"
+        return base
+    if pullback_size < minimum_pullback:
+        base["reason"] = "WAIT_PULLBACK_TOO_SMALL"
+        return base
+    if pullback_size >= impulse_size:
+        base["reason"] = "WAIT_PULLBACK_TOO_LARGE"
+        return base
+    if not preserved_structure or invalidated:
+        base["reason"] = "WAIT_STRUCTURE_INVALIDATED"
+        return base
+
+    base.update({
+        "valid": True,
+        "reason": (
+            "BULLISH_HH_HL_VALID_IMPULSE_AND_PULLBACK"
+            if side == "BUY"
+            else "BEARISH_LH_LL_VALID_IMPULSE_AND_PULLBACK"
+        ),
+    })
+    return base
+
+
+def classify_consolidation(data_15m, symbol):
+    result = {
+        "is_consolidation": False,
+        "reason": None,
+        "high_overlap": False,
+        "compressed_range": False,
+        "ema_compressed": False,
+        "conditions_met": 0,
+    }
+    if data_15m is None or len(data_15m) < 21:
+        return result
+
+    recent = data_15m.tail(8)
+    atr = atr14(data_15m)
+    if atr is None:
+        return result
+
+    overlap_count = 0
+    for index in range(1, len(recent)):
+        previous = recent.iloc[index - 1]
+        current = recent.iloc[index]
+        previous_range = float(previous["High"]) - float(previous["Low"])
+        current_range = float(current["High"]) - float(current["Low"])
+        denominator = min(previous_range, current_range)
+        overlap = min(float(previous["High"]), float(current["High"])) - max(
+            float(previous["Low"]), float(current["Low"])
+        )
+        ratio = max(0.0, overlap) / denominator if denominator > 0 else 0.0
+        if ratio >= 0.60:
+            overlap_count += 1
+
+    eight_candle_range = float(recent["High"].max() - recent["Low"].min())
+    close = data_15m["Close"].astype(float)
+    ema9 = close.ewm(span=9, adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+    ema_spread = abs(float(ema9.iloc[-1]) - float(ema21.iloc[-1]))
+    ema9_slope = abs(float(ema9.iloc[-1]) - float(ema9.iloc[-4]))
+
+    result.update({
+        "atr14": atr,
+        "overlap_pairs": overlap_count,
+        "high_overlap": overlap_count >= 5,
+        "eight_candle_range": eight_candle_range,
+        "compressed_range": eight_candle_range <= 3.0 * atr,
+        "ema9": float(ema9.iloc[-1]),
+        "ema21": float(ema21.iloc[-1]),
+        "ema_spread": ema_spread,
+        "ema9_three_candle_slope": ema9_slope,
+        "ema_compressed": (
+            ema_spread <= 0.20 * atr
+            and ema9_slope <= 0.15 * atr
+        ),
+    })
+    result["conditions_met"] = sum(
+        bool(result[key])
+        for key in ["high_overlap", "compressed_range", "ema_compressed"]
+    )
+    result["is_consolidation"] = result["conditions_met"] >= 2
+    result["reason"] = "WAIT_CONSOLIDATION" if result["is_consolidation"] else None
+    result["symbol"] = shared.normalize_symbol(symbol)
+    return result
+
+
 def get_watch_key(symbol, side):
     return shared.get_15m_swing_watch_key(symbol, side)
 
@@ -263,7 +447,16 @@ def clear_opposite_watch(symbol, side, reason):
     return False
 
 
-def save_remembered_breakout(symbol, side, level, break_time, break_close, reason):
+def save_remembered_breakout(
+    symbol,
+    side,
+    level,
+    break_time,
+    break_close,
+    reason,
+    break_close_time=None,
+    required_buffer=None,
+):
     key = get_watch_key(symbol, side)
     shared.FIFTEEN_M_SWING_WATCH[key] = {
         "symbol": shared.normalize_symbol(symbol),
@@ -272,7 +465,9 @@ def save_remembered_breakout(symbol, side, level, break_time, break_close, reaso
         "saved_at": datetime.now(timezone.utc).isoformat(),
         "break_confirmed": True,
         "break_candle_time": break_time,
+        "break_close_time": break_close_time,
         "break_close": float(break_close),
+        "bos_buffer": float(required_buffer or 0.0),
         "status": "PENDING",
         "reason": reason,
     }
@@ -290,7 +485,12 @@ def remembered_breakout(symbol, side):
             "side": side,
             "level": float(watch.get("swing_level")),
             "break_time": watch.get("break_candle_time"),
+            "break_close_time": (
+                watch.get("break_close_time")
+                or candle_close_time(watch.get("break_candle_time"), 15)
+            ),
             "break_close": float(watch.get("break_close")),
+            "bos_buffer": float(watch.get("bos_buffer") or 0.0),
             "remembered": True,
             "watch": watch,
         }
@@ -303,12 +503,14 @@ def evaluate_15m_breakout(data_15m, symbol):
         "side": "WAIT",
         "level": None,
         "break_time": None,
+        "break_close_time": None,
         "break_close": None,
         "remembered": False,
         "reason": "WAIT_NO_15M_BREAK",
         "swings": [],
         "structure": {},
         "breakouts": [],
+        "bos_buffer": None,
     }
 
     if data_15m is None or len(data_15m) < 10:
@@ -316,17 +518,20 @@ def evaluate_15m_breakout(data_15m, symbol):
         return result
 
     swing_source = data_15m.iloc[:-1].copy()
-    swings = detect_valid_swings(swing_source, symbol)
+    swings = detect_raw_swings(swing_source, symbol)
     result["swings"] = swings
 
     if not swings:
-        result["reason"] = "WAIT_NO_VALID_100_POINT_SWING"
+        result["reason"] = "WAIT_NO_VALID_100_POINT_IMPULSE"
         return result
 
-    structure = detect_swing_structure(swings)
+    structure = validate_continuation_structure(swings, swing_source, symbol)
     result["structure"] = structure
-    bullish_structure = structure.get("pattern") == "HH_HL"
-    bearish_structure = structure.get("pattern") == "LH_LL"
+    if not structure.get("valid"):
+        result["reason"] = structure.get("reason") or "WAIT_NO_VALID_100_POINT_IMPULSE"
+        return result
+    bullish_structure = structure.get("side") == "BUY"
+    bearish_structure = structure.get("side") == "SELL"
 
     last = data_15m.iloc[-1]
     previous = data_15m.iloc[-2]
@@ -335,6 +540,9 @@ def evaluate_15m_breakout(data_15m, symbol):
     last_low = float(last["Low"])
     previous_close = float(previous["Close"])
     break_time = candle_time(data_15m.index[-1])
+    break_close_time = candle_close_time(data_15m.index[-1], 15)
+    required_buffer = bos_buffer(data_15m, symbol)
+    result["bos_buffer"] = required_buffer
 
     high_swing = latest_swing(swings, "HIGH")
     low_swing = latest_swing(swings, "LOW")
@@ -342,30 +550,42 @@ def evaluate_15m_breakout(data_15m, symbol):
 
     if high_swing and bullish_structure:
         level = float(high_swing["price"])
-        confirmed = last_high > level and last_close > level and previous_close <= level
+        confirmed = (
+            last_high > level
+            and last_close >= level + required_buffer
+            and previous_close <= level
+        )
         if confirmed:
             candidates.append({
                 "side": "BUY",
                 "level": level,
                 "break_time": break_time,
+                "break_close_time": break_close_time,
                 "break_close": last_close,
                 "swing": high_swing,
                 "structure": structure,
                 "remembered": False,
+                "bos_buffer": required_buffer,
             })
 
     if low_swing and bearish_structure:
         level = float(low_swing["price"])
-        confirmed = last_low < level and last_close < level and previous_close >= level
+        confirmed = (
+            last_low < level
+            and last_close <= level - required_buffer
+            and previous_close >= level
+        )
         if confirmed:
             candidates.append({
                 "side": "SELL",
                 "level": level,
                 "break_time": break_time,
+                "break_close_time": break_close_time,
                 "break_close": last_close,
                 "swing": low_swing,
                 "structure": structure,
                 "remembered": False,
+                "bos_buffer": required_buffer,
             })
 
     if not candidates:
@@ -376,6 +596,7 @@ def evaluate_15m_breakout(data_15m, symbol):
             candidates.append({
                 **remembered,
                 "structure": structure,
+                "bos_buffer": float(remembered.get("bos_buffer") or required_buffer),
             })
 
     result["breakouts"] = candidates
@@ -392,7 +613,11 @@ def evaluate_15m_breakout(data_15m, symbol):
             and last_close < float(low_swing["price"])
             and previous_close >= float(low_swing["price"])
         )
-        if raw_buy_break and not bullish_structure:
+        if raw_buy_break and bullish_structure:
+            result["reason"] = "WAIT_WEAK_15M_BOS"
+        elif raw_sell_break and bearish_structure:
+            result["reason"] = "WAIT_WEAK_15M_BOS"
+        elif raw_buy_break and not bullish_structure:
             result["reason"] = "WAIT_NO_HH_HL_STRUCTURE"
         elif raw_sell_break and not bearish_structure:
             result["reason"] = "WAIT_NO_LH_LL_STRUCTURE"
@@ -404,8 +629,13 @@ def evaluate_15m_breakout(data_15m, symbol):
         "side": chosen["side"],
         "level": chosen["level"],
         "break_time": chosen["break_time"],
+        "break_close_time": (
+            chosen.get("break_close_time")
+            or candle_close_time(chosen.get("break_time"), 15)
+        ),
         "break_close": chosen["break_close"],
         "remembered": bool(chosen.get("remembered")),
+        "bos_buffer": float(chosen.get("bos_buffer") or required_buffer),
         "swing": chosen.get("swing"),
         "structure": chosen.get("structure") or structure,
         "reason": "15M_SWING_BREAK_CLOSED",
@@ -413,11 +643,20 @@ def evaluate_15m_breakout(data_15m, symbol):
     return result
 
 
-def confirm_5m(data_5m, side, level, break_time):
+def confirm_5m(
+    data_5m,
+    side,
+    level,
+    break_time,
+    break_close_time=None,
+    not_before=None,
+    required_buffer=0.0,
+):
     base = {
         "side": "WAIT",
         "close_confirmed": False,
         "closed_candle_time": None,
+        "confirmation_close_time": None,
         "reason": "WAIT_NO_5M_CLOSE_CONFIRMATION",
     }
     if side not in ["BUY", "SELL"] or level is None or not break_time:
@@ -428,7 +667,10 @@ def confirm_5m(data_5m, side, level, break_time):
         return base
 
     try:
-        anchor = pd.Timestamp(break_time)
+        anchor = pd.Timestamp(
+            break_close_time
+            or candle_close_time(break_time, 15)
+        )
         if anchor.tzinfo is None:
             anchor = anchor.tz_localize("UTC")
         else:
@@ -436,6 +678,8 @@ def confirm_5m(data_5m, side, level, break_time):
     except Exception:
         return base
 
+    weak_confirmation_seen = False
+    threshold_buffer = max(0.0, float(required_buffer or 0.0))
     for candle_index, candle in closed.iterrows():
         try:
             ts = pd.Timestamp(candle_index)
@@ -443,7 +687,11 @@ def confirm_5m(data_5m, side, level, break_time):
                 ts = ts.tz_localize("UTC")
             else:
                 ts = ts.tz_convert("UTC")
-            if ts <= anchor:
+            confirmation_close = ts + pd.Timedelta(minutes=5)
+            if confirmation_close <= anchor:
+                continue
+            freshness_floor = utc_timestamp(not_before)
+            if freshness_floor is not None and confirmation_close <= freshness_floor:
                 continue
             open_price = float(candle["Open"])
             close_price = float(candle["Close"])
@@ -452,28 +700,46 @@ def confirm_5m(data_5m, side, level, break_time):
         except Exception:
             continue
 
-        passed = (
+        direction_matches = (
             side == "BUY"
             and close_price > open_price
-            and close_price > float(level)
         ) or (
             side == "SELL"
             and close_price < open_price
-            and close_price < float(level)
+        )
+        passed = direction_matches and (
+            (
+                side == "BUY"
+                and close_price >= float(level) + threshold_buffer
+            )
+            or (
+                side == "SELL"
+                and close_price <= float(level) - threshold_buffer
+            )
         )
         if passed:
             return {
                 "side": side,
                 "close_confirmed": True,
                 "closed_candle_time": ts.isoformat(),
+                "confirmation_close_time": confirmation_close.isoformat(),
                 "open": open_price,
                 "high": high_price,
                 "low": low_price,
                 "close": close_price,
                 "setup_level": float(level),
+                "bos_buffer": threshold_buffer,
                 "reason": "5M_CLOSE_CONFIRMED",
             }
+        if direction_matches and (
+            (side == "BUY" and close_price > float(level))
+            or (side == "SELL" and close_price < float(level))
+        ):
+            weak_confirmation_seen = True
 
+    if weak_confirmation_seen:
+        base["reason"] = "WAIT_WEAK_5M_CONFIRMATION"
+        base["bos_buffer"] = threshold_buffer
     return base
 
 
@@ -761,6 +1027,17 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
         )
 
     trend = trend_filter(closed_15m, normalized_symbol)
+    consolidation = classify_consolidation(closed_15m, normalized_symbol)
+    base_meta["consolidation"] = consolidation
+    base_meta["market_condition"] = (
+        "CONSOLIDATION" if consolidation.get("is_consolidation") else "STRUCTURE"
+    )
+    if consolidation.get("is_consolidation"):
+        return wait_result(normalized_symbol, "WAIT_CONSOLIDATION", {
+            **base_meta,
+            "trend_15m": trend,
+        })
+
     breakout = evaluate_15m_breakout(closed_15m, normalized_symbol)
     base_meta = {
         **base_meta,
@@ -775,6 +1052,40 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
         })
 
     side = breakout["side"]
+    ema_allowed = (
+        side == "BUY" and bool(trend.get("buy_allowed"))
+    ) or (
+        side == "SELL" and bool(trend.get("sell_allowed"))
+    )
+    if not ema_allowed:
+        return wait_result(normalized_symbol, "WAIT_EMA_NOT_ALLOWED", {
+            **base_meta,
+            "trend_15m": trend,
+            "fifteen_m_swing_break": breakout,
+            "blocked_by": "WAIT_EMA_NOT_ALLOWED",
+            "blocker_rule_name": "strict_15m_ema_permission",
+        })
+
+    prior_close = last_position_closed_time(normalized_symbol)
+    bos_close = utc_timestamp(
+        breakout.get("break_close_time")
+        or candle_close_time(breakout.get("break_time"), 15)
+    )
+    if prior_close is not None and (bos_close is None or bos_close <= prior_close):
+        shared.FIFTEEN_M_SWING_WATCH.pop(
+            get_watch_key(normalized_symbol, side),
+            None,
+        )
+        shared.save_fifteen_m_swing_watch()
+        return wait_result(normalized_symbol, "WAIT_BOS_NOT_FRESH_AFTER_POSITION_CLOSE", {
+            **base_meta,
+            "trend_15m": trend,
+            "fifteen_m_swing_break": breakout,
+            "previous_position_closed_at": prior_close.isoformat(),
+            "blocked_by": "post_close_setup_freshness",
+            "blocker_rule_name": "bos_after_previous_position_close",
+        })
+
     breakout_meta = {
         **base_meta,
         "fifteen_m_setup": side,
@@ -787,6 +1098,9 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
         side,
         breakout["level"],
         breakout["break_time"],
+        break_close_time=breakout.get("break_close_time"),
+        not_before=prior_close,
+        required_buffer=breakout.get("bos_buffer"),
     )
     setup_meta = {
         **breakout_meta,
@@ -804,9 +1118,11 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             breakout["level"],
             breakout["break_time"],
             breakout["break_close"],
-            "WAIT_NO_5M_CLOSE_CONFIRMATION",
+            five_m.get("reason") or "WAIT_NO_5M_CLOSE_CONFIRMATION",
+            break_close_time=breakout.get("break_close_time"),
+            required_buffer=breakout.get("bos_buffer"),
         )
-        return wait_result(normalized_symbol, "WAIT_NO_5M_CLOSE_CONFIRMATION", {
+        return wait_result(normalized_symbol, five_m.get("reason") or "WAIT_NO_5M_CLOSE_CONFIRMATION", {
             **setup_meta,
             "remembered_breakout": True,
         })
@@ -835,6 +1151,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
         "sell_pct": sell_pct,
         "confidence": 85,
         "market_condition": "STRUCTURE",
+        "consolidation": consolidation,
         "entry_quality": "STRICT",
         "entry_timing": "5M CLOSED CONFIRMATION",
         "strategy_model": "strict_15m_trader",
@@ -865,6 +1182,13 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
         "fifteen_m_structure_pattern": (breakout.get("structure") or {}).get("pattern"),
         "fifteen_m_structure_bias": (breakout.get("structure") or {}).get("bias"),
         "fifteen_m_closed_candle_close": breakout["break_close"],
+        "fifteen_m_break_time": breakout["break_time"],
+        "fifteen_m_break_close_time": breakout.get("break_close_time"),
+        "setup_candle_time": five_m.get("confirmation_close_time"),
+        "five_m_closed_candle_time": five_m.get("confirmation_close_time"),
+        "previous_position_closed_at": (
+            prior_close.isoformat() if prior_close is not None else None
+        ),
         "confirmation_5m": five_m,
         "confirmation_5m_raw": five_m.get("side"),
         "current_5m_entry_confirmation": True,
@@ -895,7 +1219,9 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             "lh_ll_confirmed": (breakout.get("structure") or {}).get("pattern") == "LH_LL",
             "fifteen_m_break_level": breakout["level"],
             "fifteen_m_break_time": breakout["break_time"],
+            "fifteen_m_break_close_time": breakout.get("break_close_time"),
             "five_m_confirmation": True,
+            "five_m_confirmation_close_time": five_m.get("confirmation_close_time"),
             "five_m_signal": side,
             "trend_bias": str(trend.get("trend") or "NEUTRAL").lower(),
             "entry": levels["entry"],
