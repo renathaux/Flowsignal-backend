@@ -34,6 +34,7 @@ from ctrader_connector import (
     get_ctrader_account_selection_debug,
     get_ctrader_redirect_uri_debug,
     get_ctrader_refresh_token_status,
+    get_ctrader_market_data,
     get_live_prices,
     get_ctrader_position_fetch_error,
     get_ctrader_symbol_risk_metadata,
@@ -2143,6 +2144,9 @@ LIVE_ORDER_LOCK = threading.RLock()
 LIVE_ORDER_IN_FLIGHT = set()
 MAX_LIVE_TRADE_HISTORY = 50
 LIVE_EXECUTION_COOLDOWN_SECONDS = 30
+LIVE_POST_CLOSE_COOLDOWN_SECONDS = int(
+    os.getenv("LIVE_POST_CLOSE_COOLDOWN_SECONDS", "900")
+)
 BROKER_SYNC_GRACE_SECONDS = 10
 LIVE_RISK_PERCENT = 1.0
 MAX_LIVE_RISK_PERCENT = 1.0
@@ -2152,6 +2156,88 @@ LIVE_LAST_EXECUTION_TIME = {
     "EURUSD": 0,
     "XAUUSD": 0
 }
+LIVE_LAST_POSITION_CLOSED_AT = {
+    "EURUSD": 0.0,
+    "XAUUSD": 0.0,
+}
+
+
+def invalidate_symbol_setup_state(
+    symbol,
+    closed_at,
+    reason="position closed",
+    panel_data=None,
+):
+    normalized_symbol = normalize_symbol(symbol)
+    try:
+        closed_timestamp = float(closed_at or time.time())
+    except (TypeError, ValueError):
+        closed_timestamp = time.time()
+
+    LIVE_LAST_POSITION_CLOSED_AT[normalized_symbol] = max(
+        float(LIVE_LAST_POSITION_CLOSED_AT.get(normalized_symbol, 0) or 0),
+        closed_timestamp,
+    )
+
+    try:
+        import brain
+
+        brain.clear_symbol_entry_memory(
+            normalized_symbol,
+            reason,
+            closed_at=closed_timestamp,
+        )
+    except Exception as exc:
+        print("SYMBOL_SETUP_MEMORY_INVALIDATION_ERROR =", {
+            "symbol": normalized_symbol,
+            "closed_at": closed_timestamp,
+            "reason": reason,
+            "error": str(exc),
+        })
+
+    plan_roots = [PANEL_CACHE.get("data")]
+    if (
+        isinstance(panel_data, dict)
+        and all(panel_data is not root for root in plan_roots)
+    ):
+        plan_roots.append(panel_data)
+    for plan_root in plan_roots:
+        plan = (
+            plan_root.get(normalized_symbol)
+            if isinstance(plan_root, dict)
+            else None
+        )
+        if not isinstance(plan, dict):
+            continue
+        plan.update({
+            "signal": "WAIT",
+            "final_signal": "WAIT",
+            "signal_before_filters": "WAIT",
+            "signal_after_filters": "WAIT",
+            "signal_display_state": "WAIT",
+            "fresh_entry_available": False,
+            "strategy_setup_complete": False,
+            "fifteen_m_setup": "WAIT",
+            "confirmation_5m": "WAIT",
+            "confirmation_5m_raw": "WAIT",
+            "current_5m_entry_confirmation": False,
+            "blocked_by": "position_closed_setup_invalidated",
+            "blocked_reason": "Position closed; waiting for a fresh post-close 15m BOS",
+            "blocker_rule_name": "post_close_setup_invalidation",
+            "previous_position_closed_at": datetime.fromtimestamp(
+                closed_timestamp,
+                tz=timezone.utc,
+            ).isoformat(),
+        })
+
+    SIGNAL_EMAIL_LAST_SIGNAL[normalized_symbol] = "WAIT"
+    print("POST_CLOSE_SETUP_INVALIDATED =", {
+        "symbol": normalized_symbol,
+        "closed_at": closed_timestamp,
+        "reason": reason,
+        "cooldown_seconds": LIVE_POST_CLOSE_COOLDOWN_SECONDS,
+    })
+    return closed_timestamp
 
 def get_configured_live_risk_percent():
     try:
@@ -2615,6 +2701,8 @@ def save_live_backup():
                     LIVE_TRADE_HISTORY[:MAX_LIVE_TRADE_HISTORY],
                 "live_last_execution_time":
                     LIVE_LAST_EXECUTION_TIME,
+                "live_last_position_closed_at":
+                    LIVE_LAST_POSITION_CLOSED_AT,
                 LIVE_RESET_KEY:
                     LAST_LIVE_RESET,
             }, f, indent=2)
@@ -4420,6 +4508,7 @@ def load_live_backup():
         active_orders = backup.get("live_active_orders", {})
         history = backup.get("live_trade_history", [])
         last_execution_time = backup.get("live_last_execution_time", {})
+        last_position_closed_at = backup.get("live_last_position_closed_at", {})
         LAST_LIVE_RESET = float(backup.get(LIVE_RESET_KEY, 0) or 0)
 
         if not isinstance(active_orders, dict):
@@ -4460,6 +4549,26 @@ def load_live_backup():
                         LIVE_LAST_EXECUTION_TIME[execution_symbol] = float(timestamp or 0)
                     except (TypeError, ValueError):
                         pass
+
+        if isinstance(last_position_closed_at, dict):
+            try:
+                import brain
+            except Exception:
+                brain = None
+            for symbol, timestamp in last_position_closed_at.items():
+                execution_symbol = normalize_symbol(symbol)
+                if execution_symbol not in LIVE_LAST_POSITION_CLOSED_AT:
+                    continue
+                try:
+                    close_timestamp = float(timestamp or 0)
+                except (TypeError, ValueError):
+                    continue
+                LIVE_LAST_POSITION_CLOSED_AT[execution_symbol] = close_timestamp
+                if brain is not None:
+                    brain.set_last_position_closed_at(
+                        execution_symbol,
+                        close_timestamp,
+                    )
 
         print("LIVE BACKUP LOADED:", get_persistable_live_active_orders())
         if recovered_snapshot:
@@ -5595,6 +5704,36 @@ def get_panel_trade_plan(panel_data, symbol):
 
     return panel_data.get(execution_symbol)
 
+
+def get_plan_execution_metadata(plan, side=None):
+    plan = plan if isinstance(plan, dict) else {}
+    breakout = (
+        plan.get("fifteen_m_swing_break")
+        if isinstance(plan.get("fifteen_m_swing_break"), dict)
+        else {}
+    )
+    confirmation = (
+        plan.get("confirmation_5m")
+        if isinstance(plan.get("confirmation_5m"), dict)
+        else {}
+    )
+    return {
+        "signal_setup_id": get_signal_setup_id(plan, side),
+        "fifteen_m_break_time": (
+            plan.get("fifteen_m_break_time")
+            or breakout.get("break_time")
+        ),
+        "fifteen_m_break_close_time": (
+            plan.get("fifteen_m_break_close_time")
+            or breakout.get("break_close_time")
+        ),
+        "five_m_confirmation_close_time": (
+            plan.get("five_m_closed_candle_time")
+            or confirmation.get("confirmation_close_time")
+        ),
+        "trend_15m": copy.deepcopy(plan.get("trend_15m") or {}),
+    }
+
 def get_paper_trade_for_live_symbol(panel_data, symbol):
     if not isinstance(panel_data, dict):
         return None
@@ -5973,6 +6112,7 @@ def run_ctrader_auto_trade_checks(panel_data):
                 "stop_loss": plan.get("stop_loss"),
                 "tp1": plan.get("tp1"),
                 "tp2": plan.get("tp2"),
+                **get_plan_execution_metadata(plan, signal),
             },
             source="auto"
         )
@@ -6215,6 +6355,20 @@ def prepare_ctrader_trade(payload, volume=0.01):
 
     normalized["mode"] = LIVE_ACCOUNT_STATE.get("mode", "demo")
     normalized["signal"] = signal
+    execution_metadata = get_plan_execution_metadata(plan, action)
+    for key in [
+        "signal_setup_id",
+        "fifteen_m_break_time",
+        "fifteen_m_break_close_time",
+        "five_m_confirmation_close_time",
+        "trend_15m",
+    ]:
+        payload_value = payload.get(key)
+        normalized[key] = (
+            copy.deepcopy(payload_value)
+            if payload_value not in [None, "", {}]
+            else copy.deepcopy(execution_metadata.get(key))
+        )
 
     if not normalized.get("ok"):
         normalized["message"] = normalized.get("reason")
@@ -7117,6 +7271,12 @@ def sync_live_positions(panel_data=None):
             closed_trade = build_broker_closed_trade(trade, closed_at)
 
             move_live_trade_to_history_once(closed_trade)
+            invalidate_symbol_setup_state(
+                symbol,
+                closed_at,
+                reason="broker position closed",
+                panel_data=panel_data,
+            )
             log_live_trade_audit("broker_position_closed_sync", closed_trade, reason="no broker position")
             mark_signal_history_broker_closed(symbol)
             removed.append({
@@ -7179,6 +7339,12 @@ def sync_live_positions(panel_data=None):
                     or item.get("order_id")
                 )
                 closed_item = build_broker_closed_trade(item, closed_at)
+                invalidate_symbol_setup_state(
+                    item.get("symbol"),
+                    closed_at,
+                    reason="stale running position closed",
+                    panel_data=panel_data,
+                )
                 mark_signal_history_broker_closed(item.get("symbol"))
                 log_live_trade_audit(
                     "running_history_converted_closed",
@@ -7616,6 +7782,11 @@ def close_live_trade(payload: dict):
         closed_trade["warning"] = warning
 
     move_live_trade_to_history_once(closed_trade)
+    invalidate_symbol_setup_state(
+        symbol,
+        closed_at,
+        reason="position manually closed",
+    )
     log_live_trade_audit("manual_close", closed_trade, reason=warning)
     LIVE_ACTIVE_ORDERS[symbol] = None
     save_live_backup()
@@ -7775,6 +7946,178 @@ def live_auto_toggle(payload: dict):
         "status": "ok",
         "enabled": LIVE_AUTO_TRADE_ENABLED["enabled"]
     }
+
+
+def parse_execution_timestamp(value):
+    if value in [None, "", "--"]:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            numeric = float(value)
+            if numeric > 1e12:
+                numeric /= 1000
+            return datetime.fromtimestamp(numeric, tz=timezone.utc)
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def validate_auto_entry_state_locked(
+    symbol,
+    side,
+    trade_payload,
+    broker_positions,
+    now=None,
+):
+    normalized_symbol = normalize_symbol(symbol)
+    side = str(side or "").upper()
+    now = float(now if now is not None else time.time())
+    last_closed_at = float(
+        LIVE_LAST_POSITION_CLOSED_AT.get(normalized_symbol, 0) or 0
+    )
+    break_close = parse_execution_timestamp(
+        trade_payload.get("fifteen_m_break_close_time")
+    )
+    confirmation_close = parse_execution_timestamp(
+        trade_payload.get("five_m_confirmation_close_time")
+    )
+    trend = (
+        trade_payload.get("trend_15m")
+        if isinstance(trade_payload.get("trend_15m"), dict)
+        else {}
+    )
+    details = {
+        "symbol": normalized_symbol,
+        "side": side,
+        "signal_setup_id": trade_payload.get("signal_setup_id"),
+        "fifteen_m_break_close_time": (
+            break_close.isoformat() if break_close else None
+        ),
+        "five_m_confirmation_close_time": (
+            confirmation_close.isoformat() if confirmation_close else None
+        ),
+        "previous_position_closed_at": (
+            datetime.fromtimestamp(last_closed_at, tz=timezone.utc).isoformat()
+            if last_closed_at > 0
+            else None
+        ),
+        "ema_trend": trend.get("trend"),
+        "buy_allowed": bool(trend.get("buy_allowed")),
+        "sell_allowed": bool(trend.get("sell_allowed")),
+        "post_close_cooldown_seconds": LIVE_POST_CLOSE_COOLDOWN_SECONDS,
+    }
+
+    active_order = LIVE_ACTIVE_ORDERS.get(normalized_symbol)
+    if active_order and get_live_trade_status(active_order) in [
+        "RUNNING", "OPEN", "TP1 HIT", "CLOSING", "TP2 HIT"
+    ]:
+        return {"ok": False, "reason": "active position exists", "details": details}
+
+    if any(
+        normalize_symbol(position.get("symbol")) == normalized_symbol
+        for position in (broker_positions or [])
+    ):
+        return {"ok": False, "reason": "broker position exists", "details": details}
+
+    if not trade_payload.get("signal_setup_id"):
+        return {"ok": False, "reason": "missing setup fingerprint", "details": details}
+
+    if break_close is None or confirmation_close is None:
+        return {"ok": False, "reason": "missing closed-candle timestamps", "details": details}
+
+    now_datetime = datetime.fromtimestamp(now, tz=timezone.utc)
+    if break_close > now_datetime or confirmation_close > now_datetime:
+        return {"ok": False, "reason": "setup contains a future candle close", "details": details}
+
+    if confirmation_close <= break_close:
+        return {
+            "ok": False,
+            "reason": "5m confirmation did not close after 15m BOS close",
+            "details": details,
+        }
+
+    if last_closed_at > 0:
+        previous_close = datetime.fromtimestamp(last_closed_at, tz=timezone.utc)
+        if break_close <= previous_close:
+            return {"ok": False, "reason": "15m BOS predates position close", "details": details}
+        if confirmation_close <= previous_close:
+            return {"ok": False, "reason": "5m confirmation predates position close", "details": details}
+        if now - last_closed_at < LIVE_POST_CLOSE_COOLDOWN_SECONDS:
+            details["post_close_cooldown_remaining_seconds"] = round(
+                LIVE_POST_CLOSE_COOLDOWN_SECONDS - (now - last_closed_at),
+                2,
+            )
+            return {"ok": False, "reason": "post-close cooldown active", "details": details}
+
+    ema_allowed = (
+        side == "BUY" and bool(trend.get("buy_allowed"))
+    ) or (
+        side == "SELL" and bool(trend.get("sell_allowed"))
+    )
+    if not ema_allowed:
+        return {"ok": False, "reason": f"15m EMA does not allow {side}", "details": details}
+
+    return {"ok": True, "reason": None, "details": details}
+
+
+def validate_fresh_ema_permission_locked(symbol, side):
+    normalized_symbol = normalize_symbol(symbol)
+    side = str(side or "").upper()
+    details = {
+        "symbol": normalized_symbol,
+        "side": side,
+        "fresh_ema_recalculated": False,
+    }
+    try:
+        from strategies import strict_trader
+
+        latest_15m = get_ctrader_market_data(
+            normalized_symbol,
+            "15m",
+            limit=100,
+            force_refresh=True,
+        )
+        closed_15m = strict_trader.closed_frame(latest_15m, 15)
+        if closed_15m is None or len(closed_15m) < 21:
+            details["reason"] = "latest closed 15m candles unavailable"
+            return {
+                "ok": False,
+                "reason": "WAIT_EMA_CHANGED_BEFORE_EXECUTION",
+                "details": details,
+            }
+
+        trend = strict_trader.trend_filter(closed_15m, normalized_symbol)
+        details.update({
+            "fresh_ema_recalculated": True,
+            "fresh_ema_trend": trend.get("trend"),
+            "fresh_ema9": trend.get("ema_fast"),
+            "fresh_ema21": trend.get("ema_slow"),
+            "fresh_ema_close": trend.get("close"),
+            "fresh_buy_allowed": bool(trend.get("buy_allowed")),
+            "fresh_sell_allowed": bool(trend.get("sell_allowed")),
+            "fresh_last_closed_15m": str(closed_15m.index[-1]),
+        })
+        allowed = (
+            side == "BUY" and bool(trend.get("buy_allowed"))
+        ) or (
+            side == "SELL" and bool(trend.get("sell_allowed"))
+        )
+        return {
+            "ok": bool(allowed),
+            "reason": None if allowed else "WAIT_EMA_CHANGED_BEFORE_EXECUTION",
+            "details": details,
+        }
+    except Exception as exc:
+        details["reason"] = str(exc)
+        return {
+            "ok": False,
+            "reason": "WAIT_EMA_CHANGED_BEFORE_EXECUTION",
+            "details": details,
+        }
+
 
 def execute_live_order_core(payload: dict, source="manual"):
     global LAST_EXECUTION_TIME
@@ -8431,9 +8774,88 @@ def execute_live_order_core(payload: dict, source="manual"):
                 "LIVE EXECUTION BLOCKED: active trade already exists"
             )
 
-        LIVE_ORDER_IN_FLIGHT.add(symbol)
+        broker_positions_before_send = get_open_positions()
+        # Auto orders and manual clicks carrying a strategy setup fingerprint
+        # must use fresh EMA data. A fully user-entered manual market order has
+        # no setup fingerprint and remains on the separate discretionary path.
+        strategy_generated_order = bool(
+            source == "auto" or trade_payload.get("signal_setup_id")
+        )
+        if source == "auto":
+            final_gate = validate_auto_entry_state_locked(
+                symbol,
+                side,
+                trade_payload,
+                broker_positions_before_send,
+            )
+            print("LIVE_AUTO_FINAL_ENTRY_GATE =", {
+                **final_gate.get("details", {}),
+                "ok": final_gate.get("ok"),
+                "reason": final_gate.get("reason"),
+            })
+            if not final_gate.get("ok"):
+                reason = f"LIVE BLOCKED: {final_gate.get('reason')}"
+                set_auto_trade_status(
+                    symbol=symbol,
+                    signal=trade_payload.get("signal"),
+                    action=side,
+                    status="BLOCKED",
+                    reason=reason,
+                    details=final_gate.get("details"),
+                )
+                log_auto_trade_blocked_reason(
+                    symbol=symbol,
+                    signal=trade_payload.get("signal"),
+                    stage="final_entry_state_revalidation",
+                    reason=reason,
+                    details=final_gate.get("details"),
+                )
+                return reject_live_execution_block(
+                    symbol,
+                    side,
+                    trade_payload,
+                    reason,
+                    reason,
+                    details=final_gate.get("details"),
+                )
 
-    broker_positions_before_send = get_open_positions()
+        if strategy_generated_order:
+            fresh_ema_gate = validate_fresh_ema_permission_locked(symbol, side)
+            print("LIVE_FRESH_EMA_FINAL_GATE =", {
+                **fresh_ema_gate.get("details", {}),
+                "source": source,
+                "strategy_generated_order": True,
+                "ok": fresh_ema_gate.get("ok"),
+                "reason": fresh_ema_gate.get("reason"),
+            })
+            if not fresh_ema_gate.get("ok"):
+                reason = "WAIT_EMA_CHANGED_BEFORE_EXECUTION"
+                if source == "auto":
+                    set_auto_trade_status(
+                        symbol=symbol,
+                        signal=trade_payload.get("signal"),
+                        action=side,
+                        status="BLOCKED",
+                        reason=reason,
+                        details=fresh_ema_gate.get("details"),
+                    )
+                    log_auto_trade_blocked_reason(
+                        symbol=symbol,
+                        signal=trade_payload.get("signal"),
+                        stage="fresh_ema_final_gate",
+                        reason=reason,
+                        details=fresh_ema_gate.get("details"),
+                    )
+                return reject_live_execution_block(
+                    symbol,
+                    side,
+                    trade_payload,
+                    reason,
+                    reason,
+                    details=fresh_ema_gate.get("details"),
+                )
+
+        LIVE_ORDER_IN_FLIGHT.add(symbol)
 
     if any(
         normalize_symbol(position.get("symbol")) == symbol
