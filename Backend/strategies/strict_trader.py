@@ -1035,6 +1035,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
     if consolidation.get("is_consolidation"):
         return wait_result(normalized_symbol, "WAIT_CONSOLIDATION", {
             **base_meta,
+            **bias_scores_from_context(trend=trend),
             "trend_15m": trend,
         })
 
