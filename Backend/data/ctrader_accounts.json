@@ -3,6 +3,33 @@
   "active_account_env": "live",
   "accounts": [
     {
+      "account_id": "47810571",
+      "ctidTraderAccountId": "47810571",
+      "account_number": 7578842,
+      "trader_login": 7578842,
+      "traderLogin": 7578842,
+      "broker_name": "ftmo",
+      "balance": 10141.22,
+      "equity": null,
+      "currency": 15,
+      "mode": "demo",
+      "env": "demo",
+      "isLive": false,
+      "status": "available",
+      "unavailable": false,
+      "expired": false,
+      "reason": null,
+      "money_digits": 2,
+      "raw": {
+        "brokerName": "ftmo",
+        "balance": 1014122,
+        "moneyDigits": 2,
+        "depositAssetId": 15,
+        "traderLogin": 7578842,
+        "accessRights": 0
+      }
+    },
+    {
       "account_id": "47857153",
       "ctidTraderAccountId": "47857153",
       "account_number": 17150489,
@@ -31,7 +58,7 @@
     }
   ],
   "forgotten_account_ids": [],
-  "last_refresh": "2026-07-14T13:17:43.733027+00:00",
+  "last_refresh": "2026-07-14T14:26:01.628296+00:00",
   "active_account_snapshot": {
     "active_account_id": "47857153",
     "account_number": 17150489,
@@ -49,8 +76,8 @@
     "cached_balance_used": false,
     "cached_balance": 9886.93,
     "cached_equity": null,
-    "account_list_last_refresh": "2026-07-14T13:17:33.595791+00:00",
-    "snapshot_refreshed_at": "2026-07-14T13:17:39.476782+00:00"
+    "account_list_last_refresh": "2026-07-14T13:30:39.346965+00:00",
+    "snapshot_refreshed_at": "2026-07-14T13:31:22.911929+00:00"
   },
-  "active_account_snapshot_refreshed_at": "2026-07-14T13:17:39.476782+00:00"
+  "active_account_snapshot_refreshed_at": "2026-07-14T13:31:22.911929+00:00"
 }

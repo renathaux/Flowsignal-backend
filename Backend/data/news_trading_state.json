@@ -2,6 +2,22 @@
   "audit": [],
   "mode_enabled_at": "2026-07-14T13:16:53.707406+00:00",
   "normal_fresh_after": {},
-  "opportunities": {},
+  "opportunities": {
+    "818c09d7f434c5c33641300a|EURUSD": {
+      "consumed": false,
+      "currency": "USD",
+      "details": {
+        "ok": false,
+        "reason": "WAITING_FOR_5M_CONFIRMATION"
+      },
+      "event_id": "818c09d7f434c5c33641300a",
+      "event_name": "US CPI",
+      "reason": "WAITING_FOR_5M_CONFIRMATION",
+      "release_time": "2026-07-07T12:30:00+00:00",
+      "status": "PENDING",
+      "symbol": "EURUSD",
+      "updated_at": "2026-07-14T14:15:05.946645+00:00"
+    }
+  },
   "version": 1
 }

@@ -229,5 +229,5 @@ shared.register_pair_strategy_rules("XAUUSD", PAIR_RULES)
 
 
 def analyze_xauusd(data_5m, data_15m, data_1h):
-    analyzer = getattr(shared, "_original_get_mtf_signal", shared.get_mtf_signal)
+    analyzer = getattr(shared, "get_strict_mtf_signal", shared.get_mtf_signal)
     return analyzer(data_5m, data_15m, data_1h, "XAUUSD")

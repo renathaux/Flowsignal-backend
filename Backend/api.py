@@ -894,19 +894,74 @@ def get_signal_setup_id(plan, side=None):
     signal_side = str(side or plan.get("signal") or "").upper()
     if signal_side not in ["BUY", "SELL"]:
         return None
+    if plan.get("news_event_id") and plan.get("signal_setup_id"):
+        return str(plan.get("signal_setup_id"))
 
+    breakout = (
+        plan.get("fifteen_m_swing_break")
+        if isinstance(plan.get("fifteen_m_swing_break"), dict)
+        else {}
+    )
+    confirmation = (
+        plan.get("confirmation_5m")
+        if isinstance(plan.get("confirmation_5m"), dict)
+        else {}
+    )
+    swing = breakout.get("swing") if isinstance(breakout.get("swing"), dict) else {}
+    explicit_identity = (
+        plan.get("setup_identity")
+        if isinstance(plan.get("setup_identity"), dict)
+        else {}
+    )
     setup_parts = {
-        "side": signal_side,
-        "strategy_setup_type": plan.get("strategy_setup_type"),
-        "setup_candle_time": (
-            plan.get("setup_candle_time")
-            or plan.get("five_m_closed_candle_time")
-            or plan.get("fifteen_m_breakout_candle_time")
+        "symbol": normalize_symbol(
+            explicit_identity.get("symbol") or plan.get("symbol")
         ),
-        "entry": plan.get("entry_price") or plan.get("entry"),
-        "sl": plan.get("stop_loss") or plan.get("sl"),
-        "tp2": plan.get("tp2"),
+        "direction": signal_side,
+        "swing_type": explicit_identity.get("swing_type") or swing.get("type"),
+        "swing_timestamp": (
+            explicit_identity.get("swing_timestamp") or swing.get("time")
+        ),
+        "swing_price": (
+            explicit_identity.get("swing_price")
+            if explicit_identity.get("swing_price") is not None
+            else swing.get("price")
+        ),
+        "bos_candle_timestamp": (
+            explicit_identity.get("bos_candle_timestamp")
+            or plan.get("fifteen_m_break_time")
+            or breakout.get("break_time")
+        ),
+        "bos_level": (
+            explicit_identity.get("bos_level")
+            if explicit_identity.get("bos_level") is not None
+            else plan.get("fifteen_m_swing_level")
+            if plan.get("fifteen_m_swing_level") is not None
+            else breakout.get("level")
+        ),
+        "confirmation_timestamp": (
+            explicit_identity.get("confirmation_timestamp")
+            or plan.get("five_m_closed_candle_time")
+            or confirmation.get("confirmation_close_time")
+        ),
     }
+    if any(value in [None, ""] for value in setup_parts.values()):
+        # Legacy plans are still compared for UI lifecycle cleanup only. Live
+        # execution separately requires the complete strict setup identity,
+        # so this compatibility fingerprint cannot authorize an order.
+        legacy_parts = {
+            "symbol": normalize_symbol(plan.get("symbol")) or "LEGACY_UNSPECIFIED",
+            "direction": signal_side,
+            "strategy_setup_type": plan.get("strategy_setup_type"),
+            "setup_candle_time": plan.get("setup_candle_time"),
+        }
+        if any(
+            legacy_parts.get(key) in [None, ""]
+            for key in ("strategy_setup_type", "setup_candle_time")
+        ):
+            return None
+        encoded = json.dumps(legacy_parts, sort_keys=True, default=str)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
     encoded = json.dumps(setup_parts, sort_keys=True, default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -3562,9 +3617,9 @@ def calculate_protected_sl_price(entry, tp2, side):
     tp2_value = float(tp2)
 
     if str(side or "").upper() == "BUY":
-        return entry_value + ((tp2_value - entry_value) * 0.40)
+        return entry_value + ((tp2_value - entry_value) * 0.50)
 
-    return entry_value - ((entry_value - tp2_value) * 0.40)
+    return entry_value - ((entry_value - tp2_value) * 0.50)
 
 
 def get_trade_price_increment(trade):
@@ -6051,6 +6106,7 @@ def get_plan_execution_metadata(plan, side=None):
             or confirmation.get("confirmation_close_time")
         ),
         "trend_15m": copy.deepcopy(plan.get("trend_15m") or {}),
+        "setup_identity": copy.deepcopy(plan.get("setup_identity") or {}),
     }
 
 def get_paper_trade_for_live_symbol(panel_data, symbol):
@@ -6760,6 +6816,7 @@ def prepare_ctrader_trade(payload, volume=0.01):
         "fifteen_m_break_close_time",
         "five_m_confirmation_close_time",
         "trend_15m",
+        "setup_identity",
         "news_event_id",
         "news_event",
         "news_confirmation",
@@ -8390,6 +8447,11 @@ def validate_auto_entry_state_locked(
         if isinstance(trade_payload.get("trend_15m"), dict)
         else {}
     )
+    setup_identity = (
+        trade_payload.get("setup_identity")
+        if isinstance(trade_payload.get("setup_identity"), dict)
+        else {}
+    )
     details = {
         "symbol": normalized_symbol,
         "side": side,
@@ -8409,6 +8471,7 @@ def validate_auto_entry_state_locked(
         "buy_allowed": bool(trend.get("buy_allowed")),
         "sell_allowed": bool(trend.get("sell_allowed")),
         "post_close_cooldown_seconds": LIVE_POST_CLOSE_COOLDOWN_SECONDS,
+        "setup_identity": copy.deepcopy(setup_identity),
     }
 
     active_order = LIVE_ACTIVE_ORDERS.get(normalized_symbol)
@@ -8425,6 +8488,23 @@ def validate_auto_entry_state_locked(
 
     if not trade_payload.get("signal_setup_id"):
         return {"ok": False, "reason": "missing setup fingerprint", "details": details}
+
+    required_identity_fields = {
+        "symbol",
+        "direction",
+        "swing_type",
+        "swing_timestamp",
+        "swing_price",
+        "bos_candle_timestamp",
+        "bos_level",
+        "confirmation_timestamp",
+    }
+    if any(setup_identity.get(field) in [None, ""] for field in required_identity_fields):
+        return {"ok": False, "reason": "missing setup swing identity", "details": details}
+    expected_setup_id = get_signal_setup_id(trade_payload, side)
+    details["recalculated_signal_setup_id"] = expected_setup_id
+    if expected_setup_id != trade_payload.get("signal_setup_id"):
+        return {"ok": False, "reason": "setup fingerprint changed", "details": details}
 
     if break_close is None or confirmation_close is None:
         return {"ok": False, "reason": "missing closed-candle timestamps", "details": details}
@@ -8464,7 +8544,7 @@ def validate_auto_entry_state_locked(
     return {"ok": True, "reason": None, "details": details}
 
 
-def validate_fresh_ema_permission_locked(symbol, side):
+def validate_fresh_ema_permission_locked(symbol, side, setup_identity=None):
     normalized_symbol = normalize_symbol(symbol)
     side = str(side or "").upper()
     details = {
@@ -8491,6 +8571,10 @@ def validate_fresh_ema_permission_locked(symbol, side):
             }
 
         trend = strict_trader.trend_filter(closed_15m, normalized_symbol)
+        consolidation = strict_trader.classify_consolidation(
+            closed_15m,
+            normalized_symbol,
+        )
         details.update({
             "fresh_ema_recalculated": True,
             "fresh_ema_trend": trend.get("trend"),
@@ -8500,17 +8584,67 @@ def validate_fresh_ema_permission_locked(symbol, side):
             "fresh_buy_allowed": bool(trend.get("buy_allowed")),
             "fresh_sell_allowed": bool(trend.get("sell_allowed")),
             "fresh_last_closed_15m": str(closed_15m.index[-1]),
+            "fresh_consolidation": consolidation,
         })
         allowed = (
             side == "BUY" and bool(trend.get("buy_allowed"))
         ) or (
             side == "SELL" and bool(trend.get("sell_allowed"))
         )
-        return {
-            "ok": bool(allowed),
-            "reason": None if allowed else "WAIT_EMA_CHANGED_BEFORE_EXECUTION",
-            "details": details,
-        }
+        if not allowed:
+            return {
+                "ok": False,
+                "reason": "WAIT_EMA_CHANGED_BEFORE_EXECUTION",
+                "details": details,
+            }
+        if consolidation.get("is_consolidation"):
+            return {
+                "ok": False,
+                "reason": "WAIT_CONSOLIDATION",
+                "details": details,
+            }
+
+        identity = setup_identity if isinstance(setup_identity, dict) else {}
+        if not identity:
+            return {
+                "ok": False,
+                "reason": "WAIT_SETUP_SWING_IDENTITY_MISSING",
+                "details": details,
+            }
+        expected_type = str(identity.get("swing_type") or "").upper()
+        expected_time = parse_execution_timestamp(identity.get("swing_timestamp"))
+        try:
+            expected_price = float(identity.get("swing_price"))
+        except (TypeError, ValueError):
+            expected_price = None
+        valid_swings = strict_trader.detect_valid_swings(
+            closed_15m.iloc[:-1].copy(),
+            normalized_symbol,
+        )
+        matching_swing = None
+        for swing in valid_swings:
+            swing_time = parse_execution_timestamp(swing.get("time"))
+            try:
+                swing_price = float(swing.get("price"))
+            except (TypeError, ValueError):
+                continue
+            if (
+                str(swing.get("type") or "").upper() == expected_type
+                and swing_time == expected_time
+                and expected_price is not None
+                and abs(swing_price - expected_price)
+                <= strict_trader.point_size(normalized_symbol) + 1e-12
+            ):
+                matching_swing = swing
+                break
+        details["fresh_setup_swing_matched"] = matching_swing is not None
+        if matching_swing is None:
+            return {
+                "ok": False,
+                "reason": "WAIT_SETUP_SWING_CHANGED_BEFORE_EXECUTION",
+                "details": details,
+            }
+        return {"ok": True, "reason": None, "details": details}
     except Exception as exc:
         details["reason"] = str(exc)
         return {
@@ -9334,7 +9468,11 @@ def execute_live_order_core(payload: dict, source="manual"):
                 )
 
         if strategy_generated_order and not is_news_order:
-            fresh_ema_gate = validate_fresh_ema_permission_locked(symbol, side)
+            fresh_ema_gate = validate_fresh_ema_permission_locked(
+                symbol,
+                side,
+                trade_payload.get("setup_identity"),
+            )
             print("LIVE_FRESH_EMA_FINAL_GATE =", {
                 **fresh_ema_gate.get("details", {}),
                 "source": source,
@@ -9343,7 +9481,10 @@ def execute_live_order_core(payload: dict, source="manual"):
                 "reason": fresh_ema_gate.get("reason"),
             })
             if not fresh_ema_gate.get("ok"):
-                reason = "WAIT_EMA_CHANGED_BEFORE_EXECUTION"
+                reason = (
+                    fresh_ema_gate.get("reason")
+                    or "WAIT_EMA_CHANGED_BEFORE_EXECUTION"
+                )
                 if source == "auto":
                     set_auto_trade_status(
                         symbol=symbol,
@@ -9367,6 +9508,54 @@ def execute_live_order_core(payload: dict, source="manual"):
                     reason,
                     reason,
                     details=fresh_ema_gate.get("details"),
+                )
+
+            market_health = check_live_market_data_health(symbol)
+            if not market_health.get("ok"):
+                return reject_live_execution_block(
+                    symbol,
+                    side,
+                    trade_payload,
+                    "WAIT_STALE_MARKET_FEED",
+                    "WAIT_STALE_MARKET_FEED",
+                    details=market_health,
+                )
+
+            locked_risk_size = calculate_live_risk_size(
+                symbol,
+                trade_payload.get("entry"),
+                trade_payload.get("sl"),
+            )
+            locked_rr = validate_live_trade_risk_reward(
+                symbol,
+                side,
+                trade_payload.get("entry"),
+                trade_payload.get("sl"),
+                trade_payload.get("tp2"),
+            )
+            risk_changed = bool(
+                not locked_risk_size.get("ok")
+                or locked_risk_size.get("lot_size") != risk_size.get("lot_size")
+                or locked_risk_size.get("volume_units") != risk_size.get("volume_units")
+                or locked_risk_size.get("risk_amount") != risk_size.get("risk_amount")
+            )
+            if risk_changed or not locked_rr.get("ok"):
+                reason = (
+                    "WAIT_RISK_CHANGED_BEFORE_EXECUTION"
+                    if risk_changed
+                    else "WAIT_INVALID_RR"
+                )
+                return reject_live_execution_block(
+                    symbol,
+                    side,
+                    trade_payload,
+                    reason,
+                    reason,
+                    details={
+                        "initial_risk_size": risk_size,
+                        "locked_risk_size": locked_risk_size,
+                        "locked_risk_reward": locked_rr,
+                    },
                 )
 
         LIVE_ORDER_IN_FLIGHT.add(symbol)

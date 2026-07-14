@@ -14,6 +14,8 @@ MAX_RR = 2.00
 FALLBACK_RR = 2.00
 PULLBACK_MIN_POINTS = 30
 BOS_MIN_BUFFER_POINTS = 10
+REMEMBERED_BREAKOUT_MAX_15M_CANDLES = 4
+PROTECTED_SL_TP2_FRACTION = 0.50
 
 
 def point_size(symbol):
@@ -100,6 +102,8 @@ def candle_close_time(index_value, minutes):
 
 
 def utc_timestamp(value):
+    if value in [None, "", "--"]:
+        return None
     try:
         timestamp = pd.Timestamp(value)
         if timestamp.tzinfo is None:
@@ -180,14 +184,28 @@ def detect_raw_swings(data_15m, symbol, left=2, right=2):
             })
 
     raw.sort(key=lambda item: item["index"])
-    previous_by_type = {"HIGH": None, "LOW": None}
+    return qualify_raw_swings(raw, data_15m, symbol)
+
+
+def qualify_raw_swings(raw, data_15m, symbol):
+    """Mark real legs without letting a tiny intervening pivot reset the anchor."""
+    min_size = minimum_swing_size(symbol)
+    accepted = []
 
     for swing in raw:
         opposite_type = "LOW" if swing["type"] == "HIGH" else "HIGH"
-        opposite = previous_by_type.get(opposite_type)
-        valid_size = None
+        opposite = next(
+            (
+                candidate
+                for candidate in reversed(accepted)
+                if candidate.get("type") == opposite_type
+                and abs(float(swing["price"]) - float(candidate["price"]))
+                >= min_size
+            ),
+            None,
+        )
 
-        if opposite:
+        if opposite is not None:
             valid_size = abs(float(swing["price"]) - float(opposite["price"]))
         else:
             row = data_15m.iloc[swing["index"]]
@@ -201,7 +219,9 @@ def detect_raw_swings(data_15m, symbol, left=2, right=2):
             else None
         )
 
-        previous_by_type[swing["type"]] = swing
+        swing["reference_swing"] = opposite
+        if swing["valid"]:
+            accepted.append(swing)
 
     return raw
 
@@ -447,6 +467,27 @@ def clear_opposite_watch(symbol, side, reason):
     return False
 
 
+def clear_breakout_watch(symbol, side, reason):
+    key = get_watch_key(symbol, side)
+    if key not in shared.FIFTEEN_M_SWING_WATCH:
+        return False
+    shared.FIFTEEN_M_SWING_WATCH.pop(key, None)
+    shared.save_fifteen_m_swing_watch()
+    print("STRICT_BREAKOUT_WATCH_CLEARED =", {
+        "symbol": shared.normalize_symbol(symbol),
+        "side": side,
+        "reason": reason,
+    })
+    return True
+
+
+def clear_symbol_breakout_watches(symbol, reason):
+    changed = False
+    for side in ["BUY", "SELL"]:
+        changed = clear_breakout_watch(symbol, side, reason) or changed
+    return changed
+
+
 def save_remembered_breakout(
     symbol,
     side,
@@ -456,7 +497,21 @@ def save_remembered_breakout(
     reason,
     break_close_time=None,
     required_buffer=None,
+    swing=None,
+    break_type=None,
+    invalidation_level=None,
 ):
+    close_timestamp = utc_timestamp(
+        break_close_time or candle_close_time(break_time, 15)
+    )
+    expires_at = (
+        close_timestamp
+        + pd.Timedelta(
+            minutes=15 * REMEMBERED_BREAKOUT_MAX_15M_CANDLES
+        )
+        if close_timestamp is not None
+        else None
+    )
     key = get_watch_key(symbol, side)
     shared.FIFTEEN_M_SWING_WATCH[key] = {
         "symbol": shared.normalize_symbol(symbol),
@@ -468,17 +523,48 @@ def save_remembered_breakout(
         "break_close_time": break_close_time,
         "break_close": float(break_close),
         "bos_buffer": float(required_buffer or 0.0),
+        "swing": swing,
+        "break_type": break_type,
+        "invalidation_level": invalidation_level,
+        "expires_at": expires_at.isoformat() if expires_at is not None else None,
+        "maximum_closed_15m_candles": REMEMBERED_BREAKOUT_MAX_15M_CANDLES,
         "status": "PENDING",
         "reason": reason,
     }
     shared.save_fifteen_m_swing_watch()
 
 
-def remembered_breakout(symbol, side):
+def remembered_breakout(symbol, side, current_close_time=None, current_close=None):
     watch = shared.FIFTEEN_M_SWING_WATCH.get(get_watch_key(symbol, side))
     if not isinstance(watch, dict):
         return None
     if str(watch.get("status") or "PENDING").upper() != "PENDING":
+        return None
+    current_timestamp = utc_timestamp(current_close_time)
+    expires_at = utc_timestamp(watch.get("expires_at"))
+    if (
+        current_timestamp is not None
+        and expires_at is not None
+        and current_timestamp > expires_at
+    ):
+        clear_breakout_watch(symbol, side, "remembered breakout expired")
+        return None
+    try:
+        invalidation_level = float(watch.get("invalidation_level"))
+        close_value = float(current_close)
+    except (TypeError, ValueError):
+        invalidation_level = None
+        close_value = None
+    invalidated = bool(
+        invalidation_level is not None
+        and close_value is not None
+        and (
+            (side == "BUY" and close_value <= invalidation_level)
+            or (side == "SELL" and close_value >= invalidation_level)
+        )
+    )
+    if invalidated:
+        clear_breakout_watch(symbol, side, "remembered breakout structure invalidated")
         return None
     try:
         return {
@@ -491,6 +577,10 @@ def remembered_breakout(symbol, side):
             ),
             "break_close": float(watch.get("break_close")),
             "bos_buffer": float(watch.get("bos_buffer") or 0.0),
+            "swing": watch.get("swing"),
+            "break_type": watch.get("break_type"),
+            "invalidation_level": invalidation_level,
+            "expires_at": watch.get("expires_at"),
             "remembered": True,
             "watch": watch,
         }
@@ -518,20 +608,24 @@ def evaluate_15m_breakout(data_15m, symbol):
         return result
 
     swing_source = data_15m.iloc[:-1].copy()
-    swings = detect_raw_swings(swing_source, symbol)
+    raw_swings = detect_raw_swings(swing_source, symbol)
+    swings = [swing for swing in raw_swings if swing.get("valid")]
+    result["raw_swings"] = raw_swings
     result["swings"] = swings
 
     if not swings:
-        result["reason"] = "WAIT_NO_VALID_100_POINT_IMPULSE"
+        result["reason"] = (
+            "WAIT_SWING_UNDER_100_POINTS"
+            if raw_swings
+            else "WAIT_NO_VALID_SWING"
+        )
         return result
 
-    structure = validate_continuation_structure(swings, swing_source, symbol)
+    # HH/HL and LH/LL remain useful display context, but are not an entry gate.
+    # A valid confirmed swing plus a buffered closed-candle break is sufficient
+    # for either a continuation BOS or reversal CHOCH.
+    structure = detect_swing_structure(swings)
     result["structure"] = structure
-    if not structure.get("valid"):
-        result["reason"] = structure.get("reason") or "WAIT_NO_VALID_100_POINT_IMPULSE"
-        return result
-    bullish_structure = structure.get("side") == "BUY"
-    bearish_structure = structure.get("side") == "SELL"
 
     last = data_15m.iloc[-1]
     previous = data_15m.iloc[-2]
@@ -548,7 +642,7 @@ def evaluate_15m_breakout(data_15m, symbol):
     low_swing = latest_swing(swings, "LOW")
     candidates = []
 
-    if high_swing and bullish_structure:
+    if high_swing:
         level = float(high_swing["price"])
         confirmed = (
             last_high > level
@@ -564,11 +658,17 @@ def evaluate_15m_breakout(data_15m, symbol):
                 "break_close": last_close,
                 "swing": high_swing,
                 "structure": structure,
+                "break_type": (
+                    "BOS" if structure.get("bias") == "BULLISH" else "CHOCH"
+                ),
+                "invalidation_level": (
+                    float(low_swing["price"]) if low_swing else None
+                ),
                 "remembered": False,
                 "bos_buffer": required_buffer,
             })
 
-    if low_swing and bearish_structure:
+    if low_swing:
         level = float(low_swing["price"])
         confirmed = (
             last_low < level
@@ -584,13 +684,24 @@ def evaluate_15m_breakout(data_15m, symbol):
                 "break_close": last_close,
                 "swing": low_swing,
                 "structure": structure,
+                "break_type": (
+                    "BOS" if structure.get("bias") == "BEARISH" else "CHOCH"
+                ),
+                "invalidation_level": (
+                    float(high_swing["price"]) if high_swing else None
+                ),
                 "remembered": False,
                 "bos_buffer": required_buffer,
             })
 
     if not candidates:
         for side in ["BUY", "SELL"]:
-            remembered = remembered_breakout(symbol, side)
+            remembered = remembered_breakout(
+                symbol,
+                side,
+                current_close_time=break_close_time,
+                current_close=last_close,
+            )
             if not remembered:
                 continue
             candidates.append({
@@ -613,14 +724,8 @@ def evaluate_15m_breakout(data_15m, symbol):
             and last_close < float(low_swing["price"])
             and previous_close >= float(low_swing["price"])
         )
-        if raw_buy_break and bullish_structure:
+        if raw_buy_break or raw_sell_break:
             result["reason"] = "WAIT_WEAK_15M_BOS"
-        elif raw_sell_break and bearish_structure:
-            result["reason"] = "WAIT_WEAK_15M_BOS"
-        elif raw_buy_break and not bullish_structure:
-            result["reason"] = "WAIT_NO_HH_HL_STRUCTURE"
-        elif raw_sell_break and not bearish_structure:
-            result["reason"] = "WAIT_NO_LH_LL_STRUCTURE"
         return result
 
     chosen = candidates[-1]
@@ -637,8 +742,11 @@ def evaluate_15m_breakout(data_15m, symbol):
         "remembered": bool(chosen.get("remembered")),
         "bos_buffer": float(chosen.get("bos_buffer") or required_buffer),
         "swing": chosen.get("swing"),
+        "break_type": chosen.get("break_type") or "CHOCH",
+        "invalidation_level": chosen.get("invalidation_level"),
+        "expires_at": chosen.get("expires_at"),
         "structure": chosen.get("structure") or structure,
-        "reason": "15M_SWING_BREAK_CLOSED",
+        "reason": f"15M_{chosen.get('break_type') or 'CHOCH'}_SWING_BREAK_CLOSED",
     })
     return result
 
@@ -657,7 +765,7 @@ def confirm_5m(
         "close_confirmed": False,
         "closed_candle_time": None,
         "confirmation_close_time": None,
-        "reason": "WAIT_NO_5M_CLOSE_CONFIRMATION",
+        "reason": "WAIT_5M_CONFIRMATION",
     }
     if side not in ["BUY", "SELL"] or level is None or not break_time:
         return base
@@ -766,7 +874,9 @@ def select_stop_loss(swings, side, entry, symbol):
 
     return {
         "ok": False,
-        "reason": "WAIT_SL_SMALLER_THAN_100_POINTS",
+        "reason": (
+            "WAIT_SL_TOO_SMALL" if candidates else "WAIT_NO_VALID_SWING_SL"
+        ),
         "minimum_distance": minimum,
         "buffer": buffer,
     }
@@ -823,9 +933,23 @@ def select_tp2(swings, side, entry, risk, symbol):
     }
 
 
-def build_risk_levels(data_15m, side, entry, symbol):
+def build_risk_levels(data_15m, side, entry, symbol, setup_break_time=None):
     dec = decimals(symbol)
-    swings = detect_valid_swings(data_15m.iloc[:-1].copy(), symbol)
+    swing_source = data_15m.copy()
+    setup_timestamp = utc_timestamp(setup_break_time)
+    if setup_timestamp is not None:
+        try:
+            source_index = pd.DatetimeIndex(swing_source.index)
+            if source_index.tz is None:
+                source_index = source_index.tz_localize("UTC")
+            else:
+                source_index = source_index.tz_convert("UTC")
+            swing_source = swing_source.loc[source_index <= setup_timestamp]
+        except Exception:
+            return {"ok": False, "reason": "WAIT_NO_VALID_SWING_SL"}
+    else:
+        swing_source = swing_source.iloc[:-1].copy()
+    swings = detect_valid_swings(swing_source, symbol)
     stop = select_stop_loss(swings, side, float(entry), symbol)
     if not stop.get("ok"):
         return {**stop, "ok": False}
@@ -836,10 +960,10 @@ def build_risk_levels(data_15m, side, entry, symbol):
     tp1_ratio = shared.get_tp1_ratio_of_tp2()
     if side == "BUY":
         tp1 = float(entry) + ((tp2_price - float(entry)) * tp1_ratio)
-        protected = float(entry) + ((tp2_price - float(entry)) * 0.40)
+        protected = float(entry) + ((tp2_price - float(entry)) * PROTECTED_SL_TP2_FRACTION)
     else:
         tp1 = float(entry) - ((float(entry) - tp2_price) * tp1_ratio)
-        protected = float(entry) - ((float(entry) - tp2_price) * 0.40)
+        protected = float(entry) - ((float(entry) - tp2_price) * PROTECTED_SL_TP2_FRACTION)
 
     return {
         "ok": True,
@@ -865,7 +989,7 @@ def build_risk_levels(data_15m, side, entry, symbol):
         "tp_structure_source": tp2["source"],
         "rejected_tp_candidates": tp2.get("rejected_tp_candidates", []),
         "tp1_rule": "80% of entry-to-TP2 unless admin overrides it",
-        "protected_sl_rule": "40% of entry-to-TP2 after TP1 wick touch",
+        "protected_sl_rule": "50% of entry-to-TP2 after TP1 wick touch",
     }
 
 
@@ -1033,6 +1157,10 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
         "CONSOLIDATION" if consolidation.get("is_consolidation") else "STRUCTURE"
     )
     if consolidation.get("is_consolidation"):
+        clear_symbol_breakout_watches(
+            normalized_symbol,
+            "market entered consolidation",
+        )
         return wait_result(normalized_symbol, "WAIT_CONSOLIDATION", {
             **base_meta,
             **bias_scores_from_context(trend=trend),
@@ -1059,6 +1187,11 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
         side == "SELL" and bool(trend.get("sell_allowed"))
     )
     if not ema_allowed:
+        clear_breakout_watch(
+            normalized_symbol,
+            side,
+            "EMA no longer permits remembered direction",
+        )
         return wait_result(normalized_symbol, "WAIT_EMA_NOT_ALLOWED", {
             **base_meta,
             "trend_15m": trend,
@@ -1078,7 +1211,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             None,
         )
         shared.save_fifteen_m_swing_watch()
-        return wait_result(normalized_symbol, "WAIT_BOS_NOT_FRESH_AFTER_POSITION_CLOSE", {
+        return wait_result(normalized_symbol, "WAIT_SETUP_BEFORE_PREVIOUS_CLOSE", {
             **base_meta,
             "trend_15m": trend,
             "fifteen_m_swing_break": breakout,
@@ -1113,26 +1246,41 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
         "confirmation_5m": five_m,
     }
     if not five_m.get("close_confirmed"):
-        save_remembered_breakout(
-            normalized_symbol,
-            side,
-            breakout["level"],
-            breakout["break_time"],
-            breakout["break_close"],
-            five_m.get("reason") or "WAIT_NO_5M_CLOSE_CONFIRMATION",
-            break_close_time=breakout.get("break_close_time"),
-            required_buffer=breakout.get("bos_buffer"),
-        )
-        return wait_result(normalized_symbol, five_m.get("reason") or "WAIT_NO_5M_CLOSE_CONFIRMATION", {
+        if not breakout.get("remembered"):
+            save_remembered_breakout(
+                normalized_symbol,
+                side,
+                breakout["level"],
+                breakout["break_time"],
+                breakout["break_close"],
+                five_m.get("reason") or "WAIT_5M_CONFIRMATION",
+                break_close_time=breakout.get("break_close_time"),
+                required_buffer=breakout.get("bos_buffer"),
+                swing=breakout.get("swing"),
+                break_type=breakout.get("break_type"),
+                invalidation_level=breakout.get("invalidation_level"),
+            )
+        return wait_result(normalized_symbol, five_m.get("reason") or "WAIT_5M_CONFIRMATION", {
             **setup_meta,
             "remembered_breakout": True,
+            "remembered_breakout_status": (
+                "WAIT_REMEMBERED_BREAKOUT"
+                if breakout.get("remembered")
+                else "WAIT_5M_CONFIRMATION"
+            ),
         })
 
     shared.FIFTEEN_M_SWING_WATCH.pop(get_watch_key(normalized_symbol, side), None)
     shared.save_fifteen_m_swing_watch()
 
     entry = five_m.get("close") or breakout["break_close"]
-    levels = build_risk_levels(closed_15m, side, entry, normalized_symbol)
+    levels = build_risk_levels(
+        closed_15m,
+        side,
+        entry,
+        normalized_symbol,
+        setup_break_time=breakout.get("break_time"),
+    )
     if not levels.get("ok"):
         return wait_result(normalized_symbol, levels.get("reason") or "WAIT_INVALID_RISK_LEVELS", {
             **setup_meta,
@@ -1167,7 +1315,10 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
         "strategy_setup_complete": True,
         "strategy_setup_type": f"{side}_15M_SWING_BREAK_5M_CONFIRMED",
         "plan_type": f"STRICT {side}",
-        "plan_reason": f"{side}: 15m HH/HL or LH/LL, closed swing break, and 5m close confirmed",
+        "plan_reason": (
+            f"{side}: valid 15m swing {breakout.get('break_type') or 'CHOCH'}, "
+            "closed buffered break, and later 5m close confirmed"
+        ),
         "entry_price": levels["entry"],
         "price": levels["entry"],
         "stop_loss": levels["stop_loss"],
@@ -1180,6 +1331,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
         "fifteen_m_swing_break": breakout,
         "fifteen_m_swing_break_confirmed": True,
         "fifteen_m_swing_level": breakout["level"],
+        "fifteen_m_break_classification": breakout.get("break_type"),
         "fifteen_m_structure_pattern": (breakout.get("structure") or {}).get("pattern"),
         "fifteen_m_structure_bias": (breakout.get("structure") or {}).get("bias"),
         "fifteen_m_closed_candle_close": breakout["break_close"],
@@ -1237,11 +1389,21 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             "SL/TP built from strict swing rules",
         ],
     }
+    result["setup_identity"] = {
+        "symbol": normalized_symbol,
+        "direction": side,
+        "swing_type": (breakout.get("swing") or {}).get("type"),
+        "swing_timestamp": (breakout.get("swing") or {}).get("time"),
+        "swing_price": (breakout.get("swing") or {}).get("price"),
+        "bos_candle_timestamp": breakout.get("break_time"),
+        "bos_level": breakout.get("level"),
+        "confirmation_timestamp": five_m.get("confirmation_close_time"),
+    }
     diagnostics = dict(result["signal_diagnostics"])
     result["entry_strategy_debug"] = diagnostics.copy()
     result["strategy_debug"] = diagnostics.copy()
-    result["bos_detected"] = True
-    result["choch_detected"] = False
+    result["bos_detected"] = breakout.get("break_type") == "BOS"
+    result["choch_detected"] = breakout.get("break_type") == "CHOCH"
     result["smc_direction"] = side
     result["fifteen_m_close_confirmed"] = True
     result["five_m_confirmation"] = True
@@ -1302,5 +1464,5 @@ def build_protected_sl(entry, tp2, side):
     entry = float(entry)
     tp2 = float(tp2)
     if side == "BUY":
-        return entry + ((tp2 - entry) * 0.40)
-    return entry - ((entry - tp2) * 0.40)
+        return entry + ((tp2 - entry) * PROTECTED_SL_TP2_FRACTION)
+    return entry - ((entry - tp2) * PROTECTED_SL_TP2_FRACTION)
