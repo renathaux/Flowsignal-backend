@@ -221,6 +221,14 @@ _CALENDAR_CACHE = {
 }
 
 
+def get_calendar_data_age_seconds(now_timestamp=None):
+    fetched_at = float(_CALENDAR_CACHE.get("fetched_at") or 0)
+    if fetched_at <= 0:
+        return float("inf")
+    current = float(now_timestamp if now_timestamp is not None else time.time())
+    return max(0.0, current - fetched_at)
+
+
 def load_news_env_file():
     if not os.path.exists(ENV_PATH):
         return False
@@ -393,6 +401,18 @@ def safe_news_fallback(
     filtered_event_count=None,
 ):
     normalized_symbol = normalize_symbol(symbol)
+    try:
+        from services import news_trading
+        authoritative_news = news_trading.evaluate([], normalized_symbol)
+    except Exception:
+        authoritative_news = {
+            "mode": os.getenv("NEWS_TRADING_MODE", "OFF").upper(),
+            "phase": "NORMAL",
+            "authoritative_status": "NORMAL",
+            "allow_normal_entry": True,
+            "allow_news_entry": False,
+            "blocking_reason": decision,
+        }
     event = (
         "No major news now"
         if decision == "NO_MAJOR_NEWS"
@@ -437,6 +457,9 @@ def safe_news_fallback(
         "news_score": 0,
         "symbol_score": 0,
         "decision": decision,
+        "trade_decision": authoritative_news.get("authoritative_status"),
+        "blocking_reason": authoritative_news.get("blocking_reason"),
+        "news_trading": authoritative_news,
         "last_update": iso_timestamp(),
         "source": source,
         "source_used": source,
@@ -545,7 +568,14 @@ def fetch_jblanked_calendar_events(force=False, timeout=8):
         raise RuntimeError("JBlanked response was not valid JSON") from exc
 
     raw_events = extract_raw_events(payload)
-    events = [event for event in map(normalize_event, raw_events) if event]
+    events = []
+    for raw_event in raw_events:
+        if isinstance(raw_event, dict):
+            raw_event = {**raw_event, "source": "jblanked_live"}
+        event = normalize_event(raw_event)
+        if event:
+            event["source"] = "jblanked_live"
+            events.append(event)
     print("NEWS_JBLANKED_PARSE_DEBUG =", {
         "payload_type": type(payload).__name__,
         "raw_events": len(raw_events),
@@ -755,7 +785,9 @@ def fetch_calendar_events(force=False, timeout=8, now=None):
         not force
         and cached_events is not None
         and cache_age < CALENDAR_CACHE_SECONDS
-        and _CALENDAR_CACHE.get("last_source") in ["fmp", "finnhub", "manual"]
+        and _CALENDAR_CACHE.get("last_source") in [
+            "jblanked_live", "jblanked_cache", "fmp", "finnhub", "manual"
+        ]
     ):
         cached_source = str(_CALENDAR_CACHE.get("last_source") or "cache")
         print("NEWS_PROVIDER_SELECTED =", {
@@ -767,7 +799,12 @@ def fetch_calendar_events(force=False, timeout=8, now=None):
 
     provider_errors = []
     statuses = []
+    def fetch_jblanked_for_aggregator(timeout=8, now=None):
+        events = fetch_jblanked_calendar_events(force=force, timeout=timeout)
+        return events, events
+
     providers = [
+        ("jblanked", fetch_jblanked_for_aggregator),
         ("fmp", fetch_fmp_calendar_events),
         ("finnhub", fetch_finnhub_calendar_events),
     ]
@@ -789,7 +826,11 @@ def fetch_calendar_events(force=False, timeout=8, now=None):
                 "last_error": None,
                 "raw_event_count": len(raw_events),
                 "normalized_event_count": len(events),
-                "last_source": provider_name,
+                "last_source": (
+                    "jblanked_live"
+                    if provider_name == "jblanked"
+                    else provider_name
+                ),
                 "api_status": statuses,
             })
             print("NEWS_PROVIDER_STATUS =", status)
@@ -891,7 +932,12 @@ def fetch_api_calendar_events_for_actual_refresh(timeout=8, now=None):
     statuses = []
     api_events = []
     selected_provider = None
+    def fetch_jblanked_refresh(timeout=8, now=None):
+        events = fetch_jblanked_calendar_events(force=True, timeout=timeout)
+        return events, events
+
     providers = [
+        ("jblanked", fetch_jblanked_refresh),
         ("fmp", fetch_fmp_calendar_events),
         ("finnhub", fetch_finnhub_calendar_events),
     ]
@@ -1019,6 +1065,8 @@ def refresh_actual_after_release(event, symbol, now=None):
         "actual_source": actual_event.get("source") or provider_name,
     }
     replace_cached_event_with_actual(symbol, event, updated_event)
+    _CALENDAR_CACHE["fetched_at"] = time.time()
+    _CALENDAR_CACHE["last_fetch_time"] = iso_timestamp(now)
     print("NEWS_ACTUAL_REFRESH_RESULT =", {
         "symbol": normalize_symbol(symbol),
         "event": event.get("event_name") or event.get("event"),
@@ -1119,6 +1167,12 @@ def normalize_event(raw):
         "timestamp",
         "calendar_time",
     )
+    provider_timestamp = first_present(
+        raw,
+        "provider_timestamp",
+        "updated_at",
+        "last_update",
+    )
 
     normalized_currency = normalize_currency(currency, raw)
     normalized_event = str(event or "").strip()
@@ -1140,6 +1194,7 @@ def normalize_event(raw):
         "time": parsed_time,
         "time_utc": parsed_time.isoformat() if parsed_time else None,
         "source": source,
+        "provider_timestamp": provider_timestamp,
         "raw": raw,
     }
 
@@ -1758,9 +1813,15 @@ def score_news_direction(event, symbol, now=None):
     }
 
 
-def get_news_impact(symbol):
+def get_news_impact(
+    symbol,
+    candles_5m=None,
+    candles_15m=None,
+    entry_price=None,
+    now=None,
+):
     normalized_symbol = normalize_symbol(symbol)
-    now = utc_now()
+    now = now or utc_now()
 
     try:
         events = fetch_calendar_events(now=now)
@@ -1814,9 +1875,45 @@ def get_news_impact(symbol):
             filtered_event_count=filtered_event_count,
         )
 
+    original_event = event
     event = refresh_actual_after_release(event, normalized_symbol, now=now)
+    if event is not original_event:
+        original_key = event_identity_key(normalized_symbol, original_event)
+        events = [
+            event
+            if event_identity_key(normalized_symbol, candidate) == original_key
+            else candidate
+            for candidate in events
+        ]
     score = score_news_direction(event, normalized_symbol, now=now)
     release_time = get_event_time(event)
+
+    try:
+        from services import news_trading
+
+        fetched_at = float(_CALENDAR_CACHE.get("fetched_at") or time.time())
+        news_trading_status = news_trading.evaluate(
+            events,
+            normalized_symbol,
+            candles_5m=candles_5m,
+            candles_15m=candles_15m,
+            entry_price=entry_price,
+            now=now,
+            data_age_seconds=max(0.0, time.time() - fetched_at),
+        )
+    except Exception as exc:
+        print("NEWS_TRADING_STATUS_ERROR =", {
+            "symbol": normalized_symbol,
+            "error": str(exc),
+        })
+        news_trading_status = {
+            "mode": os.getenv("NEWS_TRADING_MODE", "OFF").upper(),
+            "phase": "RELEASE_LOCK",
+            "authoritative_status": "NEWS BLOCK",
+            "allow_normal_entry": False,
+            "allow_news_entry": False,
+            "blocking_reason": "WAIT_NEWS_STATUS_UNAVAILABLE",
+        }
 
     result = {
         "symbol": normalized_symbol,
@@ -1855,12 +1952,26 @@ def get_news_impact(symbol):
         **build_news_debug(
             normalized_symbol,
             source=source,
-            is_live_news=source in ["fmp", "finnhub"],
+            is_live_news=source in [
+                "jblanked_live", "jblanked_cache", "fmp", "finnhub"
+            ],
             is_fallback=source.startswith("manual"),
             raw_event_count=raw_event_count,
             filtered_event_count=filtered_event_count,
         ),
         "relevant_event_count": relevant_event_count,
+        "news_trading": news_trading_status,
+        "trade_decision": news_trading_status.get("authoritative_status"),
+        "blocking_reason": news_trading_status.get("blocking_reason"),
+        "expected_symbol_direction": news_trading_status.get(
+            "expected_symbol_direction"
+        ),
+        "normalized_surprise": news_trading_status.get(
+            "normalized_surprise"
+        ),
+        "opportunity_expiration": news_trading_status.get(
+            "opportunity_expiration"
+        ),
     }
     print("NEWS_IMPACT_FINAL_EVENT =", {
         "symbol": normalized_symbol,

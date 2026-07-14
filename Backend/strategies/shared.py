@@ -2392,6 +2392,53 @@ def save_fifteen_m_swing_watch():
 
 FIFTEEN_M_SWING_WATCH = load_fifteen_m_swing_watch()
 
+# The API restores this per-symbol close watermark from live_backup.json.  The
+# strict strategy uses it to reject any BOS/confirmation that belonged to a
+# position which has already finished.
+LAST_POSITION_CLOSED_AT = {
+    "EURUSD": 0.0,
+    "XAUUSD": 0.0,
+}
+
+
+def set_last_position_closed_at(symbol, closed_at):
+    normalized_symbol = normalize_symbol(symbol)
+    try:
+        timestamp = float(closed_at or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    LAST_POSITION_CLOSED_AT[normalized_symbol] = max(
+        float(LAST_POSITION_CLOSED_AT.get(normalized_symbol, 0) or 0),
+        timestamp,
+    )
+    return LAST_POSITION_CLOSED_AT[normalized_symbol]
+
+
+def clear_symbol_entry_memory(symbol, reason, closed_at=None):
+    normalized_symbol = normalize_symbol(symbol)
+    removed_watches = []
+
+    for side in ["BUY", "SELL"]:
+        key = get_15m_swing_watch_key(normalized_symbol, side)
+        if key in FIFTEEN_M_SWING_WATCH:
+            FIFTEEN_M_SWING_WATCH.pop(key, None)
+            removed_watches.append(key)
+
+    hold_removed = clear_final_signal_hold_for_symbol(normalized_symbol, reason)
+    if removed_watches:
+        save_fifteen_m_swing_watch()
+    if closed_at is not None:
+        set_last_position_closed_at(normalized_symbol, closed_at)
+
+    print("SYMBOL_ENTRY_MEMORY_INVALIDATED =", {
+        "symbol": normalized_symbol,
+        "reason": reason,
+        "closed_at": LAST_POSITION_CLOSED_AT.get(normalized_symbol),
+        "removed_watches": removed_watches,
+        "final_signal_hold_removed": hold_removed,
+    })
+    return bool(removed_watches or hold_removed)
+
 def get_final_signal_hold_key(symbol):
     return normalize_symbol(symbol)
 

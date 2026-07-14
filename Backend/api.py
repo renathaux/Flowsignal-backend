@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -10,6 +10,7 @@ import json
 import copy
 import os
 import hashlib
+import hmac
 import uuid
 import math
 from datetime import datetime, timedelta, timezone
@@ -57,7 +58,20 @@ from routes.performance import (
 )
 from routes.settings import router as settings_router
 from routes.trading import router as trading_router
-from services.news_service import get_news_impact
+from services.news_service import (
+    fetch_calendar_events,
+    get_calendar_data_age_seconds,
+    get_news_impact,
+    refresh_actual_after_release,
+)
+from services import news_trading
+from services.news_mode_service import (
+    InvalidNewsTradingMode,
+    get_effective_mode as get_effective_news_mode,
+    normalize_mode as normalize_news_mode,
+    record_audit as record_news_mode_audit,
+    save_mode as save_news_mode,
+)
 from services.settings_service import (
     get_tp1_ratio_of_tp2,
     load_feature_flags,
@@ -162,7 +176,15 @@ class TradeRequest(BaseModel):
 class FeedbackRequest(BaseModel):
     message: str
     user: str | None = None
+
+
+class NewsTradingModeRequest(BaseModel):
+    mode: str
     time: str | None = None
+
+
+class AccessCodeSessionRequest(BaseModel):
+    code: str
 
 class SignupRequest(BaseModel):
     email: str
@@ -306,6 +328,7 @@ SIGNAL_EMAIL_LOCK = threading.Lock()
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 VISITS_FILE = os.path.join(DATA_DIR, "visits.json")
 SESSIONS = {}
+NEWS_MODE_CHANGE_LOCK = threading.RLock()
 
 def load_users():
     if not os.path.exists(USERS_FILE):
@@ -1406,7 +1429,13 @@ def root():
 
 @app.get("/news-impact")
 def news_impact(symbol: str = "EURUSD"):
-    return get_news_impact(symbol)
+    context = get_news_market_context(PANEL_CACHE.get("data"), symbol)
+    return get_news_impact(
+        symbol,
+        candles_5m=context["candles_5m"],
+        candles_15m=context["candles_15m"],
+        entry_price=context["entry_price"],
+    )
 
 @app.get("/health-check")
 def health_check():
@@ -1961,6 +1990,160 @@ def login(request: LoginRequest):
         "role": role
     }
 
+
+@app.post("/session/access-code")
+def create_access_code_session(request: AccessCodeSessionRequest):
+    """Turn the app's existing access grant into a backend session.
+
+    This does not add a second login. It gives the existing FlowSignal access
+    path the same server-side session needed by authenticated settings APIs.
+    """
+    expected_code = str(os.getenv("FLOWSIGNAL_ACCESS_CODE", "FLOWTEST"))
+    supplied_code = str(request.code or "").strip()
+    if not supplied_code or not hmac.compare_digest(supplied_code, expected_code):
+        raise HTTPException(status_code=401, detail="Invalid FlowSignal access code.")
+
+    token = str(uuid.uuid4())
+    SESSIONS[token] = {
+        "email": "flowsignal-access-user",
+        "role": "user",
+        "auth_method": "access_code",
+    }
+    return {
+        "ok": True,
+        "token": token,
+        "role": "user",
+        "authenticated": True,
+    }
+
+
+def _authenticated_settings_user(request: Request):
+    authorization = str(request.headers.get("authorization") or "").strip()
+    token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+    token = token or str(request.headers.get("x-session-token") or "").strip()
+    session = SESSIONS.get(token)
+    if not session or session.get("role") not in {"user", "admin", "owner"}:
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    return session
+
+
+def _news_mode_account_context():
+    try:
+        account = sync_ctrader_account_state(force=False)
+    except Exception as exc:
+        print("NEWS_MODE_ACCOUNT_SYNC_WARNING =", str(exc))
+        account = LIVE_ACCOUNT_STATE
+    environment = str(account.get("mode") or "unknown").strip().lower()
+    account_id = account.get("active_account_id") or account.get("account_id")
+    return account_id, environment
+
+
+def _allow_live_news_trading():
+    return str(os.getenv("ALLOW_LIVE_NEWS_TRADING", "false")).strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
+def _news_mode_response(setting):
+    account_id, environment = _news_mode_account_context()
+    return {
+        **setting,
+        "active_account": account_id,
+        "broker_environment": environment,
+        "allow_live_news_trading": _allow_live_news_trading(),
+    }
+
+
+@app.get("/settings/news-trading-mode")
+def get_news_trading_mode_setting(request: Request):
+    _authenticated_settings_user(request)
+    return _news_mode_response(get_effective_news_mode())
+
+
+@app.put("/settings/news-trading-mode")
+def update_news_trading_mode_setting(payload: NewsTradingModeRequest, request: Request):
+    with NEWS_MODE_CHANGE_LOCK:
+        return _apply_news_trading_mode_update(payload, request)
+
+
+def _apply_news_trading_mode_update(payload: NewsTradingModeRequest, request: Request):
+    current = get_effective_news_mode()
+    account_id, environment = _news_mode_account_context()
+    request_source = str(request.headers.get("x-request-source") or "web_app")
+    try:
+        user = _authenticated_settings_user(request)
+    except HTTPException:
+        try:
+            record_news_mode_audit(
+                previous_mode=current["mode"], new_mode=payload.mode,
+                user_id="unauthenticated", active_broker_account=account_id,
+                broker_environment=environment, request_source=request_source,
+                success=False, failure_reason="Authentication required.",
+            )
+        except Exception as audit_exc:
+            print("NEWS_MODE_AUDIT_FAILURE =", str(audit_exc))
+        raise
+
+    user_id = user.get("email") or user.get("id") or "authenticated_user"
+    failure_reason = None
+    try:
+        requested_mode = normalize_news_mode(payload.mode)
+        if (
+            requested_mode == "TRADE_CONFIRMED"
+            and environment in {"live", "funded", "real"}
+            and not _allow_live_news_trading()
+        ):
+            failure_reason = (
+                "Confirmed news trading is disabled for live accounts. "
+                "Use Demo or enable the server safety override."
+            )
+            raise HTTPException(status_code=403, detail=failure_reason)
+
+        transition = news_trading.apply_mode_transition(
+            current["mode"], requested_mode
+        )
+        saved = save_news_mode(requested_mode, updated_by=user_id)
+        try:
+            record_news_mode_audit(
+                previous_mode=current["mode"], new_mode=saved["mode"],
+                user_id=user_id, active_broker_account=account_id,
+                broker_environment=environment, request_source=request_source,
+                success=True,
+            )
+        except Exception as audit_exc:
+            # The setting is already durable and active. Keep the API truthful;
+            # the structured application log remains a secondary audit trail.
+            print("NEWS_MODE_AUDIT_FAILURE =", str(audit_exc))
+        print("NEWS_TRADING_MODE_APPLIED =", {
+            "previous_mode": current["mode"],
+            "new_mode": saved["mode"],
+            "user": user_id,
+            "active_broker_account": account_id,
+            "broker_environment": environment,
+            "transition": transition,
+        })
+        return _news_mode_response(saved)
+    except InvalidNewsTradingMode as exc:
+        failure_reason = str(exc)
+        status_code = 422
+    except HTTPException as exc:
+        failure_reason = str(exc.detail)
+        status_code = exc.status_code
+    except Exception as exc:
+        failure_reason = f"Could not save news trading mode: {exc}"
+        status_code = 500
+
+    try:
+        record_news_mode_audit(
+            previous_mode=current["mode"], new_mode=payload.mode,
+            user_id=user_id, active_broker_account=account_id,
+            broker_environment=environment, request_source=request_source,
+            success=False, failure_reason=failure_reason,
+        )
+    except Exception as audit_exc:
+        print("NEWS_MODE_AUDIT_FAILURE =", str(audit_exc))
+    raise HTTPException(status_code=status_code, detail=failure_reason)
+
 @app.post("/track-visit")
 def track_visit(data: dict, request: Request):
     try:
@@ -2213,6 +2396,16 @@ def invalidate_symbol_setup_state(
         float(LIVE_LAST_POSITION_CLOSED_AT.get(normalized_symbol, 0) or 0),
         closed_timestamp,
     )
+    try:
+        news_trading.mark_running_trade_closed(
+            normalized_symbol,
+            closed_at=closed_timestamp,
+        )
+    except Exception as exc:
+        print("NEWS_TRADE_CLOSE_STATE_ERROR =", {
+            "symbol": normalized_symbol,
+            "error": str(exc),
+        })
 
     try:
         import brain
@@ -5740,6 +5933,97 @@ def get_panel_trade_plan(panel_data, symbol):
     return panel_data.get(execution_symbol)
 
 
+def get_news_market_context(panel_data, symbol, side=None):
+    data = panel_data if isinstance(panel_data, dict) else PANEL_CACHE.get("data")
+    symbol = normalize_symbol(symbol)
+    candles = ((data or {}).get("candles") or {}).get(symbol) or {}
+    try:
+        tick = ((get_live_prices() or {}).get("live_prices") or {}).get(symbol) or {}
+    except Exception:
+        tick = {}
+    side = str(side or "").upper()
+    entry_price = (
+        tick.get("ask") if side == "BUY"
+        else tick.get("bid") if side == "SELL"
+        else tick.get("mid") or tick.get("bid") or tick.get("ask")
+    )
+    return {
+        "candles_5m": candles.get("5m") or [],
+        "candles_15m": candles.get("15m") or [],
+        "entry_price": entry_price,
+        "tick": tick,
+    }
+
+
+def evaluate_news_entry_state(panel_data, symbol, side=None, audit=False):
+    context = get_news_market_context(panel_data, symbol, side=side)
+    if news_trading.get_mode() == "OFF":
+        decision = news_trading.evaluate([], symbol)
+        return {**decision, "market_context": context, "events": []}
+    try:
+        events = fetch_calendar_events()
+        selected = news_trading.select_active_event(
+            events,
+            symbol,
+            datetime.now(timezone.utc),
+        )
+        if selected:
+            refreshed = refresh_actual_after_release(selected, symbol)
+            if refreshed is not selected:
+                selected_key = news_trading.event_id(selected)
+                events = [
+                    refreshed
+                    if news_trading.event_id(item) == selected_key
+                    else item
+                    for item in events
+                ]
+        decision = news_trading.evaluate(
+            events,
+            symbol,
+            candles_5m=context["candles_5m"],
+            candles_15m=context["candles_15m"],
+            entry_price=context["entry_price"],
+            data_age_seconds=get_calendar_data_age_seconds(),
+            audit=audit,
+        )
+    except Exception as exc:
+        decision = {
+            "mode": news_trading.get_mode(),
+            "phase": "RELEASE_LOCK",
+            "authoritative_status": "NEWS BLOCK",
+            "allow_normal_entry": False,
+            "allow_news_entry": False,
+            "blocking_reason": "WAIT_NEWS_STATUS_UNAVAILABLE",
+            "error": str(exc),
+        }
+    return {**decision, "market_context": context, "events": events if "events" in locals() else []}
+
+
+def normal_plan_is_fresh_after_news(plan, decision):
+    fresh_after = decision.get("normal_fresh_after")
+    if not fresh_after:
+        return True
+    try:
+        watermark = news_trading.parse_time(fresh_after)
+        bos_close = news_trading.parse_time(
+            plan.get("fifteen_m_break_close_time")
+            or ((plan.get("fifteen_m_swing_break") or {}).get("break_close_time"))
+        )
+        confirmation_close = news_trading.parse_time(
+            plan.get("five_m_closed_candle_time")
+            or ((plan.get("confirmation_5m") or {}).get("confirmation_close_time"))
+        )
+    except Exception:
+        return False
+    return bool(
+        watermark
+        and bos_close
+        and confirmation_close
+        and bos_close > watermark
+        and confirmation_close > bos_close
+    )
+
+
 def get_plan_execution_metadata(plan, side=None):
     plan = plan if isinstance(plan, dict) else {}
     breakout = (
@@ -5983,6 +6267,82 @@ def run_ctrader_auto_trade_checks(panel_data):
 
     for symbol in ["EURUSD", "XAUUSD"]:
         plan = get_panel_trade_plan(panel_data, symbol) or {}
+        news_state = evaluate_news_entry_state(
+            panel_data,
+            symbol,
+            audit=True,
+        )
+        if news_state.get("allow_news_entry"):
+            expected_side = news_state.get("expected_symbol_direction")
+            news_state = evaluate_news_entry_state(
+                panel_data,
+                symbol,
+                side=expected_side,
+                audit=True,
+            )
+            if news_state.get("allow_news_entry"):
+                plan = news_state.get("news_plan") or plan
+
+        if not news_state.get("allow_news_entry") and not news_state.get(
+            "allow_normal_entry", True
+        ):
+            reason = (
+                news_state.get("blocking_reason")
+                or news_state.get("authoritative_status")
+                or "NEWS BLOCK"
+            )
+            if news_state.get("phase") in {"PRE_NEWS", "RELEASE_LOCK"}:
+                try:
+                    import brain
+                    brain.clear_symbol_entry_memory(
+                        symbol,
+                        reason,
+                        closed_at=None,
+                    )
+                except Exception as exc:
+                    print("NEWS_SETUP_INVALIDATION_ERROR =", {
+                        "symbol": symbol,
+                        "error": str(exc),
+                    })
+            set_auto_trade_status(
+                symbol=symbol,
+                signal="WAIT",
+                action=None,
+                status="BLOCKED",
+                reason=reason,
+                details=news_state,
+            )
+            log_auto_trade_blocked_reason(
+                symbol=symbol,
+                signal="WAIT",
+                stage="authoritative_news_gate",
+                reason=reason,
+                details=news_state,
+            )
+            results.append({
+                "ok": False,
+                "symbol": symbol,
+                "reason": reason,
+                "news_trading": news_state,
+            })
+            continue
+
+        if (
+            not news_state.get("allow_news_entry")
+            and not normal_plan_is_fresh_after_news(plan, news_state)
+        ):
+            reason = "WAIT_FRESH_NORMAL_SETUP_AFTER_NEWS"
+            set_auto_trade_status(
+                symbol=symbol,
+                signal="WAIT",
+                action=None,
+                status="BLOCKED",
+                reason=reason,
+                details=news_state,
+            )
+            results.append({"ok": False, "symbol": symbol, "reason": reason})
+            continue
+
         signal = str(plan.get("signal") or "WAIT").upper()
         broker_block_reason = (
             None
@@ -6148,6 +6508,9 @@ def run_ctrader_auto_trade_checks(panel_data):
                 "tp1": plan.get("tp1"),
                 "tp2": plan.get("tp2"),
                 **get_plan_execution_metadata(plan, signal),
+                "news_event_id": plan.get("news_event_id"),
+                "news_event": copy.deepcopy(plan.get("news_event")),
+                "news_confirmation": copy.deepcopy(plan.get("news_confirmation")),
             },
             source="auto"
         )
@@ -6397,6 +6760,9 @@ def prepare_ctrader_trade(payload, volume=0.01):
         "fifteen_m_break_close_time",
         "five_m_confirmation_close_time",
         "trend_15m",
+        "news_event_id",
+        "news_event",
+        "news_confirmation",
     ]:
         payload_value = payload.get(key)
         normalized[key] = (
@@ -8816,7 +9182,120 @@ def execute_live_order_core(payload: dict, source="manual"):
         strategy_generated_order = bool(
             source == "auto" or trade_payload.get("signal_setup_id")
         )
-        if source == "auto":
+        is_news_order = bool(trade_payload.get("news_event_id"))
+        news_runtime = evaluate_news_entry_state(
+            PANEL_CACHE.get("data"),
+            symbol,
+            side=side,
+            audit=True,
+        )
+        if is_news_order:
+            news_context = news_runtime.get("market_context") or {}
+            tick = news_context.get("tick") or {}
+            try:
+                spread = abs(float(tick.get("ask")) - float(tick.get("bid")))
+                maximum_spread = float(
+                    (trade_payload.get("news_confirmation") or {}).get(
+                        "confirmation_buffer"
+                    )
+                )
+                spread_ok = spread <= maximum_spread
+            except (TypeError, ValueError):
+                spread_ok = False
+            market_health = check_live_market_data_health(symbol)
+            previous_close = float(
+                LIVE_LAST_POSITION_CLOSED_AT.get(symbol, 0) or 0
+            )
+            cooldown_active = bool(
+                previous_close
+                and time.time() - previous_close
+                < LIVE_POST_CLOSE_COOLDOWN_SECONDS
+            )
+            expected_news = {
+                "event_id": trade_payload.get("news_event_id"),
+                "expected_symbol_direction": side,
+                "news_plan": {
+                    "signal": side,
+                    "entry_price": trade_payload.get("entry"),
+                    "stop_loss": trade_payload.get("sl"),
+                    "tp1": trade_payload.get("tp1"),
+                    "tp2": trade_payload.get("tp2"),
+                    "signal_setup_id": trade_payload.get("signal_setup_id"),
+                },
+            }
+            locked_news_gate = news_trading.final_gate(
+                expected_news,
+                news_runtime.get("events") or [],
+                symbol,
+                news_context.get("candles_5m") or [],
+                news_context.get("entry_price"),
+                active_position=any(
+                    normalize_symbol(position.get("symbol")) == symbol
+                    for position in broker_positions_before_send
+                ),
+                cooldown_active=cooldown_active,
+                feed_fresh=bool(market_health.get("ok")),
+                spread_ok=spread_ok,
+                data_age_seconds=get_calendar_data_age_seconds(),
+                audit=True,
+            )
+            locked_risk_size = calculate_live_risk_size(
+                symbol,
+                trade_payload.get("entry"),
+                trade_payload.get("sl"),
+            )
+            locked_rr = validate_live_trade_risk_reward(
+                symbol,
+                side,
+                trade_payload.get("entry"),
+                trade_payload.get("sl"),
+                trade_payload.get("tp2"),
+            )
+            risk_changed = bool(
+                not locked_risk_size.get("ok")
+                or locked_risk_size.get("lot_size") != risk_size.get("lot_size")
+                or locked_risk_size.get("volume_units") != risk_size.get("volume_units")
+                or locked_risk_size.get("risk_amount") != risk_size.get("risk_amount")
+            )
+            if risk_changed or not locked_rr.get("ok"):
+                locked_news_gate = {
+                    **locked_news_gate,
+                    "ok": False,
+                    "reason": (
+                        "WAIT_NEWS_RISK_CHANGED_BEFORE_EXECUTION"
+                        if risk_changed
+                        else "WAIT_NEWS_RR_CHANGED_BEFORE_EXECUTION"
+                    ),
+                    "locked_risk_size": locked_risk_size,
+                    "initial_risk_size": risk_size,
+                    "locked_risk_reward": locked_rr,
+                }
+            print("LIVE_NEWS_FINAL_ENTRY_GATE =", locked_news_gate)
+            if not locked_news_gate.get("ok"):
+                reason = locked_news_gate.get("reason") or "NEWS_FINAL_GATE_FAILED"
+                return reject_live_execution_block(
+                    symbol,
+                    side,
+                    trade_payload,
+                    reason,
+                    reason,
+                    details=locked_news_gate,
+                )
+        elif not news_runtime.get("allow_normal_entry", True):
+            reason = (
+                news_runtime.get("blocking_reason")
+                or "AUTHORITATIVE_NEWS_BLOCK"
+            )
+            return reject_live_execution_block(
+                symbol,
+                side,
+                trade_payload,
+                reason,
+                reason,
+                details=news_runtime,
+            )
+
+        if source == "auto" and not is_news_order:
             final_gate = validate_auto_entry_state_locked(
                 symbol,
                 side,
@@ -8854,7 +9333,7 @@ def execute_live_order_core(payload: dict, source="manual"):
                     details=final_gate.get("details"),
                 )
 
-        if strategy_generated_order:
+        if strategy_generated_order and not is_news_order:
             fresh_ema_gate = validate_fresh_ema_permission_locked(symbol, side)
             print("LIVE_FRESH_EMA_FINAL_GATE =", {
                 **fresh_ema_gate.get("details", {}),
@@ -9014,6 +9493,15 @@ def execute_live_order_core(payload: dict, source="manual"):
         risk=trade_payload.get("risk"),
         mode=trade_payload["mode"]
     )
+
+    if trade_payload.get("news_event_id") and isinstance(
+        trade_payload.get("news_event"), dict
+    ):
+        news_trading.record_broker_result(
+            trade_payload["news_event"],
+            symbol,
+            result,
+        )
 
     if not result.get("ok", False):
         reason = result.get("reason") or result.get("message") or "Order rejected"

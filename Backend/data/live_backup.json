@@ -1,6 +1,7 @@
 {
-  "live_active_orders": {
-    "XAUUSD": {
+  "live_active_orders": {},
+  "live_trade_history": [
+    {
       "order_id": "broker-55937172",
       "trade_id": "ctrader-pos-55937172",
       "position_id": 55937172,
@@ -39,11 +40,11 @@
       "pnl": 10.21,
       "profit": 10.21,
       "broker_pnl": 10.21,
-      "broker_pnl_source": "raw.netUnrealizedPnL",
+      "broker_pnl_source": "raw.profit",
       "pips": 0.0,
       "opened_at": 1783691036320,
       "source": "broker",
-      "result": "RUNNING",
+      "result": "WIN",
       "signal_setup_id": "eb720509d1a810aa275fe969b4dd09221d823ce25bcb5966a1b84a788beca8fa",
       "levels_modified_at": 1783705639.242343,
       "user_modified_levels": {
@@ -102,14 +103,20 @@
       },
       "exit_status": "WATCH",
       "exit_reason": "Signal moved to WAIT",
-      "status": null,
+      "status": "WIN",
       "tp2_hit": false,
       "tp2_close_requested": false,
       "tp2_close_result": null,
       "take_profit_1": 4072.53,
       "take_profit_2": 4062.84,
       "take_profit": 4062.84,
-      "executed_trade_setup_snapshot": {
+      "broker_close_status": "BROKER_CLOSED",
+      "broker_realized_profit": 10.21,
+      "broker_realized_source": "raw.profit",
+      "closed_at": 1783996981.777549,
+      "closed_reason": "Broker position closed",
+      "note": "Broker position no longer found in cTrader open positions.",
+      "archived_executed_trade_setup_snapshot": {
         "snapshot_version": 1,
         "immutable": true,
         "symbol": "XAUUSD",
@@ -144,11 +151,15 @@
           "tp_rr_validation": true
         },
         "recovered_from_active_position": true
-      }
+      },
+      "executed_trade_setup_snapshot_archived_at": 1783996981.777549
     }
-  },
-  "live_trade_history": [],
+  ],
   "live_last_execution_time": {
+    "EURUSD": 0.0,
+    "XAUUSD": 0.0
+  },
+  "live_last_position_closed_at": {
     "EURUSD": 0.0,
     "XAUUSD": 0.0
   },
