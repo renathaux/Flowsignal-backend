@@ -209,6 +209,8 @@ PANEL_CACHE = {
     "last_update": 0
 }
 PANEL_REFRESH_LOCK = threading.Lock()
+PANEL_REFRESH_COMPLETE = threading.Event()
+PANEL_REFRESH_COMPLETE.set()
 PANEL_REFRESH_STATE = {
     "running": False,
     "last_started": None,
@@ -292,6 +294,7 @@ def save_live_monthly_history_cache():
 
 CACHE_SECONDS = 15
 PANEL_REFRESH_STUCK_SECONDS = 45
+PANEL_INITIAL_DATA_WAIT_SECONDS = 55
 ADMIN_TOKEN = "N2415"
 FEEDBACK_EMAIL = "flowsignal.contact@gmail.com"
 FEEDBACK_APP_PASSWORD = "wwro vjjg grzt vpcp"
@@ -657,6 +660,7 @@ def refresh_panel_cache(reason="background", force_refresh=False):
         return False
 
     started_at = time.time()
+    PANEL_REFRESH_COMPLETE.clear()
     PANEL_REFRESH_STATE.update({
         "running": True,
         "last_started": started_at,
@@ -688,6 +692,7 @@ def refresh_panel_cache(reason="background", force_refresh=False):
             time.time() - started_at,
             2,
         )
+        PANEL_REFRESH_COMPLETE.set()
         PANEL_REFRESH_LOCK.release()
 
 def refresh_panel_cache_direct(reason, force_refresh=True):
@@ -760,6 +765,10 @@ def schedule_panel_cache_refresh(reason, force_refresh=True):
         })
         return False
 
+    # Clear before starting the thread so an initial API request cannot race
+    # ahead of refresh_panel_cache() and mistake the previously-set event for
+    # a completed refresh.
+    PANEL_REFRESH_COMPLETE.clear()
     thread = threading.Thread(
         target=refresh_panel_cache,
         kwargs={
@@ -775,6 +784,16 @@ def schedule_panel_cache_refresh(reason, force_refresh=True):
         "previous_refresh_stuck": bool(refresh_stuck),
     })
     return True
+
+
+def wait_for_initial_panel_cache(timeout=PANEL_INITIAL_DATA_WAIT_SECONDS):
+    """Wait once for startup market data instead of returning a blank panel."""
+    PANEL_REFRESH_COMPLETE.wait(timeout=max(float(timeout or 0), 0))
+    cached_data = PANEL_CACHE.get("data")
+    validity = _panel_cache_validity(cached_data)
+    if not validity["valid"]:
+        return None
+    return cached_data
 
 
 def warm_panel_cache_from_persisted_candles():
@@ -1615,6 +1634,22 @@ def panel_data(force: int = 0):
                 direct_reason,
                 force_refresh=False,
             )
+            recovered_data = wait_for_initial_panel_cache()
+            if recovered_data is not None:
+                cached_data = recovered_data
+                age = max(
+                    time.time() - float(PANEL_CACHE.get("last_update") or 0),
+                    0,
+                )
+                cache_validity = _panel_cache_validity(cached_data)
+                cache_valid = cache_validity["valid"]
+                startup_cache = _is_startup_panel_payload(cached_data)
+                direct_reason = None
+                print("PANEL_INITIAL_DATA_READY =", {
+                    "cache_age_seconds": round(age, 1),
+                    "candle_counts": cache_validity.get("candle_counts"),
+                    "refresh_source": PANEL_REFRESH_STATE.get("last_source"),
+                })
         elif cache_stale:
             schedule_panel_cache_refresh(
                 direct_reason,
