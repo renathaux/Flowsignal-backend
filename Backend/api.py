@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import uuid
 import math
+import traceback
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ctrader_connector import (
@@ -147,6 +148,20 @@ app.include_router(settings_router)
 app.include_router(performance_router)
 app.include_router(ctrader_router)
 app.include_router(trading_router)
+
+@app.middleware("http")
+async def log_unhandled_api_errors(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception as exc:
+        print("UNHANDLED_API_ERROR =", {
+            "method": request.method,
+            "path": request.url.path,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        })
+        traceback.print_exc()
+        raise
 
 @app.on_event("startup")
 def start_background_task():
@@ -444,19 +459,55 @@ def _panel_cache_validity(data):
     }
 
 
-def _json_safe_panel_value(value):
-    if isinstance(value, dict):
-        return {
-            str(key): _json_safe_panel_value(child)
-            for key, child in value.items()
-        }
-    if isinstance(value, list):
-        return [_json_safe_panel_value(child) for child in value]
-    if isinstance(value, tuple):
-        return [_json_safe_panel_value(child) for child in value]
+def _json_safe_panel_value(value, _active_containers=None, _depth=0):
+    # Starlette deliberately rejects NaN/Infinity while encoding JSON. Market
+    # data frames can legitimately contain either value in an unfinished row,
+    # so normalise them at the API boundary instead of taking /panel-data down.
+    if _active_containers is None:
+        _active_containers = set()
+    # A malformed diagnostic/state object can also be an acyclic but
+    # effectively unbounded chain of nested dictionaries. It is not useful to
+    # the dashboard beyond this point and must never make the whole API fail.
+    if _depth >= 16:
+        return None
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (dict, list, tuple, set)):
+        container_id = id(value)
+        if container_id in _active_containers:
+            return None
+        _active_containers.add(container_id)
+        try:
+            if isinstance(value, dict):
+                return {
+                    str(key): _json_safe_panel_value(
+                        child,
+                        _active_containers,
+                        _depth + 1,
+                    )
+                    for key, child in value.items()
+                }
+            return [
+                _json_safe_panel_value(
+                    child,
+                    _active_containers,
+                    _depth + 1,
+                )
+                for child in value
+            ]
+        finally:
+            _active_containers.remove(container_id)
     if hasattr(value, "item"):
         try:
-            return value.item()
+            # Re-run conversion because numpy scalar extraction can produce a
+            # non-finite Python float or another scalar requiring conversion.
+            extracted = value.item()
+            if extracted is not value:
+                return _json_safe_panel_value(
+                    extracted,
+                    _active_containers,
+                    _depth + 1,
+                )
         except (TypeError, ValueError):
             pass
     return value
