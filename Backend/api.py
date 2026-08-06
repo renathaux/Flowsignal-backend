@@ -29,6 +29,7 @@ from ctrader_connector import (
     fetch_ctrader_accounts,
     forget_ctrader_account,
     get_connection_state,
+    get_ctrader_connection_snapshot,
     get_ctrader_account_snapshot,
     get_closed_deals_for_current_week,
     get_closed_deals_for_current_month,
@@ -1761,31 +1762,16 @@ LIVE_POSITION_SYNC_STATUS = {
 @app.get("/ctrader/status")
 @app.get("/ctrader-status")
 def ctrader_status():
-    account_state = sync_ctrader_account_state(force=False)
+    # Status reads must never block the UI on live broker I/O. The background
+    # engine and execution gates perform authoritative live verification.
+    account_state = get_ctrader_connection_snapshot()
     refresh_token_status = get_ctrader_refresh_token_status()
     selection_debug = get_ctrader_account_selection_debug()
     connected = bool(account_state.get("connected"))
-    positions = []
     last_error = LIVE_POSITION_SYNC_STATUS.get("last_error")
-
-    if connected:
-        try:
-            positions = get_open_positions()
-            position_error = get_ctrader_position_fetch_error()
-
-            if position_error:
-                last_error = position_error
-                LIVE_POSITION_SYNC_STATUS["last_error"] = position_error
-            else:
-                LIVE_POSITION_SYNC_STATUS["last_success"] = time.time()
-                LIVE_POSITION_SYNC_STATUS["last_error"] = None
-                last_error = None
-        except Exception as e:
-            last_error = str(e)
-            LIVE_POSITION_SYNC_STATUS["last_error"] = last_error
-            positions = []
-    else:
-        last_error = LIVE_POSITION_SYNC_STATUS.get("last_error")
+    positions_count = sum(
+        1 for trade in LIVE_ACTIVE_ORDERS.values() if isinstance(trade, dict)
+    )
 
     if connected:
         reason = account_state.get("reason") or "authenticated"
@@ -1820,7 +1806,9 @@ def ctrader_status():
             account_state.get("is_active_account_authorized")
             or selection_debug.get("is_active_account_authorized")
         ),
-        "live_positions_count": len(positions or []),
+        "live_positions_count": positions_count,
+        "status_age_seconds": account_state.get("status_age_seconds"),
+        "snapshot_source": account_state.get("snapshot_source"),
         "last_success": format_status_time(
             LIVE_POSITION_SYNC_STATUS.get("last_success")
         ),

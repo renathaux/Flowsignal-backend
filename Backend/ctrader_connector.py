@@ -390,6 +390,52 @@ def check_ctrader_connection_capability(force=False):
 def get_connection_state(force=False):
     return check_ctrader_connection_capability(force=force)
 
+
+def get_ctrader_connection_snapshot():
+    """Return status immediately without opening a broker socket."""
+    now = time.time()
+    cached_state = CTRADER_CONNECTION_CACHE.get("state")
+    if isinstance(cached_state, dict):
+        state = dict(cached_state)
+        checked_at = float(CTRADER_CONNECTION_CACHE.get("checked_at") or 0)
+        status_age = max(0.0, now - checked_at) if checked_at else None
+        state["status_age_seconds"] = status_age
+        if (
+            state.get("connected")
+            and status_age is not None
+            and status_age > CTRADER_CONNECTION_GRACE_SECONDS
+        ):
+            state["degraded"] = True
+            state["execution_ready"] = False
+            state["reason"] = "broker verification delayed; last confirmed state shown"
+        state["snapshot_source"] = "connection_cache"
+        return state
+
+    config = get_ctrader_config()
+    local_connected = bool(CONNECTED.get("connected") or CONNECTED.get("status"))
+    selection = get_ctrader_account_selection_debug()
+    return {
+        "connected": local_connected,
+        "status": local_connected,
+        "mode": CONNECTED.get("mode") or (config.get("env") if config else "demo"),
+        "account_id": (
+            CONNECTED.get("account_id")
+            or (config.get("account_id") if config else None)
+        ),
+        "execution_ready": False,
+        "auth_ok": False,
+        "account_found": False,
+        "reason": "broker verification pending" if config else "missing or invalid cTrader config",
+        "degraded": bool(config),
+        "consecutive_failures": int(
+            CTRADER_CONNECTION_CACHE.get("consecutive_failures") or 0
+        ),
+        "last_success_at": CTRADER_CONNECTION_CACHE.get("last_success_at") or None,
+        "status_age_seconds": None,
+        "snapshot_source": "local_selection",
+        **selection,
+    }
+
 def load_ctrader_account_settings():
     data = {}
     if CTRADER_ACCOUNTS_PATH.exists():
@@ -4282,11 +4328,7 @@ def preserve_active_account_during_transient_refresh(
 ):
     accounts = list(refreshed_accounts or [])
     active_id = str(active_account_id or "").strip()
-    if not active_id or any(
-        str(item.get("account_id")) == active_id
-        for item in accounts
-        if isinstance(item, dict)
-    ):
+    if not active_id:
         return accounts
 
     cached_active_account = next(
@@ -4298,6 +4340,37 @@ def preserve_active_account_during_transient_refresh(
         ),
         None,
     )
+    refreshed_index = next(
+        (
+            index
+            for index, item in enumerate(accounts)
+            if isinstance(item, dict)
+            and str(item.get("account_id")) == active_id
+        ),
+        None,
+    )
+    if refreshed_index is not None:
+        refreshed_active = accounts[refreshed_index]
+        if refreshed_active.get("unavailable") and cached_active_account:
+            accounts[refreshed_index] = {
+                **cached_active_account,
+                **refreshed_active,
+                "balance": (
+                    refreshed_active.get("balance")
+                    if refreshed_active.get("balance") not in (None, "")
+                    else cached_active_account.get("balance")
+                ),
+                "equity": (
+                    refreshed_active.get("equity")
+                    if refreshed_active.get("equity") not in (None, "")
+                    else cached_active_account.get("equity")
+                ),
+                "status": "unavailable",
+                "unavailable": True,
+                "reason": "Temporary cTrader refresh failure; active selection preserved",
+            }
+        return accounts
+
     if cached_active_account:
         accounts.append({
             **cached_active_account,
@@ -4310,6 +4383,19 @@ def preserve_active_account_during_transient_refresh(
 def fetch_ctrader_accounts(refresh=True):
     settings = load_ctrader_account_settings()
     active_account_id = get_active_ctrader_account_id()
+    if not refresh:
+        cached_accounts = settings.get("accounts", [])
+        return {
+            "ok": True,
+            "active_account_id": str(active_account_id) if active_account_id else None,
+            "active_account_env": settings.get("active_account_env"),
+            "accounts": cached_accounts if isinstance(cached_accounts, list) else [],
+            "forgotten_account_ids": settings.get("forgotten_account_ids", []),
+            "last_refresh": settings.get("last_refresh"),
+            "env": settings.get("active_account_env") or os.getenv("CTRADER_ENV", "demo"),
+            "cached": True,
+            "source": "saved_account_state",
+        }
     env = normalize_ctrader_env(os.getenv("CTRADER_ENV", "demo"))
     config = {
         "client_id": os.getenv("CTRADER_CLIENT_ID"),
