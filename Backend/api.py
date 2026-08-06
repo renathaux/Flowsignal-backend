@@ -1553,6 +1553,13 @@ def background_fetch():
         ENGINE_RUNTIME_STATE["loop_iterations"] += 1
         try:
             print("🔄 BACKGROUND FETCH (once for all users)")
+            # Server-owned recovery: a browser request is never required to
+            # start or restart the cTrader price stream.
+            stream_state = start_ctrader_live_price_stream()
+            if not stream_state.get("ok"):
+                print("CTRADER_LIVE_STREAM_RETRY_WAITING =", {
+                    "reason": stream_state.get("reason"),
+                })
             if refresh_panel_cache(reason="background"):
                 refresh_live_panel_meta(PANEL_CACHE["data"])
                 print("✅ Cache updated globally")
@@ -1667,6 +1674,8 @@ def system_status():
             "stale_15m_minutes": source.get("stale_15m_minutes"),
             "stale_1h_minutes": source.get("stale_1h_minutes"),
             "missed_fetch_count": source.get("missed_fetch_count"),
+            "signal": (panel.get(symbol) or {}).get("signal"),
+            "last_signal_timestamp": PANEL_CACHE.get("last_update") or None,
         }
 
     risk_settings = load_risk_settings()
@@ -1674,6 +1683,9 @@ def system_status():
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "backend_online": True,
+        "data_transport": "rest_polling",
+        "frontend_websocket_expected": False,
+        "browser_clients_required": 0,
         "trading_engine": {
             "running": trading_engine_running,
             "thread_alive": thread_alive,
@@ -1695,6 +1707,8 @@ def system_status():
             "environment": LIVE_ACCOUNT_STATE.get("mode"),
             "reason": LIVE_ACCOUNT_STATE.get("reason"),
             "last_success_at": LIVE_ACCOUNT_STATE.get("last_success_at"),
+            "last_heartbeat": LIVE_ACCOUNT_STATE.get("last_success_at"),
+            "connection_owner": "render_backend",
         },
         "market_data": market_data,
         "last_strategy_check": ENGINE_RUNTIME_STATE.get("last_strategy_check"),
