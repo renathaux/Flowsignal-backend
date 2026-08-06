@@ -17,6 +17,12 @@ BOS_MIN_BUFFER_POINTS = 10
 REMEMBERED_BREAKOUT_MAX_15M_CANDLES = 4
 PROTECTED_SL_TP2_FRACTION = 0.50
 
+STAGE_NOT_EVALUATED = "NOT_EVALUATED"
+STAGE_PASSED = "PASSED"
+STAGE_FAILED = "FAILED"
+STAGE_BLOCKED = "BLOCKED"
+BLOCKED_BREAKOUT_STATUS = "BLOCKED_BY_CONSOLIDATION"
+
 
 def point_size(symbol):
     try:
@@ -194,13 +200,14 @@ def qualify_raw_swings(raw, data_15m, symbol):
 
     for swing in raw:
         opposite_type = "LOW" if swing["type"] == "HIGH" else "HIGH"
+        # Measure from the nearest already-qualified opposite pivot.  Do not
+        # skip a recent local leg merely to find an older, farther anchor that
+        # makes the candidate appear large enough.
         opposite = next(
             (
                 candidate
                 for candidate in reversed(accepted)
                 if candidate.get("type") == opposite_type
-                and abs(float(swing["price"]) - float(candidate["price"]))
-                >= min_size
             ),
             None,
         )
@@ -500,6 +507,7 @@ def save_remembered_breakout(
     swing=None,
     break_type=None,
     invalidation_level=None,
+    status="PENDING",
 ):
     close_timestamp = utc_timestamp(
         break_close_time or candle_close_time(break_time, 15)
@@ -513,22 +521,41 @@ def save_remembered_breakout(
         else None
     )
     key = get_watch_key(symbol, side)
+    swing_identity = None
+    if isinstance(swing, dict):
+        swing_identity = {
+            "type": swing.get("type"),
+            "time": swing.get("time"),
+            "price": float(swing.get("price")) if swing.get("price") is not None else None,
+            "swing_size": (
+                float(swing.get("swing_size"))
+                if swing.get("swing_size") is not None
+                else None
+            ),
+        }
+    normalized_status = str(status or "PENDING").upper()
     shared.FIFTEEN_M_SWING_WATCH[key] = {
         "symbol": shared.normalize_symbol(symbol),
         "side": side,
+        "direction": side,
         "swing_level": float(level),
+        "swing_timestamp": (swing_identity or {}).get("time"),
+        "swing_price": (swing_identity or {}).get("price"),
+        "swing_size": (swing_identity or {}).get("swing_size"),
         "saved_at": datetime.now(timezone.utc).isoformat(),
         "break_confirmed": True,
         "break_candle_time": break_time,
+        "break_timestamp": break_time,
         "break_close_time": break_close_time,
         "break_close": float(break_close),
+        "break_price": float(break_close),
         "bos_buffer": float(required_buffer or 0.0),
-        "swing": swing,
+        "swing": swing_identity,
         "break_type": break_type,
         "invalidation_level": invalidation_level,
         "expires_at": expires_at.isoformat() if expires_at is not None else None,
         "maximum_closed_15m_candles": REMEMBERED_BREAKOUT_MAX_15M_CANDLES,
-        "status": "PENDING",
+        "status": normalized_status,
         "reason": reason,
     }
     shared.save_fifteen_m_swing_watch()
@@ -538,7 +565,8 @@ def remembered_breakout(symbol, side, current_close_time=None, current_close=Non
     watch = shared.FIFTEEN_M_SWING_WATCH.get(get_watch_key(symbol, side))
     if not isinstance(watch, dict):
         return None
-    if str(watch.get("status") or "PENDING").upper() != "PENDING":
+    watch_status = str(watch.get("status") or "PENDING").upper()
+    if watch_status not in ["PENDING", BLOCKED_BREAKOUT_STATUS]:
         return None
     current_timestamp = utc_timestamp(current_close_time)
     expires_at = utc_timestamp(watch.get("expires_at"))
@@ -582,6 +610,7 @@ def remembered_breakout(symbol, side, current_close_time=None, current_close=Non
             "invalidation_level": invalidation_level,
             "expires_at": watch.get("expires_at"),
             "remembered": True,
+            "watch_status": watch_status,
             "watch": watch,
         }
     except (TypeError, ValueError):
@@ -745,6 +774,7 @@ def evaluate_15m_breakout(data_15m, symbol):
         "break_type": chosen.get("break_type") or "CHOCH",
         "invalidation_level": chosen.get("invalidation_level"),
         "expires_at": chosen.get("expires_at"),
+        "watch_status": chosen.get("watch_status"),
         "structure": chosen.get("structure") or structure,
         "reason": f"15M_{chosen.get('break_type') or 'CHOCH'}_SWING_BREAK_CLOSED",
     })
@@ -1025,6 +1055,77 @@ def bias_scores_from_context(trend=None, breakout=None, confirmation=None):
     }
 
 
+def strategy_stage_states(**overrides):
+    states = {
+        "market_data": STAGE_PASSED,
+        "swing_detection": STAGE_NOT_EVALUATED,
+        "fifteen_m_bos": STAGE_NOT_EVALUATED,
+        "fifteen_m_close": STAGE_NOT_EVALUATED,
+        "ema": STAGE_NOT_EVALUATED,
+        "five_m_confirmation": STAGE_NOT_EVALUATED,
+        "consolidation_gate": STAGE_NOT_EVALUATED,
+        "swing_sl": STAGE_NOT_EVALUATED,
+        "tp_rr": STAGE_NOT_EVALUATED,
+        "execution": STAGE_BLOCKED,
+    }
+    states.update(overrides)
+    return states
+
+
+def strategy_cycle_diagnostics(
+    symbol,
+    closed_15m,
+    breakout=None,
+    trend=None,
+    confirmation=None,
+    consolidation=None,
+    stage_states=None,
+    execution_decision="WAIT",
+    block_reason=None,
+):
+    breakout = breakout if isinstance(breakout, dict) else {}
+    trend = trend if isinstance(trend, dict) else {}
+    confirmation = confirmation if isinstance(confirmation, dict) else {}
+    consolidation = consolidation if isinstance(consolidation, dict) else {}
+    swings = breakout.get("swings") if isinstance(breakout.get("swings"), list) else []
+    raw_swings = breakout.get("raw_swings") if isinstance(breakout.get("raw_swings"), list) else []
+    selected_swing = breakout.get("swing") if isinstance(breakout.get("swing"), dict) else None
+    evaluated_candle = None
+    if closed_15m is not None and not closed_15m.empty:
+        evaluated_candle = candle_time(closed_15m.index[-1])
+    return {
+        "symbol": shared.normalize_symbol(symbol),
+        "evaluation_time": datetime.now(timezone.utc).isoformat(),
+        "evaluated_m15_candle": evaluated_candle,
+        "evaluated_m15_close_time": candle_close_time(evaluated_candle, 15),
+        "raw_swing_count": len(raw_swings),
+        "qualified_swing_count": len(swings),
+        "qualified_swing": {
+            key: selected_swing.get(key)
+            for key in ["type", "time", "price", "swing_size"]
+        } if selected_swing else None,
+        "bos_found": breakout.get("side") in ["BUY", "SELL"],
+        "bos_side": breakout.get("side"),
+        "bos_level": breakout.get("level"),
+        "bos_close": breakout.get("break_close"),
+        "bos_close_time": breakout.get("break_close_time"),
+        "bos_blocked": bool(
+            consolidation.get("is_consolidation")
+            and breakout.get("side") in ["BUY", "SELL"]
+        ),
+        "ema_trend": trend.get("trend"),
+        "ema_buy_allowed": bool(trend.get("buy_allowed")),
+        "ema_sell_allowed": bool(trend.get("sell_allowed")),
+        "five_m_confirmation": bool(confirmation.get("close_confirmed")),
+        "five_m_confirmation_time": confirmation.get("confirmation_close_time"),
+        "consolidation": bool(consolidation.get("is_consolidation")),
+        "consolidation_conditions_met": consolidation.get("conditions_met"),
+        "stage_states": dict(stage_states or {}),
+        "execution_decision": execution_decision,
+        "block_reason": block_reason,
+    }
+
+
 def wait_result(symbol, reason, extra=None):
     normalized_symbol = shared.normalize_symbol(symbol)
     payload = {
@@ -1058,6 +1159,11 @@ def wait_result(symbol, reason, extra=None):
     }
     if extra:
         payload.update(extra)
+
+    stages = payload.get("strategy_stage_states")
+    if not isinstance(stages, dict):
+        stages = strategy_stage_states()
+    payload["strategy_stage_states"] = stages
 
     breakout = payload.get("fifteen_m_swing_break")
     confirmation = payload.get("confirmation_5m")
@@ -1115,10 +1221,23 @@ def wait_result(symbol, reason, extra=None):
         "sl": payload.get("stop_loss"),
         "tp1": payload.get("tp1"),
         "tp2": payload.get("tp2"),
+        "stage_states": stages,
+        "swing_detection_state": stages.get("swing_detection"),
+        "fifteen_m_bos_state": stages.get("fifteen_m_bos"),
+        "fifteen_m_close_state": stages.get("fifteen_m_close"),
+        "ema_state": stages.get("ema"),
+        "five_m_confirmation_state": stages.get("five_m_confirmation"),
+        "consolidation_state": stages.get("consolidation_gate"),
+        "swing_sl_state": stages.get("swing_sl"),
+        "tp_rr_state": stages.get("tp_rr"),
+        "execution_state": stages.get("execution"),
+        "strategy_cycle": payload.get("strategy_cycle"),
     }
     payload["signal_diagnostics"] = diagnostics
     payload["entry_strategy_debug"] = diagnostics.copy()
     payload["strategy_debug"] = diagnostics.copy()
+    if isinstance(payload.get("strategy_cycle"), dict):
+        print("STRICT_STRATEGY_CYCLE =", payload["strategy_cycle"])
     return payload
 
 
@@ -1144,10 +1263,23 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             pass
 
     if closed_15m is None or len(closed_15m) < 25:
+        stages = strategy_stage_states(
+            market_data=STAGE_FAILED,
+            execution=STAGE_BLOCKED,
+        )
         return wait_result(
             normalized_symbol,
             "WAIT_NOT_ENOUGH_15M_DATA",
-            base_meta,
+            {
+                **base_meta,
+                "strategy_stage_states": stages,
+                "strategy_cycle": strategy_cycle_diagnostics(
+                    normalized_symbol,
+                    closed_15m,
+                    stage_states=stages,
+                    block_reason="WAIT_NOT_ENOUGH_15M_DATA",
+                ),
+            },
         )
 
     trend = trend_filter(closed_15m, normalized_symbol)
@@ -1156,17 +1288,6 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
     base_meta["market_condition"] = (
         "CONSOLIDATION" if consolidation.get("is_consolidation") else "STRUCTURE"
     )
-    if consolidation.get("is_consolidation"):
-        clear_symbol_breakout_watches(
-            normalized_symbol,
-            "market entered consolidation",
-        )
-        return wait_result(normalized_symbol, "WAIT_CONSOLIDATION", {
-            **base_meta,
-            **bias_scores_from_context(trend=trend),
-            "trend_15m": trend,
-        })
-
     breakout = evaluate_15m_breakout(closed_15m, normalized_symbol)
     base_meta = {
         **base_meta,
@@ -1174,13 +1295,72 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
     }
 
     if breakout["side"] not in ["BUY", "SELL"]:
+        stages = strategy_stage_states(
+            swing_detection=(
+                STAGE_PASSED if breakout.get("swings") else STAGE_FAILED
+            ),
+            fifteen_m_bos=STAGE_FAILED,
+            consolidation_gate=(
+                STAGE_BLOCKED
+                if consolidation.get("is_consolidation")
+                else STAGE_PASSED
+            ),
+            execution=STAGE_BLOCKED,
+        )
         return wait_result(normalized_symbol, breakout["reason"], {
             **base_meta,
             "trend_15m": trend,
             "fifteen_m_swing_break": breakout,
+            "strategy_stage_states": stages,
+            "strategy_cycle": strategy_cycle_diagnostics(
+                normalized_symbol,
+                closed_15m,
+                breakout=breakout,
+                trend=trend,
+                consolidation=consolidation,
+                stage_states=stages,
+                block_reason=breakout["reason"],
+            ),
         })
 
     side = breakout["side"]
+    watch_status = str(breakout.get("watch_status") or "").upper()
+    if (
+        breakout.get("remembered")
+        and watch_status == BLOCKED_BREAKOUT_STATUS
+        and not consolidation.get("is_consolidation")
+    ):
+        clear_breakout_watch(
+            normalized_symbol,
+            side,
+            "consolidation ended; fresh BOS required",
+        )
+        stages = strategy_stage_states(
+            swing_detection=STAGE_PASSED,
+            fifteen_m_bos=STAGE_FAILED,
+            consolidation_gate=STAGE_PASSED,
+            execution=STAGE_BLOCKED,
+        )
+        return wait_result(
+            normalized_symbol,
+            "WAIT_FRESH_15M_BOS_AFTER_CONSOLIDATION",
+            {
+                **base_meta,
+                "trend_15m": trend,
+                "expired_15m_setup": breakout.get("watch"),
+                "strategy_stage_states": stages,
+                "strategy_cycle": strategy_cycle_diagnostics(
+                    normalized_symbol,
+                    closed_15m,
+                    breakout=breakout,
+                    trend=trend,
+                    consolidation=consolidation,
+                    stage_states=stages,
+                    block_reason="WAIT_FRESH_15M_BOS_AFTER_CONSOLIDATION",
+                ),
+            },
+        )
+
     ema_allowed = (
         side == "BUY" and bool(trend.get("buy_allowed"))
     ) or (
@@ -1192,12 +1372,34 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             side,
             "EMA no longer permits remembered direction",
         )
+        stages = strategy_stage_states(
+            swing_detection=STAGE_PASSED,
+            fifteen_m_bos=STAGE_PASSED,
+            fifteen_m_close=STAGE_PASSED,
+            ema=STAGE_FAILED,
+            consolidation_gate=(
+                STAGE_BLOCKED
+                if consolidation.get("is_consolidation")
+                else STAGE_PASSED
+            ),
+            execution=STAGE_BLOCKED,
+        )
         return wait_result(normalized_symbol, "WAIT_EMA_NOT_ALLOWED", {
             **base_meta,
             "trend_15m": trend,
             "fifteen_m_swing_break": breakout,
             "blocked_by": "WAIT_EMA_NOT_ALLOWED",
             "blocker_rule_name": "strict_15m_ema_permission",
+            "strategy_stage_states": stages,
+            "strategy_cycle": strategy_cycle_diagnostics(
+                normalized_symbol,
+                closed_15m,
+                breakout=breakout,
+                trend=trend,
+                consolidation=consolidation,
+                stage_states=stages,
+                block_reason="WAIT_EMA_NOT_ALLOWED",
+            ),
         })
 
     prior_close = last_position_closed_time(normalized_symbol)
@@ -1211,6 +1413,18 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             None,
         )
         shared.save_fifteen_m_swing_watch()
+        stages = strategy_stage_states(
+            swing_detection=STAGE_PASSED,
+            fifteen_m_bos=STAGE_PASSED,
+            fifteen_m_close=STAGE_PASSED,
+            ema=STAGE_PASSED,
+            consolidation_gate=(
+                STAGE_BLOCKED
+                if consolidation.get("is_consolidation")
+                else STAGE_PASSED
+            ),
+            execution=STAGE_BLOCKED,
+        )
         return wait_result(normalized_symbol, "WAIT_SETUP_BEFORE_PREVIOUS_CLOSE", {
             **base_meta,
             "trend_15m": trend,
@@ -1218,6 +1432,16 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             "previous_position_closed_at": prior_close.isoformat(),
             "blocked_by": "post_close_setup_freshness",
             "blocker_rule_name": "bos_after_previous_position_close",
+            "strategy_stage_states": stages,
+            "strategy_cycle": strategy_cycle_diagnostics(
+                normalized_symbol,
+                closed_15m,
+                breakout=breakout,
+                trend=trend,
+                consolidation=consolidation,
+                stage_states=stages,
+                block_reason="WAIT_SETUP_BEFORE_PREVIOUS_CLOSE",
+            ),
         })
 
     breakout_meta = {
@@ -1259,7 +1483,29 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
                 swing=breakout.get("swing"),
                 break_type=breakout.get("break_type"),
                 invalidation_level=breakout.get("invalidation_level"),
+                status=(
+                    BLOCKED_BREAKOUT_STATUS
+                    if consolidation.get("is_consolidation")
+                    else "PENDING"
+                ),
             )
+        stages = strategy_stage_states(
+            swing_detection=STAGE_PASSED,
+            fifteen_m_bos=(
+                STAGE_BLOCKED
+                if consolidation.get("is_consolidation")
+                else STAGE_PASSED
+            ),
+            fifteen_m_close=STAGE_PASSED,
+            ema=STAGE_PASSED,
+            five_m_confirmation=STAGE_FAILED,
+            consolidation_gate=(
+                STAGE_BLOCKED
+                if consolidation.get("is_consolidation")
+                else STAGE_PASSED
+            ),
+            execution=STAGE_BLOCKED,
+        )
         return wait_result(normalized_symbol, five_m.get("reason") or "WAIT_5M_CONFIRMATION", {
             **setup_meta,
             "remembered_breakout": True,
@@ -1267,6 +1513,57 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
                 "WAIT_REMEMBERED_BREAKOUT"
                 if breakout.get("remembered")
                 else "WAIT_5M_CONFIRMATION"
+            ),
+            "strategy_stage_states": stages,
+            "strategy_cycle": strategy_cycle_diagnostics(
+                normalized_symbol,
+                closed_15m,
+                breakout=breakout,
+                trend=trend,
+                confirmation=five_m,
+                consolidation=consolidation,
+                stage_states=stages,
+                block_reason=five_m.get("reason") or "WAIT_5M_CONFIRMATION",
+            ),
+        })
+
+    if consolidation.get("is_consolidation"):
+        save_remembered_breakout(
+            normalized_symbol,
+            side,
+            breakout["level"],
+            breakout["break_time"],
+            breakout["break_close"],
+            BLOCKED_BREAKOUT_STATUS,
+            break_close_time=breakout.get("break_close_time"),
+            required_buffer=breakout.get("bos_buffer"),
+            swing=breakout.get("swing"),
+            break_type=breakout.get("break_type"),
+            invalidation_level=breakout.get("invalidation_level"),
+            status=BLOCKED_BREAKOUT_STATUS,
+        )
+        stages = strategy_stage_states(
+            swing_detection=STAGE_PASSED,
+            fifteen_m_bos=STAGE_BLOCKED,
+            fifteen_m_close=STAGE_PASSED,
+            ema=STAGE_PASSED,
+            five_m_confirmation=STAGE_PASSED,
+            consolidation_gate=STAGE_BLOCKED,
+            execution=STAGE_BLOCKED,
+        )
+        return wait_result(normalized_symbol, "WAIT_CONSOLIDATION", {
+            **setup_meta,
+            "blocked_breakout_status": BLOCKED_BREAKOUT_STATUS,
+            "strategy_stage_states": stages,
+            "strategy_cycle": strategy_cycle_diagnostics(
+                normalized_symbol,
+                closed_15m,
+                breakout=breakout,
+                trend=trend,
+                confirmation=five_m,
+                consolidation=consolidation,
+                stage_states=stages,
+                block_reason="WAIT_CONSOLIDATION",
             ),
         })
 
@@ -1282,13 +1579,55 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
         setup_break_time=breakout.get("break_time"),
     )
     if not levels.get("ok"):
+        stages = strategy_stage_states(
+            swing_detection=STAGE_PASSED,
+            fifteen_m_bos=STAGE_PASSED,
+            fifteen_m_close=STAGE_PASSED,
+            ema=STAGE_PASSED,
+            five_m_confirmation=STAGE_PASSED,
+            consolidation_gate=STAGE_PASSED,
+            swing_sl=STAGE_FAILED,
+            execution=STAGE_BLOCKED,
+        )
         return wait_result(normalized_symbol, levels.get("reason") or "WAIT_INVALID_RISK_LEVELS", {
             **setup_meta,
             "swing_sl_debug": levels,
+            "strategy_stage_states": stages,
+            "strategy_cycle": strategy_cycle_diagnostics(
+                normalized_symbol,
+                closed_15m,
+                breakout=breakout,
+                trend=trend,
+                confirmation=five_m,
+                consolidation=consolidation,
+                stage_states=stages,
+                block_reason=levels.get("reason") or "WAIT_INVALID_RISK_LEVELS",
+            ),
         })
 
     buy_pct = 85 if side == "BUY" else 15
     sell_pct = 85 if side == "SELL" else 15
+    completed_stages = strategy_stage_states(
+        swing_detection=STAGE_PASSED,
+        fifteen_m_bos=STAGE_PASSED,
+        fifteen_m_close=STAGE_PASSED,
+        ema=STAGE_PASSED,
+        five_m_confirmation=STAGE_PASSED,
+        consolidation_gate=STAGE_PASSED,
+        swing_sl=STAGE_PASSED,
+        tp_rr=STAGE_PASSED,
+        execution=STAGE_PASSED,
+    )
+    completed_cycle = strategy_cycle_diagnostics(
+        normalized_symbol,
+        closed_15m,
+        breakout=breakout,
+        trend=trend,
+        confirmation=five_m,
+        consolidation=consolidation,
+        stage_states=completed_stages,
+        execution_decision=side,
+    )
     result = {
         "symbol": normalized_symbol,
         "signal": side,
@@ -1353,6 +1692,8 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
         "blocked_reason": None,
         "block_reason": None,
         "blocker_rule_name": None,
+        "strategy_stage_states": completed_stages,
+        "strategy_cycle": completed_cycle,
         "signal_diagnostics": {
             "symbol": normalized_symbol,
             "final_signal": side,
@@ -1381,6 +1722,17 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             "sl": levels["stop_loss"],
             "tp1": levels["tp1"],
             "tp2": levels["tp2"],
+            "stage_states": completed_stages,
+            "swing_detection_state": completed_stages["swing_detection"],
+            "fifteen_m_bos_state": completed_stages["fifteen_m_bos"],
+            "fifteen_m_close_state": completed_stages["fifteen_m_close"],
+            "ema_state": completed_stages["ema"],
+            "five_m_confirmation_state": completed_stages["five_m_confirmation"],
+            "consolidation_state": completed_stages["consolidation_gate"],
+            "swing_sl_state": completed_stages["swing_sl"],
+            "tp_rr_state": completed_stages["tp_rr"],
+            "execution_state": completed_stages["execution"],
+            "strategy_cycle": completed_cycle,
         },
         "debug_reasons": [
             "15m EMA supports trade",
@@ -1407,6 +1759,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
     result["smc_direction"] = side
     result["fifteen_m_close_confirmed"] = True
     result["five_m_confirmation"] = True
+    print("STRICT_STRATEGY_CYCLE =", completed_cycle)
     return result
 
 

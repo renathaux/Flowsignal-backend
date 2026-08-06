@@ -2384,11 +2384,21 @@ def load_fifteen_m_swing_watch():
         return {}
 
 def save_fifteen_m_swing_watch():
+    temp_file = None
     try:
-        with open(FIFTEEN_M_SWING_WATCH_FILE, "w", encoding="utf-8") as f:
+        temp_file = f"{FIFTEEN_M_SWING_WATCH_FILE}.{uuid.uuid4().hex}.tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(FIFTEEN_M_SWING_WATCH, f, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_file, FIFTEEN_M_SWING_WATCH_FILE)
     except Exception as exc:
         print("FIFTEEN_M_SWING_WATCH_SAVE_ERROR =", str(exc))
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except OSError:
+                pass
 
 FIFTEEN_M_SWING_WATCH = load_fifteen_m_swing_watch()
 
