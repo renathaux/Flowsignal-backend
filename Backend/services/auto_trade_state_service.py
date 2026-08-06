@@ -1,0 +1,201 @@
+"""Durable, backend-authoritative PAPER/LIVE Auto Trade preferences."""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+from datetime import datetime, timezone
+
+from db import Base, SessionLocal, engine
+from models import AutoTradeStateAudit, RuntimeSetting
+
+
+PAPER_SETTING = "paper_auto_trade_enabled"
+LIVE_SETTING = "live_auto_trade_enabled"
+SETTING_NAMES = {"paper": PAPER_SETTING, "live": LIVE_SETTING}
+_LOCK = threading.RLock()
+
+Base.metadata.create_all(bind=engine)
+
+
+def _as_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def _utc_iso(value):
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def persistence_info():
+    database_url = str(os.getenv("DATABASE_URL") or "")
+    backend = engine.url.get_backend_name()
+    durable = backend not in {"sqlite"}
+    return {
+        "backend": backend,
+        "durable_across_deployments": durable,
+        "configured_by_database_url": bool(database_url),
+        "warning": None if durable else (
+            "SQLite is process-local on Render unless its directory is mounted "
+            "to a persistent disk. Configure DATABASE_URL with durable Postgres."
+        ),
+    }
+
+
+def _legacy_values(legacy_path):
+    if not legacy_path or not os.path.exists(legacy_path):
+        return None
+    try:
+        with open(legacy_path, "r", encoding="utf-8") as file:
+            state = json.load(file)
+        return {
+            "paper": _as_bool(state.get("paper_auto_enabled")),
+            "live": _as_bool(state.get("live_auto_enabled")),
+        }
+    except Exception:
+        return None
+
+
+def load_state(legacy_path=None, session_factory=None):
+    factory = session_factory or SessionLocal
+    with factory() as session:
+        rows = {
+            mode: session.get(RuntimeSetting, setting_name)
+            for mode, setting_name in SETTING_NAMES.items()
+        }
+        if any(rows.values()):
+            timestamps = [row.updated_at for row in rows.values() if row is not None]
+            latest = max(timestamps) if timestamps else None
+            return {
+                "paper_enabled": _as_bool(
+                    rows["paper"].setting_value if rows["paper"] else False
+                ),
+                "live_enabled": _as_bool(
+                    rows["live"].setting_value if rows["live"] else False
+                ),
+                "updated_at": _utc_iso(latest),
+                "updated_by": next(
+                    (row.updated_by for row in rows.values() if row is not None),
+                    "unknown",
+                ),
+                "source": "runtime_setting",
+                "persistence": persistence_info(),
+            }
+
+    legacy = _legacy_values(legacy_path)
+    if legacy is not None:
+        return save_state(
+            paper_enabled=legacy["paper"],
+            live_enabled=legacy["live"],
+            updated_by="legacy_migration",
+            request_source="startup_migration",
+            reason="Migrated auto_trade_state.json to RuntimeSetting",
+            session_factory=factory,
+        )
+
+    return {
+        "paper_enabled": _as_bool(os.getenv("PAPER_AUTO_TRADE_ENABLED", False)),
+        "live_enabled": _as_bool(os.getenv("LIVE_AUTO_TRADE_ENABLED", False)),
+        "updated_at": None,
+        "updated_by": "environment" if (
+            os.getenv("PAPER_AUTO_TRADE_ENABLED") is not None
+            or os.getenv("LIVE_AUTO_TRADE_ENABLED") is not None
+        ) else "system",
+        "source": "environment" if (
+            os.getenv("PAPER_AUTO_TRADE_ENABLED") is not None
+            or os.getenv("LIVE_AUTO_TRADE_ENABLED") is not None
+        ) else "default",
+        "persistence": persistence_info(),
+    }
+
+
+def save_state(
+    *, paper_enabled, live_enabled, updated_by="user",
+    request_source="api", reason=None, active_broker_account=None,
+    broker_environment=None, session_factory=None, now=None,
+):
+    factory = session_factory or SessionLocal
+    updated_at = now or datetime.now(timezone.utc)
+    requested = {
+        "paper": bool(paper_enabled),
+        "live": bool(live_enabled),
+    }
+
+    with _LOCK:
+        with factory() as session:
+            previous = {}
+            for mode, setting_name in SETTING_NAMES.items():
+                row = session.get(RuntimeSetting, setting_name)
+                previous[mode] = _as_bool(row.setting_value) if row else False
+                if row is None:
+                    row = RuntimeSetting(setting_name=setting_name)
+                    session.add(row)
+                row.setting_value = "true" if requested[mode] else "false"
+                row.updated_at = updated_at
+                row.updated_by = str(updated_by or "user")
+
+            for mode in ["paper", "live"]:
+                if previous[mode] == requested[mode]:
+                    continue
+                session.add(AutoTradeStateAudit(
+                    trading_mode=mode.upper(),
+                    previous_enabled=previous[mode],
+                    new_enabled=requested[mode],
+                    updated_by=str(updated_by or "user"),
+                    active_broker_account=(
+                        str(active_broker_account)
+                        if active_broker_account not in (None, "") else None
+                    ),
+                    broker_environment=(
+                        str(broker_environment)
+                        if broker_environment not in (None, "") else None
+                    ),
+                    timestamp=updated_at,
+                    request_source=str(request_source or "api"),
+                    reason=str(reason) if reason else None,
+                ))
+            session.commit()
+
+    return {
+        "paper_enabled": requested["paper"],
+        "live_enabled": requested["live"],
+        "updated_at": _utc_iso(updated_at),
+        "updated_by": str(updated_by or "user"),
+        "source": "runtime_setting",
+        "request_source": str(request_source or "api"),
+        "reason": reason,
+        "persistence": persistence_info(),
+    }
+
+
+def latest_changes(limit=10, session_factory=None):
+    factory = session_factory or SessionLocal
+    with factory() as session:
+        rows = (
+            session.query(AutoTradeStateAudit)
+            .order_by(AutoTradeStateAudit.timestamp.desc())
+            .limit(max(1, min(int(limit), 100)))
+            .all()
+        )
+        return [{
+            "mode": row.trading_mode,
+            "previous_enabled": bool(row.previous_enabled),
+            "new_enabled": bool(row.new_enabled),
+            "updated_by": row.updated_by,
+            "active_broker_account": row.active_broker_account,
+            "broker_environment": row.broker_environment,
+            "timestamp": _utc_iso(row.timestamp),
+            "request_source": row.request_source,
+            "reason": row.reason,
+        } for row in rows]
