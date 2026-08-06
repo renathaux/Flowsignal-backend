@@ -78,6 +78,11 @@ from services.settings_service import (
     load_feature_flags,
     load_risk_settings,
 )
+from services.auto_trade_state_service import (
+    latest_changes as get_auto_trade_state_changes,
+    load_state as load_durable_auto_trade_state,
+    save_state as save_durable_auto_trade_state,
+)
 from paths import DATA_DIR
 from risk_management.account_balance import (
     log_account_balance_verification_failed as risk_log_account_balance_verification_failed,
@@ -165,15 +170,26 @@ async def log_unhandled_api_errors(request: Request, call_next):
 
 @app.on_event("startup")
 def start_background_task():
+    global BACKGROUND_THREAD
     print("Startup OK - warming panel cache")
     warm_panel_cache_from_persisted_candles()
     try:
         start_ctrader_live_price_stream()
     except Exception as exc:
         print("CTRADER_LIVE_STREAM_START_ERROR =", str(exc))
-    thread = threading.Thread(target=background_fetch)
-    thread.daemon = True
-    thread.start()
+    with BACKGROUND_THREAD_LOCK:
+        if BACKGROUND_THREAD is not None and BACKGROUND_THREAD.is_alive():
+            print("BACKGROUND_FETCH_ALREADY_RUNNING =", {
+                "thread_id": BACKGROUND_THREAD.ident,
+            })
+            return
+        BACKGROUND_THREAD = threading.Thread(
+            target=background_fetch,
+            name="flowsignal-trading-engine",
+            daemon=True,
+        )
+        BACKGROUND_THREAD.start()
+        ENGINE_RUNTIME_STATE["loop_thread_id"] = BACKGROUND_THREAD.ident
     
 app.add_middleware(
     CORSMiddleware,
@@ -279,6 +295,21 @@ LIVE_PANEL_META_CACHE = {
     "last_update": None,
     "last_error": None,
 }
+ENGINE_RUNTIME_STATE = {
+    "process_id": os.getpid(),
+    "started_at": time.time(),
+    "loop_thread_id": None,
+    "loop_iterations": 0,
+    "last_loop_started": None,
+    "last_loop_completed": None,
+    "last_loop_error": None,
+    "last_strategy_check": None,
+    "last_valid_setup": None,
+    "last_order_attempt": None,
+    "last_broker_response": None,
+}
+BACKGROUND_THREAD_LOCK = threading.Lock()
+BACKGROUND_THREAD = None
 
 MIN_LIVE_TRADE_RR = 1.20
 MAX_LIVE_TRADE_RR = 2.00
@@ -1518,13 +1549,18 @@ def refresh_live_panel_meta(panel_data):
 
 def background_fetch():
     while True:
+        ENGINE_RUNTIME_STATE["last_loop_started"] = time.time()
+        ENGINE_RUNTIME_STATE["loop_iterations"] += 1
         try:
             print("🔄 BACKGROUND FETCH (once for all users)")
             if refresh_panel_cache(reason="background"):
                 refresh_live_panel_meta(PANEL_CACHE["data"])
                 print("✅ Cache updated globally")
+            ENGINE_RUNTIME_STATE["last_loop_completed"] = time.time()
+            ENGINE_RUNTIME_STATE["last_loop_error"] = None
 
         except Exception as e:
+            ENGINE_RUNTIME_STATE["last_loop_error"] = str(e)
             print("❌ Background fetch error:", e)
 
         time.sleep(CACHE_SECONDS)
@@ -1569,6 +1605,121 @@ def health_check():
             "live": LIVE_AUTO_TRADE_ENABLED.get("enabled"),
         },
         "feature_flags": load_feature_flags(),
+    }
+
+
+def auto_trade_state_response():
+    preference_enabled = bool(LIVE_AUTO_TRADE_ENABLED.get("enabled"))
+    execution_ready = bool(
+        LIVE_ACCOUNT_STATE.get("connected")
+        and LIVE_ACCOUNT_STATE.get("execution_ready")
+    )
+    return {
+        "paper_enabled": bool(AUTO_TRADE_ENABLED.get("enabled")),
+        "live_enabled": preference_enabled,
+        "live_execution_active": preference_enabled and execution_ready,
+        "live_execution_paused": preference_enabled and not execution_ready,
+        "pause_reason": (
+            "broker_not_execution_ready"
+            if preference_enabled and not execution_ready
+            else None
+        ),
+        **AUTO_TRADE_STATE_METADATA,
+    }
+
+
+@app.get("/settings/auto-trade-state")
+def get_auto_trade_state_setting(request: Request):
+    _authenticated_settings_user(request)
+    return {
+        **auto_trade_state_response(),
+        "recent_changes": get_auto_trade_state_changes(limit=10),
+    }
+
+
+@app.get("/system-status")
+def system_status():
+    now = time.time()
+    thread_alive = bool(
+        BACKGROUND_THREAD is not None and BACKGROUND_THREAD.is_alive()
+    )
+    last_loop = ENGINE_RUNTIME_STATE.get("last_loop_completed")
+    loop_age = now - float(last_loop) if last_loop else None
+    trading_engine_running = bool(
+        thread_alive
+        and loop_age is not None
+        and loop_age <= max(CACHE_SECONDS * 6, 120)
+    )
+    panel = PANEL_CACHE.get("data") or {}
+    feed_status = panel.get("feed_status") if isinstance(panel, dict) else {}
+    market_data = {}
+    for symbol in ["EURUSD", "XAUUSD"]:
+        feed = (feed_status or {}).get(symbol) or {}
+        source = feed.get("signal_data_source") or {}
+        market_data[symbol] = {
+            "available": source.get("available"),
+            "reason": source.get("reason"),
+            "source": source.get("used_for_signal") or source.get("candle_source"),
+            "latest_5m_time": source.get("latest_5m_time"),
+            "latest_15m_time": source.get("latest_15m_time"),
+            "latest_1h_time": source.get("latest_1h_time"),
+            "stale_5m_minutes": source.get("stale_5m_minutes"),
+            "stale_15m_minutes": source.get("stale_15m_minutes"),
+            "stale_1h_minutes": source.get("stale_1h_minutes"),
+            "missed_fetch_count": source.get("missed_fetch_count"),
+        }
+
+    risk_settings = load_risk_settings()
+    pl = LIVE_PANEL_META_CACHE.get("live_pl_sync") or {}
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "backend_online": True,
+        "trading_engine": {
+            "running": trading_engine_running,
+            "thread_alive": thread_alive,
+            "process_id": ENGINE_RUNTIME_STATE.get("process_id"),
+            "thread_id": ENGINE_RUNTIME_STATE.get("loop_thread_id"),
+            "loop_iterations": ENGINE_RUNTIME_STATE.get("loop_iterations"),
+            "last_loop_started": ENGINE_RUNTIME_STATE.get("last_loop_started"),
+            "last_loop_completed": last_loop,
+            "heartbeat_age_seconds": round(loop_age, 1) if loop_age is not None else None,
+            "last_error": ENGINE_RUNTIME_STATE.get("last_loop_error"),
+            "browser_required": False,
+        },
+        "auto_trade": auto_trade_state_response(),
+        "broker": {
+            "connected": bool(LIVE_ACCOUNT_STATE.get("connected")),
+            "execution_ready": bool(LIVE_ACCOUNT_STATE.get("execution_ready")),
+            "authorized": bool(LIVE_ACCOUNT_STATE.get("auth_ok")),
+            "account_id": LIVE_ACCOUNT_STATE.get("account_id"),
+            "environment": LIVE_ACCOUNT_STATE.get("mode"),
+            "reason": LIVE_ACCOUNT_STATE.get("reason"),
+            "last_success_at": LIVE_ACCOUNT_STATE.get("last_success_at"),
+        },
+        "market_data": market_data,
+        "last_strategy_check": ENGINE_RUNTIME_STATE.get("last_strategy_check"),
+        "last_valid_setup": ENGINE_RUNTIME_STATE.get("last_valid_setup"),
+        "last_order_attempt": ENGINE_RUNTIME_STATE.get("last_order_attempt"),
+        "last_broker_response": ENGINE_RUNTIME_STATE.get("last_broker_response"),
+        "block_reasons": {
+            symbol: {
+                "status": status.get("status"),
+                "reason": status.get("reason"),
+                "checked_at": status.get("checked_at"),
+            }
+            for symbol, status in LIVE_AUTO_STATUS_BY_SYMBOL.items()
+        },
+        "limits": {
+            "max_daily_loss": risk_settings.get("maxDailyLoss"),
+            "max_weekly_loss": risk_settings.get("maxWeeklyLoss"),
+            "daily_total_pl": pl.get("daily_total_pl", 0),
+            "weekly_total_pl": pl.get("weekly_total_pl", 0),
+            "daily_reset_at": pl.get("daily_reset_ts"),
+            "weekly_reset_at": pl.get("weekly_reset_ts"),
+            "timezone": "America/New_York",
+            "reset_hour": "17:00",
+        },
+        "recent_auto_trade_changes": get_auto_trade_state_changes(limit=10),
     }
 
 @app.get("/ctrader-diagnostics")
@@ -1677,6 +1828,7 @@ def auto_trade_status():
     return {
         **AUTO_TRADE_LAST_STATUS,
         "live_auto_status_by_symbol": LIVE_AUTO_STATUS_BY_SYMBOL,
+        "auto_trade": auto_trade_state_response(),
     }
 
 @app.post("/market-data-source")
@@ -2375,36 +2527,63 @@ def execute_trade(request: TradeRequest):
 AUTO_TRADE_ENABLED = {
     "enabled": False
 }
+LIVE_AUTO_TRADE_ENABLED = {
+    "enabled": False
+}
 AUTO_TRADE_STATE_FILE = os.path.join(
     DATA_DIR,
     "auto_trade_state.json"
 )
 
 LAST_EXECUTION_TIME = 0
+AUTO_TRADE_STATE_METADATA = {
+    "updated_at": None,
+    "updated_by": "system",
+    "source": "default",
+    "request_source": None,
+    "reason": None,
+    "persistence": {},
+}
 
 def load_auto_trade_state():
-    if not os.path.exists(AUTO_TRADE_STATE_FILE):
-        return
-
     try:
-        with open(AUTO_TRADE_STATE_FILE, "r", encoding="utf-8") as f:
-            state = json.load(f)
-
-        AUTO_TRADE_ENABLED["enabled"] = bool(state.get("paper_auto_enabled", False))
-        LIVE_AUTO_TRADE_ENABLED["enabled"] = bool(state.get("live_auto_enabled", False))
+        state = load_durable_auto_trade_state(AUTO_TRADE_STATE_FILE)
+        AUTO_TRADE_ENABLED["enabled"] = bool(state.get("paper_enabled"))
+        LIVE_AUTO_TRADE_ENABLED["enabled"] = bool(state.get("live_enabled"))
+        AUTO_TRADE_STATE_METADATA.update({
+            key: state.get(key)
+            for key in AUTO_TRADE_STATE_METADATA
+        })
         print("AUTO TRADE STATE LOADED:", state)
     except Exception as e:
         print("AUTO TRADE STATE LOAD ERROR:", e)
 
-def save_auto_trade_state():
+def save_auto_trade_state(
+    updated_by="system",
+    request_source="backend",
+    reason=None,
+):
     try:
-        with open(AUTO_TRADE_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump({
-                "paper_auto_enabled": AUTO_TRADE_ENABLED["enabled"],
-                "live_auto_enabled": LIVE_AUTO_TRADE_ENABLED["enabled"],
-            }, f, indent=2)
+        state = save_durable_auto_trade_state(
+            paper_enabled=AUTO_TRADE_ENABLED["enabled"],
+            live_enabled=LIVE_AUTO_TRADE_ENABLED["enabled"],
+            updated_by=updated_by,
+            request_source=request_source,
+            reason=reason,
+            active_broker_account=LIVE_ACCOUNT_STATE.get("account_id")
+            if "LIVE_ACCOUNT_STATE" in globals() else None,
+            broker_environment=LIVE_ACCOUNT_STATE.get("mode")
+            if "LIVE_ACCOUNT_STATE" in globals() else None,
+        )
+        AUTO_TRADE_STATE_METADATA.update({
+            key: state.get(key)
+            for key in AUTO_TRADE_STATE_METADATA
+        })
+        print("AUTO_TRADE_STATE_PERSISTED =", state)
+        return state
     except Exception as e:
         print("AUTO TRADE STATE SAVE ERROR:", e)
+        raise
 
 def get_last_execution_time():
     live_times = [
@@ -2422,8 +2601,20 @@ def paper_auto_toggle(payload: dict):
         payload.get("enabled", False)
     )
 
+    previous_enabled = AUTO_TRADE_ENABLED["enabled"]
     AUTO_TRADE_ENABLED["enabled"] = enabled
-    save_auto_trade_state()
+    try:
+        state = save_auto_trade_state(
+            updated_by="web_user",
+            request_source="paper_auto_toggle",
+            reason="User changed Paper Auto",
+        )
+    except Exception as exc:
+        AUTO_TRADE_ENABLED["enabled"] = previous_enabled
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not persist Paper Auto state: {exc}",
+        ) from exc
 
     print(
         "AUTO TRADE STATE:",
@@ -2432,12 +2623,9 @@ def paper_auto_toggle(payload: dict):
 
     return {
         "status": "ok",
-        "enabled": AUTO_TRADE_ENABLED["enabled"]
+        "enabled": AUTO_TRADE_ENABLED["enabled"],
+        "state": state,
     }
-
-LIVE_AUTO_TRADE_ENABLED = {
-    "enabled": False
-}
 
 load_auto_trade_state()
 
@@ -2639,6 +2827,20 @@ def set_auto_trade_status(symbol=None, signal=None, action=None, status="WAITING
     timestamp = time.time()
     normalized_symbol = normalize_symbol(symbol) if symbol else None
     normalized_status = normalize_live_auto_status(status)
+    ENGINE_RUNTIME_STATE["last_strategy_check"] = {
+        "symbol": normalized_symbol,
+        "signal": signal,
+        "status": normalized_status,
+        "reason": reason,
+        "timestamp": timestamp,
+    }
+    if str(signal or "").upper() in ["BUY", "SELL"]:
+        ENGINE_RUNTIME_STATE["last_valid_setup"] = {
+            "symbol": normalized_symbol,
+            "signal": str(signal).upper(),
+            "timestamp": timestamp,
+            "details": details,
+        }
 
     AUTO_TRADE_LAST_STATUS.update({
         "symbol": normalized_symbol,
@@ -7117,13 +7319,15 @@ def sync_live_positions(panel_data=None):
     )
 
     if not connected:
-        if LIVE_AUTO_TRADE_ENABLED["enabled"]:
-            LIVE_AUTO_TRADE_ENABLED["enabled"] = False
-            save_auto_trade_state()
-
         set_auto_trade_status(
             status="BLOCKED",
-            reason="Live Auto paused — broker disconnected"
+            reason="Live Auto paused — broker disconnected",
+            details={
+                "preference_remains_enabled": bool(
+                    LIVE_AUTO_TRADE_ENABLED["enabled"]
+                ),
+                "execution_ready": False,
+            },
         )
 
         print("LIVE_POSITION_SYNC:", {
@@ -8211,7 +8415,11 @@ def forget_ctrader_account_endpoint(payload: dict):
 @app.post("/disconnect-ctrader")
 def disconnect_ctrader():
     LIVE_AUTO_TRADE_ENABLED["enabled"] = False
-    save_auto_trade_state()
+    save_auto_trade_state(
+        updated_by="web_user",
+        request_source="disconnect_ctrader",
+        reason="User explicitly disconnected cTrader",
+    )
 
     disconnected_at = time.time()
 
@@ -8443,8 +8651,20 @@ def live_auto_toggle(payload: dict):
             "message": "Connect cTrader broker before enabling Auto Trade"
         }
 
+    previous_enabled = LIVE_AUTO_TRADE_ENABLED["enabled"]
     LIVE_AUTO_TRADE_ENABLED["enabled"] = enabled
-    save_auto_trade_state()
+    try:
+        state = save_auto_trade_state(
+            updated_by=str(payload.get("updated_by") or "web_user"),
+            request_source=str(payload.get("source") or "live_auto_toggle"),
+            reason="User changed Live Auto",
+        )
+    except Exception as exc:
+        LIVE_AUTO_TRADE_ENABLED["enabled"] = previous_enabled
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not persist Live Auto state: {exc}",
+        ) from exc
 
     print(
         "LIVE AUTO TRADE STATE:",
@@ -8453,7 +8673,8 @@ def live_auto_toggle(payload: dict):
 
     return {
         "status": "ok",
-        "enabled": LIVE_AUTO_TRADE_ENABLED["enabled"]
+        "enabled": LIVE_AUTO_TRADE_ENABLED["enabled"],
+        "state": state,
     }
 
 
@@ -9721,6 +9942,16 @@ def execute_live_order_core(payload: dict, source="manual"):
         "max_risk_usd": max_risk_usd,
     })
 
+    ENGINE_RUNTIME_STATE["last_order_attempt"] = {
+        "symbol": symbol,
+        "side": side,
+        "source": source,
+        "timestamp": time.time(),
+        "entry": trade_payload.get("entry"),
+        "sl": trade_payload.get("sl"),
+        "tp2": trade_payload.get("tp2"),
+        "volume_units": trade_payload.get("volume_units"),
+    }
     result = place_market_order(
         symbol=symbol,
         action=side,
@@ -9733,6 +9964,15 @@ def execute_live_order_core(payload: dict, source="manual"):
         risk=trade_payload.get("risk"),
         mode=trade_payload["mode"]
     )
+    ENGINE_RUNTIME_STATE["last_broker_response"] = {
+        "symbol": symbol,
+        "side": side,
+        "timestamp": time.time(),
+        "ok": bool(result.get("ok")),
+        "position_id": result.get("position_id"),
+        "order_id": result.get("order_id"),
+        "reason": result.get("reason") or result.get("message"),
+    }
 
     if trade_payload.get("news_event_id") and isinstance(
         trade_payload.get("news_event"), dict
