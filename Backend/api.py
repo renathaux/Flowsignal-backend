@@ -2053,6 +2053,27 @@ def panel_data(force: int = 0):
             else "no_valid_cache"
         ),
         "cache_age_seconds": round(age, 1),
+        "stale_data": bool(
+            PANEL_REFRESH_STATE.get("last_error")
+            or not cache_valid
+        ),
+        "last_successful_refresh": PANEL_REFRESH_STATE.get("last_success"),
+        "backend_decision_timestamps": {
+            symbol: (
+                ((data.get(symbol) or {}).get("strategy_cycle") or {}).get(
+                    "evaluation_time"
+                )
+            )
+            for symbol in ["EURUSD", "XAUUSD"]
+        },
+        "evaluated_m15_candles": {
+            symbol: (
+                ((data.get(symbol) or {}).get("strategy_cycle") or {}).get(
+                    "evaluated_m15_candle"
+                )
+            )
+            for symbol in ["EURUSD", "XAUUSD"]
+        },
         "refresh_seconds": CACHE_SECONDS,
         "error": PANEL_REFRESH_STATE.get("last_error"),
         "cache_valid": cache_valid,
