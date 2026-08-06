@@ -983,7 +983,7 @@ def replace_cached_event_with_actual(symbol, original_event, updated_event):
         _CALENDAR_CACHE["events"] = updated_events
 
 
-def refresh_actual_after_release(event, symbol, now=None):
+def refresh_actual_after_release(event, symbol, now=None, timeout=8):
     now = now or utc_now()
     release_time = get_event_time(event)
     if not release_time:
@@ -1028,6 +1028,7 @@ def refresh_actual_after_release(event, symbol, now=None):
     })
 
     api_events, provider_name, statuses = fetch_api_calendar_events_for_actual_refresh(
+        timeout=timeout,
         now=now,
     )
     _CALENDAR_CACHE["api_status"] = statuses
@@ -1819,12 +1820,13 @@ def get_news_impact(
     candles_15m=None,
     entry_price=None,
     now=None,
+    provider_timeout=8,
 ):
     normalized_symbol = normalize_symbol(symbol)
     now = now or utc_now()
 
     try:
-        events = fetch_calendar_events(now=now)
+        events = fetch_calendar_events(now=now, timeout=provider_timeout)
     except Exception as exc:
         _CALENDAR_CACHE["last_source"] = "manual"
         _CALENDAR_CACHE["last_error"] = str(exc)
@@ -1876,7 +1878,12 @@ def get_news_impact(
         )
 
     original_event = event
-    event = refresh_actual_after_release(event, normalized_symbol, now=now)
+    event = refresh_actual_after_release(
+        event,
+        normalized_symbol,
+        now=now,
+        timeout=provider_timeout,
+    )
     if event is not original_event:
         original_key = event_identity_key(normalized_symbol, original_event)
         events = [
