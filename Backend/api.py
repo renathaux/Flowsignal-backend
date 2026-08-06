@@ -1584,6 +1584,7 @@ def news_impact(symbol: str = "EURUSD"):
         candles_5m=context["candles_5m"],
         candles_15m=context["candles_15m"],
         entry_price=context["entry_price"],
+        provider_timeout=2,
     )
 
 @app.get("/health-check")
