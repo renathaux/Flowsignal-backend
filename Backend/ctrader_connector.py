@@ -20,6 +20,10 @@ from zoneinfo import ZoneInfo
 
 from pathlib import Path
 from paths import CANDLE_CACHE_DIR, DATA_DIR
+from services.broker_account_state_service import (
+    load_active_account_selection,
+    save_active_account_selection,
+)
 from services.settings_service import get_tp1_ratio_of_tp2
 
 try:
@@ -387,13 +391,12 @@ def get_connection_state(force=False):
     return check_ctrader_connection_capability(force=force)
 
 def load_ctrader_account_settings():
-    if not CTRADER_ACCOUNTS_PATH.exists():
-        return dict(DEFAULT_CTRADER_ACCOUNT_SETTINGS)
-
-    try:
-        data = json.loads(CTRADER_ACCOUNTS_PATH.read_text())
-    except Exception:
-        data = {}
+    data = {}
+    if CTRADER_ACCOUNTS_PATH.exists():
+        try:
+            data = json.loads(CTRADER_ACCOUNTS_PATH.read_text())
+        except Exception:
+            data = {}
 
     settings = dict(DEFAULT_CTRADER_ACCOUNT_SETTINGS)
 
@@ -409,12 +412,21 @@ def load_ctrader_account_settings():
     if not isinstance(settings.get("forgotten_account_ids"), list):
         settings["forgotten_account_ids"] = []
 
+    durable_selection = load_active_account_selection()
+    if not settings.get("active_account_id") and durable_selection.get("active_account_id"):
+        settings["active_account_id"] = durable_selection["active_account_id"]
+        settings["active_account_env"] = durable_selection.get("active_account_env")
+
     return settings
 
 def save_ctrader_account_settings(settings):
     payload = dict(DEFAULT_CTRADER_ACCOUNT_SETTINGS)
     payload.update(settings or {})
     CTRADER_ACCOUNTS_PATH.write_text(json.dumps(payload, indent=2, default=str))
+    save_active_account_selection(
+        payload.get("active_account_id"),
+        payload.get("active_account_env"),
+    )
     return payload
 
 def clear_active_ctrader_account_balance_cache(settings=None, persist=True):
@@ -4262,6 +4274,39 @@ def extract_ctrader_account_display(
         },
     }
 
+
+def preserve_active_account_during_transient_refresh(
+    active_account_id,
+    refreshed_accounts,
+    cached_accounts,
+):
+    accounts = list(refreshed_accounts or [])
+    active_id = str(active_account_id or "").strip()
+    if not active_id or any(
+        str(item.get("account_id")) == active_id
+        for item in accounts
+        if isinstance(item, dict)
+    ):
+        return accounts
+
+    cached_active_account = next(
+        (
+            item
+            for item in (cached_accounts or [])
+            if isinstance(item, dict)
+            and str(item.get("account_id")) == active_id
+        ),
+        None,
+    )
+    if cached_active_account:
+        accounts.append({
+            **cached_active_account,
+            "status": "unavailable",
+            "unavailable": True,
+            "reason": "Temporary cTrader refresh failure; active selection preserved",
+        })
+    return accounts
+
 def fetch_ctrader_accounts(refresh=True):
     settings = load_ctrader_account_settings()
     active_account_id = get_active_ctrader_account_id()
@@ -4532,24 +4577,19 @@ def fetch_ctrader_accounts(refresh=True):
         )
 
         if active_account_id and not active_available:
+            accounts = preserve_active_account_during_transient_refresh(
+                active_account_id,
+                accounts,
+                settings.get("accounts", []),
+            )
             print("ACTIVE_ACCOUNT_SELECTED_DEBUG =", {
                 "ok": False,
                 "account_id": str(active_account_id),
                 "authorized_account_ids": account_ids,
                 "selected_account_source": get_selected_ctrader_account_source(),
                 "is_active_account_authorized": False,
-                "reason": CTRADER_UNAUTHORIZED_ACCOUNT_MESSAGE,
+                "reason": "active selection preserved while cTrader account details are unavailable",
             })
-            active_account_id = None
-            os.environ.pop("ACTIVE_CTRADER_ACCOUNT_ID", None)
-            os.environ.pop("ACTIVE_CTRADER_ACCOUNT_ENV", None)
-            os.environ.pop("CTRADER_ACCOUNT_ID", None)
-            update_env_file_values({
-                "ACTIVE_CTRADER_ACCOUNT_ID": "",
-                "ACTIVE_CTRADER_ACCOUNT_ENV": "",
-                "CTRADER_ACCOUNT_ID": "",
-            })
-            clear_ctrader_connection_cache()
 
         settings["active_account_id"] = str(active_account_id) if active_account_id else None
         settings["active_account_env"] = (
