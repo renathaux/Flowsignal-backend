@@ -1,6 +1,6 @@
 {
-  "active_account_id": "47857153",
-  "active_account_env": "live",
+  "active_account_id": "47810571",
+  "active_account_env": "demo",
   "accounts": [
     {
       "account_id": "47810571",
@@ -9,39 +9,12 @@
       "trader_login": 7578842,
       "traderLogin": 7578842,
       "broker_name": "ftmo",
-      "balance": 10141.22,
+      "balance": 9895.11,
       "equity": null,
       "currency": 15,
       "mode": "demo",
       "env": "demo",
       "isLive": false,
-      "status": "available",
-      "unavailable": false,
-      "expired": false,
-      "reason": null,
-      "money_digits": 2,
-      "raw": {
-        "brokerName": "ftmo",
-        "balance": 1014122,
-        "moneyDigits": 2,
-        "depositAssetId": 15,
-        "traderLogin": 7578842,
-        "accessRights": 0
-      }
-    },
-    {
-      "account_id": "47857153",
-      "ctidTraderAccountId": "47857153",
-      "account_number": 17150489,
-      "trader_login": 17150489,
-      "traderLogin": 17150489,
-      "broker_name": "ftmo",
-      "balance": 9886.93,
-      "equity": null,
-      "currency": 15,
-      "mode": "live",
-      "env": "live",
-      "isLive": true,
       "status": "active",
       "unavailable": false,
       "expired": false,
@@ -49,35 +22,35 @@
       "money_digits": 2,
       "raw": {
         "brokerName": "ftmo",
-        "balance": 988693,
+        "balance": 989511,
         "moneyDigits": 2,
         "depositAssetId": 15,
-        "traderLogin": 17150489,
+        "traderLogin": 7578842,
         "accessRights": 0
       }
     }
   ],
   "forgotten_account_ids": [],
-  "last_refresh": "2026-07-14T14:26:01.628296+00:00",
+  "last_refresh": "2026-08-06T12:59:13.794231+00:00",
   "active_account_snapshot": {
-    "active_account_id": "47857153",
-    "account_number": 17150489,
-    "broker_environment": "live",
-    "env_from_selection": "live",
+    "active_account_id": "47810571",
+    "account_number": 7578842,
+    "broker_environment": "demo",
+    "env_from_selection": "demo",
     "env_from_env_file": "live",
-    "raw_balance_from_ctrader": 988693,
+    "raw_balance_from_ctrader": 989511,
     "raw_equity_from_ctrader": null,
     "money_digits": 2,
-    "balance_returned_by_ctrader": 9886.93,
-    "equity_returned_by_ctrader": 9886.93,
+    "balance_returned_by_ctrader": 9895.11,
+    "equity_returned_by_ctrader": 9895.11,
     "equity_source": "balance_plus_unrealized_pnl",
     "balance_verified": true,
     "equity_verified": true,
     "cached_balance_used": false,
-    "cached_balance": 9886.93,
+    "cached_balance": 9895.11,
     "cached_equity": null,
-    "account_list_last_refresh": "2026-07-14T13:30:39.346965+00:00",
-    "snapshot_refreshed_at": "2026-07-14T13:31:22.911929+00:00"
+    "account_list_last_refresh": "2026-08-06T12:56:23.853781+00:00",
+    "snapshot_refreshed_at": "2026-08-06T12:56:28.353124+00:00"
   },
-  "active_account_snapshot_refreshed_at": "2026-07-14T13:31:22.911929+00:00"
+  "active_account_snapshot_refreshed_at": "2026-08-06T12:56:28.353124+00:00"
 }

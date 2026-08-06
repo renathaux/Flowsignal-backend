@@ -4,31 +4,7 @@
     "XAUUSD": null
   },
   "paper_active_trades": [],
-  "paper_trade_history": [
-    {
-      "trade_id": "paper-7f29cc9f-3fa7-46b0-88be-66845acebbbf",
-      "signal_key": "EURUSD:SELL:1.1422:1.14468:1.13922",
-      "setup_lock_key": "EURUSD:SELL:levels:1.1422:1.14468:1.13922",
-      "level_lock_key": "EURUSD:SELL:levels:1.1422:1.14468:1.13922",
-      "symbol": "EURUSD",
-      "side": "SELL",
-      "source": "paper",
-      "entry": 1.1422,
-      "sl": 1.14468,
-      "original_sl": 1.14468,
-      "tp1": 1.13982,
-      "tp2": 1.13922,
-      "opened_at": "2026-07-10 13:24:37 UTC",
-      "closed_at": "2026-07-14 02:42:55 UTC",
-      "closed_price": 1.139375,
-      "status": "CLOSED",
-      "result": "STALE_CLOSED",
-      "pips": 28.3,
-      "hit_tp1": false,
-      "profit_protected": false,
-      "protected_sl_price": null
-    }
-  ],
+  "paper_trade_history": [],
   "paper_setup_locks": {
     "XAUUSD:SELL:SELL_5M_ENTRY:4103.08:2026-07-09T10:45:00+00:00": {
       "symbol": "XAUUSD",
@@ -110,7 +86,61 @@
       "entry": 4096.77,
       "sl": 4084.03,
       "tp2": 4071.29
+    },
+    "XAUUSD:SELL:SELL_15M_SWING_BREAK_5M_CONFIRMED:4050.9:2026-07-15T01:55:00+00:00": {
+      "symbol": "XAUUSD",
+      "side": "SELL",
+      "trade_id": "paper-d84a5223-4d4d-4307-9f45-a3d4170047b6",
+      "opened_at": "2026-07-15 01:55:11 UTC",
+      "entry": 4041.03,
+      "sl": 4062.4,
+      "tp2": 4015.03
+    },
+    "XAUUSD:SELL:levels:4041.03:4062.4:4015.03": {
+      "symbol": "XAUUSD",
+      "side": "SELL",
+      "trade_id": "paper-d84a5223-4d4d-4307-9f45-a3d4170047b6",
+      "opened_at": "2026-07-15 01:55:11 UTC",
+      "entry": 4041.03,
+      "sl": 4062.4,
+      "tp2": 4015.03
+    },
+    "XAUUSD:SELL:2026-07-15T01:55:00+00:00": {
+      "symbol": "XAUUSD",
+      "side": "SELL",
+      "trade_id": "paper-d84a5223-4d4d-4307-9f45-a3d4170047b6",
+      "opened_at": "2026-07-15 01:55:11 UTC",
+      "entry": 4041.03,
+      "sl": 4062.4,
+      "tp2": 4015.03
+    },
+    "EURUSD:BUY:BUY_15M_SWING_BREAK_5M_CONFIRMED:1.14374:2026-07-15T02:50:00+00:00": {
+      "symbol": "EURUSD",
+      "side": "BUY",
+      "trade_id": "paper-1cf438aa-7156-4a8c-b9d3-d7233c6045cf",
+      "opened_at": "2026-07-15 02:51:02 UTC",
+      "entry": 1.14414,
+      "sl": 1.14274,
+      "tp2": 1.14583
+    },
+    "EURUSD:BUY:levels:1.14414:1.14274:1.14583": {
+      "symbol": "EURUSD",
+      "side": "BUY",
+      "trade_id": "paper-1cf438aa-7156-4a8c-b9d3-d7233c6045cf",
+      "opened_at": "2026-07-15 02:51:02 UTC",
+      "entry": 1.14414,
+      "sl": 1.14274,
+      "tp2": 1.14583
+    },
+    "EURUSD:BUY:2026-07-15T02:50:00+00:00": {
+      "symbol": "EURUSD",
+      "side": "BUY",
+      "trade_id": "paper-1cf438aa-7156-4a8c-b9d3-d7233c6045cf",
+      "opened_at": "2026-07-15 02:51:02 UTC",
+      "entry": 1.14414,
+      "sl": 1.14274,
+      "tp2": 1.14583
     }
   },
-  "last_paper_reset": 1783890000.0
+  "last_paper_reset": 1785704400.0
 }
