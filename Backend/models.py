@@ -39,3 +39,22 @@ class NewsTradingModeAudit(Base):
     request_source = Column(String(100), nullable=False)
     success = Column(Boolean, nullable=False)
     failure_reason = Column(Text, nullable=True)
+
+
+class AutoTradeStateAudit(Base):
+    __tablename__ = "auto_trade_state_audit"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trading_mode = Column(String(16), nullable=False)
+    previous_enabled = Column(Boolean, nullable=False)
+    new_enabled = Column(Boolean, nullable=False)
+    updated_by = Column(String(255), nullable=False)
+    active_broker_account = Column(String(100), nullable=True)
+    broker_environment = Column(String(32), nullable=True)
+    timestamp = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    request_source = Column(String(100), nullable=False)
+    reason = Column(Text, nullable=True)
