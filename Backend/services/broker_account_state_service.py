@@ -4,15 +4,12 @@ import json
 import threading
 from datetime import datetime, timezone
 
-from db import Base, SessionLocal, engine
+from db import SessionLocal
 from models import RuntimeSetting
 
 
 SETTING_NAME = "ctrader_active_account"
 _LOCK = threading.RLock()
-
-Base.metadata.create_all(bind=engine)
-
 
 def load_active_account_selection(session_factory=None):
     factory = session_factory or SessionLocal
