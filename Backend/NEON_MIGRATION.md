@@ -20,6 +20,10 @@ Optional pool controls already have safe defaults:
 - `DB_POOL_RECYCLE_SECONDS=300`
 - `DB_POOL_TIMEOUT_SECONDS=30`
 - `DB_CONNECT_TIMEOUT_SECONDS=10`
+- `CTRADER_TOKEN_ENCRYPTION_KEY`: optional but recommended dedicated stable
+  secret used to encrypt cTrader OAuth tokens stored in Neon. When omitted,
+  FlowSignal derives the encryption key from the existing
+  `CTRADER_CLIENT_SECRET`.
 
 Do not put either real URL in Git, `.env.example`, screenshots, chat messages,
 or frontend code. PostgreSQL passwords containing reserved URL characters must
@@ -74,10 +78,15 @@ Use `--merge` only after reviewing an already-populated Neon database. It uses
 4. Add both secret URLs to Render.
 5. update the Render start command.
 6. deploy and confirm `/database-status` reports PostgreSQL, durable storage,
-   a successful connection, and revision `20260807_0001`.
+   a successful connection, and the latest Alembic revision.
 7. Verify Paper/LIVE Auto and News Trading Mode values in the UI.
 8. Enable LIVE Auto manually only after the broker and account are verified.
 
 Rollback is configuration-only: restore the previous Render start command and
 remove `DATABASE_URL`/`MIGRATION_DATABASE_URL`. The local SQLite file is not
 deleted by the migration tool.
+
+After the cTrader token-storage migration is deployed, reconnect cTrader once.
+The OAuth callback stores only encrypted tokens in Neon. Later Render uploads
+load those durable tokens automatically, and refresh-token rotation updates the
+same encrypted record. An explicit Disconnect cTrader action deletes it.
