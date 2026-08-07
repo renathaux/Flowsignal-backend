@@ -33,26 +33,29 @@ class DatabaseConfigurationTests(unittest.TestCase):
             "runtime_settings",
             "news_trading_mode_audit",
             "auto_trade_state_audit",
+            "ctrader_oauth_tokens",
         }
         self.assertEqual(set(Base.metadata.tables), expected)
-        self.assertTrue(expected.issubset(set(inspect(db.engine).get_table_names())))
+        legacy_tables = expected - {"ctrader_oauth_tokens"}
+        self.assertTrue(
+            legacy_tables.issubset(set(inspect(db.engine).get_table_names()))
+        )
 
     def test_migration_revision_and_tool_are_valid_python(self):
         files = [
             BACKEND_DIR / "migrations" / "env.py",
             BACKEND_DIR / "migrations" / "versions" / "20260807_0001_initial_schema.py",
+            BACKEND_DIR / "migrations" / "versions" / "20260807_0002_ctrader_token_storage.py",
             BACKEND_DIR / "scripts" / "migrate_sqlite_to_neon.py",
         ]
         for path in files:
             ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
     def test_initial_revision_contains_every_model_table(self):
-        source = (
-            BACKEND_DIR
-            / "migrations"
-            / "versions"
-            / "20260807_0001_initial_schema.py"
-        ).read_text(encoding="utf-8")
+        source = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted((BACKEND_DIR / "migrations" / "versions").glob("*.py"))
+        )
         for table_name in Base.metadata.tables:
             self.assertIn(f'"{table_name}"', source)
 
@@ -76,7 +79,8 @@ class DatabaseConfigurationTests(unittest.TestCase):
             }
         finally:
             connection.close()
-        self.assertTrue(set(Base.metadata.tables).issubset(tables))
+        source_tables = set(Base.metadata.tables) - {"ctrader_oauth_tokens"}
+        self.assertTrue(source_tables.issubset(tables))
 
 
 if __name__ == "__main__":
