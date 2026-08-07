@@ -7,7 +7,7 @@ import os
 import threading
 from datetime import datetime, timezone
 
-from db import Base, SessionLocal, engine
+from db import SessionLocal
 from models import NewsTradingModeAudit, RuntimeSetting
 
 
@@ -15,11 +15,6 @@ SETTING_NAME = "news_trading_mode"
 ALLOWED_MODES = frozenset({"OFF", "BLOCK_ONLY", "TRADE_CONFIRMED"})
 _LOCK = threading.RLock()
 logger = logging.getLogger("flowsignal.news_mode")
-
-# The application has no migration runner today. create_all is non-destructive
-# and creates only missing tables; production DATABASE_URL remains authoritative.
-Base.metadata.create_all(bind=engine)
-
 
 class InvalidNewsTradingMode(ValueError):
     pass
