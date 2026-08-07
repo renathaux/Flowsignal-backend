@@ -24,6 +24,11 @@ from services.broker_account_state_service import (
     load_active_account_selection,
     save_active_account_selection,
 )
+from services.ctrader_token_service import (
+    clear_tokens as clear_durable_ctrader_tokens,
+    load_tokens as load_durable_ctrader_tokens,
+    save_tokens as save_durable_ctrader_tokens,
+)
 from services.settings_service import get_tp1_ratio_of_tp2
 
 try:
@@ -79,6 +84,72 @@ print("CTRADER_REDIRECT_URI_LOADED =", {
 })
 
 print("CTRADER ENV LOADED")
+
+CTRADER_TOKEN_HYDRATION = {
+    "checked_at": 0.0,
+    "loaded": False,
+    "source": None,
+}
+CTRADER_TOKEN_HYDRATION_SECONDS = 30
+
+
+def hydrate_ctrader_tokens_from_storage(force=False):
+    """Prefer encrypted database tokens over deployment-time token values."""
+    now = time.time()
+    if (
+        not force
+        and CTRADER_TOKEN_HYDRATION["checked_at"]
+        and now - CTRADER_TOKEN_HYDRATION["checked_at"]
+        < CTRADER_TOKEN_HYDRATION_SECONDS
+    ):
+        return dict(CTRADER_TOKEN_HYDRATION)
+
+    stored = load_durable_ctrader_tokens()
+    access_token = str(stored.get("access_token") or "").strip()
+    refresh_token = str(stored.get("refresh_token") or "").strip()
+    if access_token:
+        os.environ["CTRADER_ACCESS_TOKEN"] = access_token
+        if refresh_token:
+            os.environ["CTRADER_REFRESH_TOKEN"] = refresh_token
+        CTRADER_TOKEN_HYDRATION.update({
+            "checked_at": now,
+            "loaded": True,
+            "source": "encrypted_database",
+        })
+        print("CTRADER_TOKEN_DURABLE_LOAD =", {
+            "ok": True,
+            "source": "encrypted_database",
+            "has_access_token": True,
+            "has_refresh_token": bool(refresh_token),
+        })
+    else:
+        CTRADER_TOKEN_HYDRATION.update({
+            "checked_at": now,
+            "loaded": False,
+            "source": "environment_fallback",
+        })
+    return dict(CTRADER_TOKEN_HYDRATION)
+
+
+def persist_ctrader_tokens(access_token, refresh_token, updated_by):
+    saved = save_durable_ctrader_tokens(
+        access_token,
+        refresh_token,
+        updated_by=updated_by,
+    )
+    if saved:
+        CTRADER_TOKEN_HYDRATION.update({
+            "checked_at": time.time(),
+            "loaded": True,
+            "source": "encrypted_database",
+        })
+    print("CTRADER_TOKEN_DURABLE_SAVE =", {
+        "ok": bool(saved),
+        "updated_by": str(updated_by),
+        "has_access_token": bool(access_token),
+        "has_refresh_token": bool(refresh_token),
+    })
+    return bool(saved)
 
 class CTraderApiError(RuntimeError):
     def __init__(self, message, data=None):
@@ -799,12 +870,18 @@ def exchange_ctrader_authorization_code(code):
         "CTRADER_ACCESS_TOKEN": access_token,
         "CTRADER_REFRESH_TOKEN": refresh_token or os.getenv("CTRADER_REFRESH_TOKEN", ""),
     })
+    durable_saved = persist_ctrader_tokens(
+        access_token,
+        refresh_token or os.getenv("CTRADER_REFRESH_TOKEN", ""),
+        updated_by="oauth_callback",
+    )
     clear_ctrader_connection_cache()
 
     return {
         "ok": True,
         "access_token_saved": True,
         "refresh_token_saved": bool(refresh_token),
+        "durable_token_saved": durable_saved,
     }
 
 def clear_ctrader_saved_accounts():
@@ -989,6 +1066,12 @@ def clear_ctrader_tokens_and_accounts():
         "ACTIVE_CTRADER_ACCOUNT_ID": "",
         "ACTIVE_CTRADER_ACCOUNT_ENV": "",
         "CTRADER_ACCOUNT_ID": "",
+    })
+    clear_durable_ctrader_tokens()
+    CTRADER_TOKEN_HYDRATION.update({
+        "checked_at": time.time(),
+        "loaded": False,
+        "source": "explicit_disconnect",
     })
     clear_ctrader_connection_cache()
 
@@ -3737,6 +3820,7 @@ def fetch_ctrader_closed_deals(config, from_timestamp, to_timestamp, max_rows=10
             pass
 
 def get_ctrader_config():
+    hydrate_ctrader_tokens_from_storage()
     active_account_id = get_active_ctrader_account_id()
     active_account_env = get_active_ctrader_account_env()
     config = {
@@ -3768,8 +3852,11 @@ def get_ctrader_config():
     return config
 
 def get_ctrader_refresh_token_status():
+    hydration = hydrate_ctrader_tokens_from_storage()
     return {
         "has_refresh_token": bool(os.getenv("CTRADER_REFRESH_TOKEN")),
+        "durable_token_loaded": bool(hydration.get("loaded")),
+        "source": hydration.get("source"),
     }
 
 def update_env_file_values(values):
@@ -3872,6 +3959,11 @@ def refresh_ctrader_access_token(config):
         "CTRADER_ACCESS_TOKEN": access_token,
         "CTRADER_REFRESH_TOKEN": new_refresh_token,
     })
+    durable_saved = persist_ctrader_tokens(
+        access_token,
+        new_refresh_token,
+        updated_by="token_refresh",
+    )
     config["access_token"] = access_token
     config["refresh_token"] = new_refresh_token
 
@@ -3880,6 +3972,7 @@ def refresh_ctrader_access_token(config):
         "reason": "refreshed",
         "access_token_updated": True,
         "refresh_token_updated": bool(new_refresh_token),
+        "durable_token_saved": durable_saved,
     })
 
     return config
@@ -4381,6 +4474,7 @@ def preserve_active_account_during_transient_refresh(
     return accounts
 
 def fetch_ctrader_accounts(refresh=True):
+    hydrate_ctrader_tokens_from_storage()
     settings = load_ctrader_account_settings()
     active_account_id = get_active_ctrader_account_id()
     if not refresh:
