@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from sqlalchemy import text as sql_text
 from email.mime.text import MIMEText
 import smtplib
 import time
@@ -82,8 +83,10 @@ from services.settings_service import (
 from services.auto_trade_state_service import (
     latest_changes as get_auto_trade_state_changes,
     load_state as load_durable_auto_trade_state,
+    save_mode as save_durable_auto_trade_mode,
     save_state as save_durable_auto_trade_state,
 )
+from db import database_status as get_database_status, engine as database_engine
 from paths import DATA_DIR
 from risk_management.account_balance import (
     log_account_balance_verification_failed as risk_log_account_balance_verification_failed,
@@ -1614,10 +1617,46 @@ def health_check():
             "live": LIVE_AUTO_TRADE_ENABLED.get("enabled"),
         },
         "feature_flags": load_feature_flags(),
+        "database": database_runtime_status(),
     }
 
 
-def auto_trade_state_response():
+def database_runtime_status():
+    status = get_database_status()
+    response = {
+        "backend": status.get("backend"),
+        "driver": status.get("driver"),
+        "configured_by_database_url": status.get("configured_by_database_url"),
+        "durable": status.get("durable"),
+        "connected": False,
+        "migration_revision": None,
+    }
+    try:
+        with database_engine.connect() as connection:
+            connection.execute(sql_text("SELECT 1"))
+            revision = connection.execute(
+                sql_text("SELECT version_num FROM alembic_version LIMIT 1")
+            ).scalar_one_or_none()
+        response.update({
+            "connected": True,
+            "migration_revision": revision,
+        })
+    except Exception as exc:
+        response.update({
+            "error": "Database connection or migration check failed.",
+            "error_type": type(exc).__name__,
+        })
+    return response
+
+
+@app.get("/database-status")
+def database_status_endpoint():
+    return database_runtime_status()
+
+
+def auto_trade_state_response(refresh=True):
+    if refresh:
+        refresh_auto_trade_state_from_persistence("state_response")
     preference_enabled = bool(LIVE_AUTO_TRADE_ENABLED.get("enabled"))
     execution_ready = bool(
         LIVE_ACCOUNT_STATE.get("connected")
@@ -2007,6 +2046,8 @@ def panel_data(force: int = 0):
 
     print("LIVE_PL_SYNC:", live_pl_sync)
 
+    authoritative_auto_trade_state = auto_trade_state_response(refresh=True)
+
     print("PAPER_STATE_REFRESH:", {
         "paper_auto_enabled": AUTO_TRADE_ENABLED["enabled"],
         "active_symbols": [
@@ -2084,10 +2125,13 @@ def panel_data(force: int = 0):
         "live_meta_error": LIVE_PANEL_META_CACHE.get("last_error"),
 
         "paper_auto_enabled":
-            AUTO_TRADE_ENABLED["enabled"],
+            authoritative_auto_trade_state["paper_enabled"],
 
         "live_auto_enabled":
-            LIVE_AUTO_TRADE_ENABLED["enabled"],
+            authoritative_auto_trade_state["live_enabled"],
+
+        "auto_trade_state":
+            authoritative_auto_trade_state,
 
         "live_account":
             LIVE_ACCOUNT_STATE,
@@ -2568,6 +2612,7 @@ AUTO_TRADE_STATE_METADATA = {
     "reason": None,
     "persistence": {},
 }
+AUTO_TRADE_STATE_REFRESH_LOCK = threading.RLock()
 
 def load_auto_trade_state():
     try:
@@ -2582,23 +2627,78 @@ def load_auto_trade_state():
     except Exception as e:
         print("AUTO TRADE STATE LOAD ERROR:", e)
 
+
+def refresh_auto_trade_state_from_persistence(reason="runtime_refresh"):
+    """Synchronize every worker with the backend-authoritative preference."""
+    with AUTO_TRADE_STATE_REFRESH_LOCK:
+        try:
+            state = load_durable_auto_trade_state(AUTO_TRADE_STATE_FILE)
+            AUTO_TRADE_ENABLED["enabled"] = bool(state.get("paper_enabled"))
+            LIVE_AUTO_TRADE_ENABLED["enabled"] = bool(state.get("live_enabled"))
+            AUTO_TRADE_STATE_METADATA.update({
+                key: state.get(key)
+                for key in AUTO_TRADE_STATE_METADATA
+            })
+            print("AUTO_TRADE_STATE_REFRESHED =", {
+                "reason": reason,
+                "paper_enabled": AUTO_TRADE_ENABLED["enabled"],
+                "live_enabled": LIVE_AUTO_TRADE_ENABLED["enabled"],
+                "updated_at": state.get("updated_at"),
+                "source": state.get("source"),
+            })
+            return state
+        except Exception as exc:
+            # A transient database failure must not silently force either mode
+            # OFF. Keep the last confirmed in-memory preference.
+            print("AUTO_TRADE_STATE_REFRESH_ERROR =", {
+                "reason": reason,
+                "error": str(exc),
+                "paper_enabled_kept": AUTO_TRADE_ENABLED["enabled"],
+                "live_enabled_kept": LIVE_AUTO_TRADE_ENABLED["enabled"],
+            })
+            return {
+                "paper_enabled": AUTO_TRADE_ENABLED["enabled"],
+                "live_enabled": LIVE_AUTO_TRADE_ENABLED["enabled"],
+                **AUTO_TRADE_STATE_METADATA,
+                "refresh_error": str(exc),
+            }
+
 def save_auto_trade_state(
     updated_by="system",
     request_source="backend",
     reason=None,
+    changed_mode=None,
 ):
     try:
-        state = save_durable_auto_trade_state(
-            paper_enabled=AUTO_TRADE_ENABLED["enabled"],
-            live_enabled=LIVE_AUTO_TRADE_ENABLED["enabled"],
-            updated_by=updated_by,
-            request_source=request_source,
-            reason=reason,
-            active_broker_account=LIVE_ACCOUNT_STATE.get("account_id")
+        common = {
+            "updated_by": updated_by,
+            "request_source": request_source,
+            "reason": reason,
+            "active_broker_account": LIVE_ACCOUNT_STATE.get("account_id")
             if "LIVE_ACCOUNT_STATE" in globals() else None,
-            broker_environment=LIVE_ACCOUNT_STATE.get("mode")
+            "broker_environment": LIVE_ACCOUNT_STATE.get("mode")
             if "LIVE_ACCOUNT_STATE" in globals() else None,
-        )
+        }
+        if changed_mode:
+            normalized_mode = str(changed_mode).strip().lower()
+            enabled = (
+                AUTO_TRADE_ENABLED["enabled"]
+                if normalized_mode == "paper"
+                else LIVE_AUTO_TRADE_ENABLED["enabled"]
+            )
+            state = save_durable_auto_trade_mode(
+                mode=normalized_mode,
+                enabled=enabled,
+                **common,
+            )
+        else:
+            state = save_durable_auto_trade_state(
+                paper_enabled=AUTO_TRADE_ENABLED["enabled"],
+                live_enabled=LIVE_AUTO_TRADE_ENABLED["enabled"],
+                **common,
+            )
+        AUTO_TRADE_ENABLED["enabled"] = bool(state.get("paper_enabled"))
+        LIVE_AUTO_TRADE_ENABLED["enabled"] = bool(state.get("live_enabled"))
         AUTO_TRADE_STATE_METADATA.update({
             key: state.get(key)
             for key in AUTO_TRADE_STATE_METADATA
@@ -2632,6 +2732,7 @@ def paper_auto_toggle(payload: dict):
             updated_by="web_user",
             request_source="paper_auto_toggle",
             reason="User changed Paper Auto",
+            changed_mode="paper",
         )
     except Exception as exc:
         AUTO_TRADE_ENABLED["enabled"] = previous_enabled
@@ -6582,6 +6683,9 @@ def run_ctrader_auto_trade_checks(panel_data):
     if not isinstance(panel_data, dict):
         return []
 
+    # The web toggle and the server-owned engine may run in different workers.
+    # Re-read the authoritative preference before every execution cycle.
+    refresh_auto_trade_state_from_persistence("execution_cycle")
     sync_ctrader_account_state()
     broker_connected = bool(
         LIVE_ACCOUNT_STATE.get("connected")
@@ -8438,12 +8542,10 @@ def forget_ctrader_account_endpoint(payload: dict):
 
 @app.post("/disconnect-ctrader")
 def disconnect_ctrader():
-    LIVE_AUTO_TRADE_ENABLED["enabled"] = False
-    save_auto_trade_state(
-        updated_by="web_user",
-        request_source="disconnect_ctrader",
-        reason="User explicitly disconnected cTrader",
-    )
+    # Disconnecting the transport pauses execution; it must not erase the
+    # owner's persisted LIVE Auto preference. Reconnection resumes the same
+    # preference after the normal broker/final-entry safety checks pass.
+    live_preference_kept = bool(LIVE_AUTO_TRADE_ENABLED["enabled"])
 
     disconnected_at = time.time()
 
@@ -8486,7 +8588,9 @@ def disconnect_ctrader():
         "broker": "ctrader",
         "account_id": None,
         "execution_ready": False,
-        "live_auto_enabled": False
+        "live_auto_enabled": live_preference_kept,
+        "live_execution_paused": live_preference_kept,
+        "pause_reason": "broker_disconnected" if live_preference_kept else None,
     }
 
 @app.post("/close-live-trade")
@@ -8682,6 +8786,7 @@ def live_auto_toggle(payload: dict):
             updated_by=str(payload.get("updated_by") or "web_user"),
             request_source=str(payload.get("source") or "live_auto_toggle"),
             reason="User changed Live Auto",
+            changed_mode="live",
         )
     except Exception as exc:
         LIVE_AUTO_TRADE_ENABLED["enabled"] = previous_enabled
