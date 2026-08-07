@@ -58,3 +58,13 @@ class AutoTradeStateAudit(Base):
     )
     request_source = Column(String(100), nullable=False)
     reason = Column(Text, nullable=True)
+
+
+class CTraderOAuthToken(Base):
+    __tablename__ = "ctrader_oauth_tokens"
+
+    provider = Column(String(32), primary_key=True)
+    encrypted_access_token = Column(Text, nullable=False)
+    encrypted_refresh_token = Column(Text, nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+    updated_by = Column(String(255), nullable=False)
