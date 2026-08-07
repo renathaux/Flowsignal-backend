@@ -7,7 +7,7 @@ import os
 import threading
 from datetime import datetime, timezone
 
-from db import Base, SessionLocal, engine
+from db import SessionLocal, engine
 from models import AutoTradeStateAudit, RuntimeSetting
 
 
@@ -15,9 +15,6 @@ PAPER_SETTING = "paper_auto_trade_enabled"
 LIVE_SETTING = "live_auto_trade_enabled"
 SETTING_NAMES = {"paper": PAPER_SETTING, "live": LIVE_SETTING}
 _LOCK = threading.RLock()
-
-Base.metadata.create_all(bind=engine)
-
 
 def _as_bool(value, default=False):
     if isinstance(value, bool):
@@ -176,6 +173,65 @@ def save_state(
         "request_source": str(request_source or "api"),
         "reason": reason,
         "persistence": persistence_info(),
+    }
+
+
+def save_mode(
+    *, mode, enabled, updated_by="user", request_source="api", reason=None,
+    active_broker_account=None, broker_environment=None,
+    session_factory=None, now=None,
+):
+    """Persist one Auto Trade preference without rewriting the other mode.
+
+    PAPER and LIVE are independent user preferences.  Updating one from a
+    worker with stale in-memory state must never silently overwrite the other.
+    """
+    normalized_mode = str(mode or "").strip().lower()
+    if normalized_mode not in SETTING_NAMES:
+        raise ValueError("Auto Trade mode must be PAPER or LIVE")
+
+    factory = session_factory or SessionLocal
+    updated_at = now or datetime.now(timezone.utc)
+    setting_name = SETTING_NAMES[normalized_mode]
+    requested = bool(enabled)
+
+    with _LOCK:
+        with factory() as session:
+            row = session.get(RuntimeSetting, setting_name)
+            previous = _as_bool(row.setting_value) if row else False
+            if row is None:
+                row = RuntimeSetting(setting_name=setting_name)
+                session.add(row)
+            row.setting_value = "true" if requested else "false"
+            row.updated_at = updated_at
+            row.updated_by = str(updated_by or "user")
+
+            if previous != requested:
+                session.add(AutoTradeStateAudit(
+                    trading_mode=normalized_mode.upper(),
+                    previous_enabled=previous,
+                    new_enabled=requested,
+                    updated_by=str(updated_by or "user"),
+                    active_broker_account=(
+                        str(active_broker_account)
+                        if active_broker_account not in (None, "") else None
+                    ),
+                    broker_environment=(
+                        str(broker_environment)
+                        if broker_environment not in (None, "") else None
+                    ),
+                    timestamp=updated_at,
+                    request_source=str(request_source or "api"),
+                    reason=str(reason) if reason else None,
+                ))
+            session.commit()
+
+    state = load_state(session_factory=factory)
+    return {
+        **state,
+        "request_source": str(request_source or "api"),
+        "reason": reason,
+        "changed_mode": normalized_mode.upper(),
     }
 
 
