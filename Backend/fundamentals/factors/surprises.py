@@ -100,7 +100,7 @@ def score_event_surprise(event, historical_surprises=None, now=None):
         provisional = False
     else:
         forecast = parse_numeric(event.get("forecast")) or 0.0
-        floor = DENOMINATOR_FLOOR.get(metadata["indicator"], 0.10)
+        floor = DENOMINATOR_FLOOR.get(metadata["base_indicator"], 0.10)
         normalized = raw / max(abs(forecast), floor)
         base_score = _clamp(normalized / PROVISIONAL_REFERENCE_RATIO * 100.0)
         standardized = None
