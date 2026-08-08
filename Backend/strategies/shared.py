@@ -23,6 +23,7 @@ from ctrader_connector import (
 )
 from paths import DATA_DIR
 from services.settings_service import get_tp1_ratio_of_tp2
+from services.strategy_diagnostics_service import persist_cycle_safely
 
 MARKET_DATA_SOURCES = ["ctrader"]
 MARKET_TIMEZONE = ZoneInfo("America/New_York")
@@ -10141,6 +10142,24 @@ def get_panel_data(force_refresh=False):
             "last_successful_fetch": decision_source.get("last_successful_fetch"),
             "missed_fetch_count": decision_source.get("missed_fetch_count"),
         })
+
+    # Diagnostics are a best-effort observer of the completed calculation.
+    # persist_cycle_safely catches all storage failures and never changes a
+    # signal, gate, level, or execution decision.
+    persist_cycle_safely(
+        "EURUSD",
+        eurusd_result,
+        data_5m=eurusd,
+        data_15m=eurusd_htf,
+        source_state=eurusd_source_state,
+    )
+    persist_cycle_safely(
+        "XAUUSD",
+        gold_result,
+        data_5m=gold,
+        data_15m=gold_htf,
+        source_state=gold_source_state,
+    )
 
     if eurusd_source_state.get("available") and not eurusd.empty:
        update_paper_trade(
