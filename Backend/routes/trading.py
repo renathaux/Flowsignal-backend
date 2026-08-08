@@ -1,6 +1,16 @@
 from fastapi import APIRouter
 
+from fundamentals.ingestion import start_fundamental_ingestion_scheduler
+from routes.fundamentals import router as fundamentals_router
+
 router = APIRouter()
+router.include_router(fundamentals_router)
+
+
+@router.on_event("startup")
+def start_fundamental_collection():
+    result = start_fundamental_ingestion_scheduler()
+    print("FUNDAMENTAL_SCHEDULER_START =", result)
 
 
 @router.get("/trading/health")

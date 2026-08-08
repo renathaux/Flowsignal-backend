@@ -1,7 +1,11 @@
 import os
 from urllib.parse import urlsplit, urlunsplit
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:  # Environment variables remain authoritative in production.
+    def load_dotenv(*_args, **_kwargs):
+        return False
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from paths import BASE_DIR, DATABASE_DIR

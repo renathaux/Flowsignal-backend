@@ -35,11 +35,23 @@ class DatabaseConfigurationTests(unittest.TestCase):
             "auto_trade_state_audit",
             "ctrader_oauth_tokens",
             "strategy_cycle_diagnostics",
+            "economic_events",
+            "economic_event_observations",
+            "economic_provider_fetches",
+            "fundamental_factor_inputs",
+            "currency_strength_snapshots",
+            "fundamental_insight_snapshots",
         }
         self.assertEqual(set(Base.metadata.tables), expected)
         legacy_tables = expected - {
             "ctrader_oauth_tokens",
             "strategy_cycle_diagnostics",
+            "economic_events",
+            "economic_event_observations",
+            "economic_provider_fetches",
+            "fundamental_factor_inputs",
+            "currency_strength_snapshots",
+            "fundamental_insight_snapshots",
         }
         self.assertTrue(
             legacy_tables.issubset(set(inspect(db.engine).get_table_names()))
@@ -51,6 +63,7 @@ class DatabaseConfigurationTests(unittest.TestCase):
             BACKEND_DIR / "migrations" / "versions" / "20260807_0001_initial_schema.py",
             BACKEND_DIR / "migrations" / "versions" / "20260807_0002_ctrader_token_storage.py",
             BACKEND_DIR / "migrations" / "versions" / "20260807_0003_strategy_cycle_diagnostics.py",
+            BACKEND_DIR / "migrations" / "versions" / "20260807_0004_fundamental_engine_phase1.py",
             BACKEND_DIR / "scripts" / "migrate_sqlite_to_neon.py",
         ]
         for path in files:
@@ -87,6 +100,12 @@ class DatabaseConfigurationTests(unittest.TestCase):
         source_tables = set(Base.metadata.tables) - {
             "ctrader_oauth_tokens",
             "strategy_cycle_diagnostics",
+            "economic_events",
+            "economic_event_observations",
+            "economic_provider_fetches",
+            "fundamental_factor_inputs",
+            "currency_strength_snapshots",
+            "fundamental_insight_snapshots",
         }
         self.assertTrue(source_tables.issubset(tables))
 

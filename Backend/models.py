@@ -1,6 +1,17 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, Column, DateTime, Index, Integer, JSON, String, Text
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+)
 from db import Base
 
 
@@ -104,3 +115,108 @@ class StrategyCycleDiagnostic(Base):
             "evaluation_timestamp",
         ),
     )
+
+
+class EconomicEvent(Base):
+    __tablename__ = "economic_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_id = Column(String(128), nullable=False, unique=True, index=True)
+    event_name = Column(String(255), nullable=False)
+    indicator = Column(String(128), nullable=False, index=True)
+    country = Column(String(100), nullable=True)
+    currency = Column(String(8), nullable=False, index=True)
+    impact = Column(String(16), nullable=False, default="UNKNOWN")
+    release_time = Column(DateTime(timezone=True), nullable=False, index=True)
+    provider = Column(String(32), nullable=False, index=True)
+    provider_event_id = Column(String(255), nullable=True)
+    data_status = Column(String(32), nullable=False, default="SCHEDULED")
+    first_seen_at = Column(DateTime(timezone=True), nullable=False)
+    last_seen_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index("ix_economic_event_currency_release", "currency", "release_time"),
+        Index("ix_economic_event_indicator_release", "indicator", "release_time"),
+    )
+
+
+class EconomicEventObservation(Base):
+    """Append-only provider observation preserving forecasts and revisions."""
+
+    __tablename__ = "economic_event_observations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    observation_hash = Column(String(64), nullable=False, unique=True, index=True)
+    economic_event_id = Column(
+        Integer,
+        ForeignKey("economic_events.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    actual = Column(String(100), nullable=True)
+    forecast = Column(String(100), nullable=True)
+    previous = Column(String(100), nullable=True)
+    revised_previous = Column(String(100), nullable=True)
+    provider = Column(String(32), nullable=False, index=True)
+    provider_timestamp = Column(DateTime(timezone=True), nullable=True)
+    fetched_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    data_status = Column(String(32), nullable=False)
+    raw_payload = Column(JSON, nullable=True)
+
+
+class EconomicProviderFetch(Base):
+    __tablename__ = "economic_provider_fetches"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    provider = Column(String(32), nullable=False, index=True)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    status = Column(String(24), nullable=False, index=True)
+    raw_event_count = Column(Integer, nullable=False, default=0)
+    normalized_event_count = Column(Integer, nullable=False, default=0)
+    error = Column(Text, nullable=True)
+
+
+class FundamentalFactorInput(Base):
+    __tablename__ = "fundamental_factor_inputs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    calculation_id = Column(String(64), nullable=False, index=True)
+    currency = Column(String(8), nullable=False, index=True)
+    factor = Column(String(32), nullable=False, index=True)
+    score = Column(Float, nullable=True)
+    status = Column(String(32), nullable=False)
+    weight = Column(Float, nullable=False, default=0.0)
+    evidence = Column(JSON, nullable=False, default=list)
+    calculated_at = Column(DateTime(timezone=True), nullable=False, index=True)
+
+
+class CurrencyStrengthSnapshot(Base):
+    __tablename__ = "currency_strength_snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id = Column(String(64), nullable=False, unique=True, index=True)
+    calculation_id = Column(String(64), nullable=False, index=True)
+    currency = Column(String(8), nullable=False, index=True)
+    score = Column(Float, nullable=True)
+    status = Column(String(32), nullable=False)
+    coverage = Column(Float, nullable=False)
+    confidence = Column(Float, nullable=False)
+    factors = Column(JSON, nullable=False)
+    evidence = Column(JSON, nullable=False)
+    calculated_at = Column(DateTime(timezone=True), nullable=False, index=True)
+
+
+class FundamentalInsightSnapshot(Base):
+    __tablename__ = "fundamental_insight_snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    insight_id = Column(String(64), nullable=False, unique=True, index=True)
+    calculation_id = Column(String(64), nullable=False, index=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    pair_score = Column(Float, nullable=True)
+    direction = Column(String(16), nullable=False)
+    confidence = Column(Float, nullable=False)
+    status = Column(String(32), nullable=False)
+    response_json = Column(JSON, nullable=False)
+    generated_at = Column(DateTime(timezone=True), nullable=False, index=True)
