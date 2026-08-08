@@ -37,6 +37,7 @@ def analyze_events(normalized_events, *, provider_identity):
         for field in AUDITED_FIELDS
     }
     currency_counts = Counter(event.currency for event in canonical)
+    impact_counts = Counter(event.impact for event in canonical)
     exact_groups = defaultdict(list)
     identity_groups = defaultdict(list)
     provider_id_meanings = defaultdict(set)
@@ -107,6 +108,8 @@ def analyze_events(normalized_events, *, provider_identity):
     return {
         "event_count": len(canonical),
         "currency_counts": dict(sorted(currency_counts.items())),
+        "impact_counts": dict(sorted(impact_counts.items())),
+        "high_impact_event_count": impact_counts.get("HIGH", 0),
         "field_counts": field_counts,
         "missing_field_counts": missing,
         "stable_provider_event_id_count": field_counts["provider_event_id"],

@@ -11,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 from fundamentals.backfill import run_backfill
 from fundamentals.preflight import run_preflight
 from fundamentals.provider_audit import analyze_events
+from fundamentals.normalization.indicators import indicator_metadata, normalize_indicator
 from fundamentals.providers.jblanked import (
     DATASET_ID,
     JBlankedAccessError,
@@ -95,7 +96,63 @@ class FundamentalProviderPreflightTests(unittest.TestCase):
         self.assertEqual(item["release_time"].isoformat(), "2026-07-01T12:30:00+00:00")
         report = analyze_events([item], provider_identity=DATASET_ID)
         self.assertTrue(report["timezone"]["all_normalized_to_utc"])
-        self.assertEqual(report["normalized_indicators"], ["Core CPI m/m -> core_cpi"])
+        self.assertEqual(report["impact_counts"], {"HIGH": 1})
+        self.assertEqual(report["high_impact_event_count"], 1)
+        self.assertEqual(report["normalized_indicators"], ["Core CPI m/m -> core_cpi_m_m"])
+
+    def test_distinct_indicator_variants_remain_distinct(self):
+        expected = {
+            "Average Hourly Earnings m/m": "average_hourly_earnings_m_m",
+            "Average Hourly Earnings y/y": "average_hourly_earnings_y_y",
+            "CPI m/m": "cpi_m_m",
+            "CPI y/y": "cpi_y_y",
+            "Core CPI m/m": "core_cpi_m_m",
+            "Core CPI y/y": "core_cpi_y_y",
+            "PCE Price Index m/m": "pce_m_m",
+            "PCE Price Index y/y": "pce_y_y",
+            "Core PCE Price Index m/m": "core_pce_m_m",
+            "Core PCE Price Index y/y": "core_pce_y_y",
+            "GDP q/q Preliminary": "gdp_q_q_preliminary",
+            "GDP q/q Final": "gdp_q_q_final",
+            "GDP y/y": "gdp_y_y",
+            "Manufacturing PMI Preliminary": "manufacturing_pmi_preliminary",
+            "Services PMI Final": "services_pmi_final",
+            "Nonfarm Payrolls": "nonfarm_payrolls",
+            "Unemployment Rate": "unemployment_rate",
+            "Employment Change": "employment_change",
+            "Fed Interest Rate Decision": "fed_interest_rate",
+            "ECB Interest Rate Decision": "ecb_interest_rate",
+        }
+        normalized = {name: normalize_indicator(name) for name in expected}
+        self.assertEqual(normalized, expected)
+        self.assertEqual(len(set(normalized.values())), len(normalized))
+        self.assertEqual(normalize_indicator("Headline CPI y/y"), "cpi_y_y")
+        self.assertNotEqual(
+            normalize_indicator("Headline CPI y/y"),
+            normalize_indicator("Core CPI y/y"),
+        )
+        self.assertEqual(normalize_indicator("Headline PCE y/y"), "pce_y_y")
+        self.assertNotEqual(
+            normalize_indicator("Headline PCE y/y"),
+            normalize_indicator("Core PCE y/y"),
+        )
+
+    def test_qualified_variants_keep_recognized_factor_metadata(self):
+        for name in (
+            "Average Hourly Earnings m/m",
+            "Average Hourly Earnings y/y",
+            "Core CPI y/y",
+            "Core PCE Price Index m/m",
+            "GDP q/q Preliminary",
+            "Manufacturing PMI Preliminary",
+            "Services PMI Final",
+            "Fed Interest Rate Decision",
+            "ECB Interest Rate Decision",
+        ):
+            with self.subTest(name=name):
+                metadata = indicator_metadata(name)
+                self.assertTrue(metadata["recognized"])
+                self.assertNotEqual(metadata["category"], "other")
 
     def test_duplicate_detection(self):
         result = provider_result(None, None, None, duplicate=True)
