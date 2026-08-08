@@ -5,6 +5,10 @@ import time
 from datetime import datetime, timezone
 
 from fundamentals.config import FUNDAMENTAL_INGEST_INTERVAL_SECONDS
+from fundamentals.repositories.economic_events import (
+    persist_calendar_batch,
+    record_failed_fetch,
+)
 from fundamentals.repositories.observations import provider_health
 
 
@@ -12,6 +16,56 @@ _INGEST_LOCK = threading.Lock()
 _WORKER_LOCK = threading.Lock()
 _WORKER_THREAD = None
 _LAST_KICK_MONOTONIC = 0.0
+
+
+def collect_provider_data(*, now=None, timeout=8):
+    """Collect trusted providers without changing the legacy News Mode path."""
+    from services.news_service import (
+        fetch_finnhub_calendar_events,
+        fetch_fmp_calendar_events,
+        fetch_jblanked_calendar_events,
+    )
+
+    current = now or datetime.now(timezone.utc)
+    providers = (
+        ("jblanked", lambda: (
+            (events := fetch_jblanked_calendar_events(force=True, timeout=timeout)),
+            events,
+        )),
+        ("fmp", lambda: fetch_fmp_calendar_events(timeout=timeout, now=current)),
+        ("finnhub", lambda: fetch_finnhub_calendar_events(timeout=timeout, now=current)),
+    )
+    total_events = 0
+    successful = []
+    failed = []
+    for provider, fetch_provider in providers:
+        started_at = datetime.now(timezone.utc)
+        try:
+            raw_events, normalized_events = fetch_provider()
+            result = persist_calendar_batch(
+                provider,
+                raw_events,
+                normalized_events,
+                started_at=started_at,
+                completed_at=datetime.now(timezone.utc),
+            )
+            total_events += int(result.get("events") or 0)
+            successful.append(provider)
+        except Exception as exc:
+            failed.append({"provider": provider, "error": str(exc)})
+            try:
+                record_failed_fetch(provider, exc, started_at=started_at)
+            except Exception as persistence_exc:
+                print("FUNDAMENTAL_PROVIDER_FAILURE_PERSIST_ERROR =", {
+                    "provider": provider,
+                    "error": str(persistence_exc),
+                })
+    return {
+        "status": "FETCHED" if successful else "FAILED",
+        "event_count": total_events,
+        "successful_providers": successful,
+        "failed_providers": failed,
+    }
 
 
 def run_fundamental_ingestion_if_due(
@@ -40,9 +94,7 @@ def run_fundamental_ingestion_if_due(
         return {"status": "ALREADY_RUNNING"}
     try:
         if fetcher is None:
-            from services.news_service import fetch_calendar_events
-
-            fetcher = fetch_calendar_events
+            return collect_provider_data(now=current, timeout=8)
         events = fetcher(force=True, timeout=8, now=current)
         return {"status": "FETCHED", "event_count": len(events or [])}
     except Exception as exc:
