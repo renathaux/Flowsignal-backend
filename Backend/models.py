@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text
+from sqlalchemy import Boolean, Column, DateTime, Index, Integer, JSON, String, Text
 from db import Base
 
 
@@ -68,3 +68,39 @@ class CTraderOAuthToken(Base):
     encrypted_refresh_token = Column(Text, nullable=True)
     updated_at = Column(DateTime(timezone=True), nullable=False)
     updated_by = Column(String(255), nullable=False)
+
+
+class StrategyCycleDiagnostic(Base):
+    """Durable, read-only audit snapshot for one strategy evaluation cycle."""
+
+    __tablename__ = "strategy_cycle_diagnostics"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    cycle_id = Column(String(64), nullable=False, unique=True, index=True)
+    session_id = Column(String(128), nullable=False, index=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    evaluation_timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
+    latest_closed_m15_timestamp = Column(DateTime(timezone=True), nullable=True)
+    latest_closed_m5_timestamp = Column(DateTime(timezone=True), nullable=True)
+    decision = Column(String(32), nullable=False, index=True)
+    block_reason = Column(String(255), nullable=True, index=True)
+    progress_percent = Column(Integer, nullable=False, default=0)
+    snapshot_json = Column(JSON, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_strategy_cycle_symbol_evaluated",
+            "symbol",
+            "evaluation_timestamp",
+        ),
+        Index(
+            "ix_strategy_cycle_decision_evaluated",
+            "decision",
+            "evaluation_timestamp",
+        ),
+    )
