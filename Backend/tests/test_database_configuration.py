@@ -38,6 +38,7 @@ class DatabaseConfigurationTests(unittest.TestCase):
             "economic_events",
             "economic_event_observations",
             "economic_provider_fetches",
+            "economic_backfill_jobs",
             "fundamental_factor_inputs",
             "currency_strength_snapshots",
             "fundamental_insight_snapshots",
@@ -49,6 +50,7 @@ class DatabaseConfigurationTests(unittest.TestCase):
             "economic_events",
             "economic_event_observations",
             "economic_provider_fetches",
+            "economic_backfill_jobs",
             "fundamental_factor_inputs",
             "currency_strength_snapshots",
             "fundamental_insight_snapshots",
@@ -64,6 +66,7 @@ class DatabaseConfigurationTests(unittest.TestCase):
             BACKEND_DIR / "migrations" / "versions" / "20260807_0002_ctrader_token_storage.py",
             BACKEND_DIR / "migrations" / "versions" / "20260807_0003_strategy_cycle_diagnostics.py",
             BACKEND_DIR / "migrations" / "versions" / "20260807_0004_fundamental_engine_phase1.py",
+            BACKEND_DIR / "migrations" / "versions" / "20260808_0005_economic_backfill_jobs.py",
             BACKEND_DIR / "scripts" / "migrate_sqlite_to_neon.py",
         ]
         for path in files:
@@ -103,6 +106,7 @@ class DatabaseConfigurationTests(unittest.TestCase):
             "economic_events",
             "economic_event_observations",
             "economic_provider_fetches",
+            "economic_backfill_jobs",
             "fundamental_factor_inputs",
             "currency_strength_snapshots",
             "fundamental_insight_snapshots",

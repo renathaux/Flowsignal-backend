@@ -177,6 +177,28 @@ class EconomicProviderFetch(Base):
     error = Column(Text, nullable=True)
 
 
+class EconomicBackfillJob(Base):
+    """Durable cursor and counters for a resumable historical provider job."""
+
+    __tablename__ = "economic_backfill_jobs"
+
+    job_id = Column(String(64), primary_key=True)
+    provider = Column(String(32), nullable=False, index=True)
+    date_from = Column(DateTime(timezone=True), nullable=False)
+    date_to = Column(DateTime(timezone=True), nullable=False)
+    current_cursor = Column(DateTime(timezone=True), nullable=False)
+    chunk_days = Column(Integer, nullable=False)
+    status = Column(String(24), nullable=False, index=True)
+    events_seen = Column(Integer, nullable=False, default=0)
+    observations_added = Column(Integer, nullable=False, default=0)
+    duplicates_skipped = Column(Integer, nullable=False, default=0)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    last_error = Column(Text, nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class FundamentalFactorInput(Base):
     __tablename__ = "fundamental_factor_inputs"
 

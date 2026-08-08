@@ -47,8 +47,15 @@ def normalize_impact(value):
     return "UNKNOWN"
 
 
-def canonical_event_id(currency, indicator, release_time):
-    basis = f"{currency}|{indicator}|{release_time.astimezone(timezone.utc).isoformat()}"
+def canonical_event_id(currency, indicator, release_time, provider=None):
+    # JBlanked datasets are independent observations. Including their dataset
+    # identity prevents MQL5/Forex Factory/FxStreet values from being merged.
+    provider_name = str(provider or "").lower()
+    dataset = provider_name if provider_name.startswith("jblanked_") else "canonical"
+    basis = (
+        f"{dataset}|{currency}|{indicator}|"
+        f"{release_time.astimezone(timezone.utc).isoformat()}"
+    )
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:32]
 
 
@@ -94,7 +101,7 @@ def normalize_economic_event(raw, provider=None, fetched_at=None):
     fetched = normalize_datetime(fetched_at or raw.get("fetched_at")) or utc_now()
     provider_timestamp = normalize_datetime(raw.get("provider_timestamp") or raw.get("updated_at"))
     return EconomicEventSchema(
-        event_id=canonical_event_id(currency, indicator, release_time),
+        event_id=canonical_event_id(currency, indicator, release_time, provider_name),
         event_name=event_name,
         indicator=indicator,
         country=normalize_country(country, currency),
@@ -112,4 +119,3 @@ def normalize_economic_event(raw, provider=None, fetched_at=None):
         data_status=status,
         raw=raw,
     )
-

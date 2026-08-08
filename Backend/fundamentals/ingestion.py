@@ -10,6 +10,7 @@ from fundamentals.repositories.economic_events import (
     record_failed_fetch,
 )
 from fundamentals.repositories.observations import provider_health
+from fundamentals.locks import LIVE_INGESTION_LOCK_KEY, advisory_lock
 
 
 _INGEST_LOCK = threading.Lock()
@@ -30,7 +31,7 @@ def collect_provider_data(*, now=None, timeout=8):
 
     current = now or datetime.now(timezone.utc)
     providers = (
-        ("jblanked", lambda: (
+        ("jblanked_mql5", lambda: (
             (events := fetch_jblanked_calendar_events(force=True, timeout=timeout)),
             events,
         )),
@@ -95,10 +96,13 @@ def run_fundamental_ingestion_if_due(
     if not _INGEST_LOCK.acquire(blocking=False):
         return {"status": "ALREADY_RUNNING"}
     try:
-        if fetcher is None:
-            return collect_provider_data(now=current, timeout=8)
-        events = fetcher(force=True, timeout=8, now=current)
-        return {"status": "FETCHED", "event_count": len(events or [])}
+        with advisory_lock(LIVE_INGESTION_LOCK_KEY) as acquired:
+            if not acquired:
+                return {"status": "ALREADY_RUNNING"}
+            if fetcher is None:
+                return collect_provider_data(now=current, timeout=8)
+            events = fetcher(force=True, timeout=8, now=current)
+            return {"status": "FETCHED", "event_count": len(events or [])}
     except Exception as exc:
         print("FUNDAMENTAL_BACKGROUND_INGEST_ERROR =", str(exc))
         return {"status": "FAILED", "error": str(exc)}
