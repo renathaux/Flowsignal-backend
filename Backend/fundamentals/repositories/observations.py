@@ -8,7 +8,10 @@ from db import SessionLocal
 from models import EconomicEvent, EconomicEventObservation, EconomicProviderFetch
 
 
-TRUSTED_PROVIDERS = {"jblanked", "jblanked_live", "jblanked_cache", "fmp", "finnhub"}
+TRUSTED_PROVIDERS = {
+    "jblanked", "jblanked_live", "jblanked_cache", "jblanked_mql5",
+    "jblanked_forex_factory", "jblanked_fxstreet", "fmp", "finnhub",
+}
 
 
 def _serialize(event, observation):
