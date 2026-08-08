@@ -18,7 +18,7 @@ load_dotenv(dotenv_path=ENV_PATH)
 JBLANKED_DEFAULT_BASE_URL = "https://www.jblanked.com/news/api"
 JBLANKED_CALENDAR_PATH = "/mql5/calendar/today/"
 FMP_ECONOMIC_CALENDAR_URL = (
-    "https://financialmodelingprep.com/api/v3/economic_calendar"
+    "https://financialmodelingprep.com/stable/economic-calendar"
 )
 FINNHUB_ECONOMIC_CALENDAR_URL = "https://finnhub.io/api/v1/calendar/economic"
 CALENDAR_CACHE_SECONDS = 15 * 60
@@ -638,7 +638,7 @@ def fetch_fmp_calendar_events(timeout=8, now=None):
     normalized_events = []
     for raw_event in raw_events:
         if isinstance(raw_event, dict):
-            raw_event = {**raw_event, "source": "fmp"}
+            raw_event = {\n                **raw_event,\n                "event": first_present(raw_event, "event", "name"),\n                "forecast": first_present(\n                    raw_event, "forecast", "estimate", "consensus"\n                ),\n                "previous": first_present(raw_event, "previous", "prev"),\n                "source": "fmp",\n            }
         event = normalize_event(raw_event)
         if event:
             event["source"] = "fmp"
