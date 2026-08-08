@@ -16,6 +16,8 @@ _INGEST_LOCK = threading.Lock()
 _WORKER_LOCK = threading.Lock()
 _WORKER_THREAD = None
 _LAST_KICK_MONOTONIC = 0.0
+_SCHEDULER_LOCK = threading.Lock()
+_SCHEDULER_THREAD = None
 
 
 def collect_provider_data(*, now=None, timeout=8):
@@ -121,3 +123,27 @@ def kick_fundamental_ingestion():
         )
         _WORKER_THREAD.start()
         return {"status": "STARTED", "thread_id": _WORKER_THREAD.ident}
+
+
+def _scheduler_loop():
+    while True:
+        try:
+            kick_fundamental_ingestion()
+        except Exception as exc:
+            print("FUNDAMENTAL_SCHEDULER_ERROR =", str(exc))
+        time.sleep(60)
+
+
+def start_fundamental_ingestion_scheduler():
+    """Start one restart-safe scheduler without touching the trading engine loop."""
+    global _SCHEDULER_THREAD
+    with _SCHEDULER_LOCK:
+        if _SCHEDULER_THREAD is not None and _SCHEDULER_THREAD.is_alive():
+            return {"status": "ALREADY_RUNNING", "thread_id": _SCHEDULER_THREAD.ident}
+        _SCHEDULER_THREAD = threading.Thread(
+            target=_scheduler_loop,
+            name="flowsignal-fundamental-scheduler",
+            daemon=True,
+        )
+        _SCHEDULER_THREAD.start()
+        return {"status": "STARTED", "thread_id": _SCHEDULER_THREAD.ident}
