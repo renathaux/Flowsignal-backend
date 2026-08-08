@@ -61,6 +61,7 @@ from routes.performance import (
 )
 from routes.settings import router as settings_router
 from routes.trading import router as trading_router
+from routes.diagnostics import router as diagnostics_router
 from services.news_service import (
     fetch_calendar_events,
     get_calendar_data_age_seconds,
@@ -86,6 +87,7 @@ from services.auto_trade_state_service import (
     save_mode as save_durable_auto_trade_mode,
     save_state as save_durable_auto_trade_state,
 )
+from services.strategy_diagnostics_service import update_execution_outcome_safely
 from db import database_status as get_database_status, engine as database_engine
 from paths import DATA_DIR
 from risk_management.account_balance import (
@@ -157,6 +159,7 @@ app.include_router(settings_router)
 app.include_router(performance_router)
 app.include_router(ctrader_router)
 app.include_router(trading_router)
+app.include_router(diagnostics_router)
 
 @app.middleware("http")
 async def log_unhandled_api_errors(request: Request, call_next):
@@ -6693,6 +6696,15 @@ def run_ctrader_auto_trade_checks(panel_data):
     )
 
     if not LIVE_AUTO_TRADE_ENABLED["enabled"]:
+        for symbol in ["EURUSD", "XAUUSD"]:
+            plan = get_panel_trade_plan(panel_data, symbol) or {}
+            if str(plan.get("signal") or "WAIT").upper() in ["BUY", "SELL"]:
+                update_execution_outcome_safely(
+                    (plan.get("audit_diagnostics") or {}).get("cycle_id"),
+                    "BLOCKED",
+                    "LIVE_AUTO_OFF",
+                    {"gate": "live_auto_disabled", "order_sent": False},
+                )
         log_auto_trade_blocked_reason(
             stage="live_auto_disabled",
             reason="Live Auto is off"
@@ -6728,6 +6740,13 @@ def run_ctrader_auto_trade_checks(panel_data):
                 or news_state.get("authoritative_status")
                 or "NEWS BLOCK"
             )
+            if str(plan.get("signal") or "WAIT").upper() in ["BUY", "SELL"]:
+                update_execution_outcome_safely(
+                    (plan.get("audit_diagnostics") or {}).get("cycle_id"),
+                    "BLOCKED",
+                    reason,
+                    {"gate": "authoritative_news_gate", "order_sent": False},
+                )
             if news_state.get("phase") in {"PRE_NEWS", "RELEASE_LOCK"}:
                 try:
                     import brain
@@ -6769,6 +6788,12 @@ def run_ctrader_auto_trade_checks(panel_data):
             and not normal_plan_is_fresh_after_news(plan, news_state)
         ):
             reason = "WAIT_FRESH_NORMAL_SETUP_AFTER_NEWS"
+            update_execution_outcome_safely(
+                (plan.get("audit_diagnostics") or {}).get("cycle_id"),
+                "BLOCKED",
+                reason,
+                {"gate": "post_news_freshness", "order_sent": False},
+            )
             set_auto_trade_status(
                 symbol=symbol,
                 signal="WAIT",
@@ -6871,6 +6896,12 @@ def run_ctrader_auto_trade_checks(panel_data):
             print("AUTO TRADE XAUUSD ATTEMPT")
 
         if not broker_connected:
+            update_execution_outcome_safely(
+                (plan.get("audit_diagnostics") or {}).get("cycle_id"),
+                "BLOCKED",
+                broker_block_reason,
+                {"gate": "broker_connection", "order_sent": False},
+            )
             set_auto_trade_status(
                 symbol=symbol,
                 signal=signal,
@@ -6952,6 +6983,24 @@ def run_ctrader_auto_trade_checks(panel_data):
             source="auto"
         )
         results.append(result)
+        update_execution_outcome_safely(
+            (plan.get("audit_diagnostics") or {}).get("cycle_id"),
+            f"{signal}_EXECUTED" if result.get("ok") else "BLOCKED",
+            None if result.get("ok") else (
+                result.get("reason")
+                or result.get("message")
+                or result.get("result", {}).get("reason")
+                or "ORDER_REJECTED"
+            ),
+            {
+                "gate": "broker_submission",
+                "order_sent": bool(result.get("ok")),
+                "broker_position_id": (
+                    (result.get("active_order") or {}).get("broker_position_id")
+                    if result.get("ok") else None
+                ),
+            },
+        )
 
         if not result.get("ok"):
             log_live_xauusd_execution_debug(
