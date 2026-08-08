@@ -721,41 +721,17 @@ def build_manual_calendar_events(now=None):
                 "event_name": event_template["event_name"],
                 "event": event_template["event_name"],
                 "currency": event_template["currency"],
-                "impact": event_template["impact"],
+                "impact": "UNKNOWN",
                 "time": release_time,
                 "release_time": release_time,
                 "time_utc": release_time.isoformat(),
                 "source": "manual",
+                "data_status": "UNRELIABLE_STATIC",
+                "informational_only": True,
                 "actual": event_template.get("actual"),
                 "forecast": event_template.get("forecast"),
                 "previous": event_template.get("previous"),
             })
-
-    if not events:
-        tomorrow = start_date + timedelta(days=1)
-        release_time = datetime(
-            tomorrow.year,
-            tomorrow.month,
-            tomorrow.day,
-            12,
-            30,
-            tzinfo=timezone.utc,
-        )
-        events.append({
-            "event_name": (
-                "Manual calendar fallback: USD CPI / NFP / FOMC watch"
-            ),
-            "event": "Manual calendar fallback: USD CPI / NFP / FOMC watch",
-            "currency": "USD",
-            "impact": "HIGH",
-            "time": release_time,
-            "release_time": release_time,
-            "time_utc": release_time.isoformat(),
-            "source": "manual",
-            "actual": None,
-            "forecast": None,
-            "previous": None,
-        })
 
     return events
 
@@ -1251,7 +1227,7 @@ def normalize_impact(impact):
         return "MEDIUM"
     if "LOW" in text or text in ["1", "YELLOW"]:
         return "LOW"
-    return "LOW"
+    return "UNKNOWN"
 
 
 def normalize_event_time(value):
