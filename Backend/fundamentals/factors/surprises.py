@@ -23,6 +23,7 @@ PROVIDER_QUALITY = {
     "jblanked_live": 0.90,
     "jblanked": 0.90,
     "jblanked_cache": 0.85,
+    "jblanked_mql5": 0.90,
     "fmp": 0.85,
     "finnhub": 0.80,
     "manual": 0.0,
