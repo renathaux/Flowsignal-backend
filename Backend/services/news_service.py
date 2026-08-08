@@ -638,7 +638,15 @@ def fetch_fmp_calendar_events(timeout=8, now=None):
     normalized_events = []
     for raw_event in raw_events:
         if isinstance(raw_event, dict):
-            raw_event = {\n                **raw_event,\n                "event": first_present(raw_event, "event", "name"),\n                "forecast": first_present(\n                    raw_event, "forecast", "estimate", "consensus"\n                ),\n                "previous": first_present(raw_event, "previous", "prev"),\n                "source": "fmp",\n            }
+            raw_event = {
+                **raw_event,
+                "event": first_present(raw_event, "event", "name"),
+                "forecast": first_present(
+                    raw_event, "forecast", "estimate", "consensus"
+                ),
+                "previous": first_present(raw_event, "previous", "prev"),
+                "source": "fmp",
+            }
         event = normalize_event(raw_event)
         if event:
             event["source"] = "fmp"
