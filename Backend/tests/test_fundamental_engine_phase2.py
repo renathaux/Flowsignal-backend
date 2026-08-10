@@ -104,11 +104,11 @@ class FactorTests(unittest.TestCase):
         ], "EUR", now=NOW)
         self.assertGreater(result["score"], 0)
 
-    def test_stale_factor(self):
+    def test_quarterly_factor_remains_current_until_next_expected_release(self):
         result = calculate_growth_factor([
             macro_event("old-gdp", "EUR", "gdp", "2.0%", "1.5%", "1.4%", days=60)
         ], "EUR", now=NOW)
-        self.assertEqual(result["status"], "STALE")
+        self.assertEqual(result["status"], "ACTIVE")
 
     def test_recent_macro_evidence_dominates_old(self):
         recent = macro_event("recent", "USD", "gdp", "3%", "2%", "2%", days=2)
