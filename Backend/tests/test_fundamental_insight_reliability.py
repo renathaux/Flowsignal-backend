@@ -1,3 +1,4 @@
+import hashlib
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -11,12 +12,24 @@ from fundamentals.insight_service import (
     get_fundamental_insight,
 )
 from fundamentals.gold_insight_service import get_xauusd_fundamental_insight
-from fundamentals.repositories.observations import provider_health
+from fundamentals.normalization.indicators import EURUSD_ENGINE_INDICATOR_BASES
+from fundamentals.repositories import observations as observation_repository
+from fundamentals.repositories.observations import (
+    _serialize_authoritative,
+    historical_surprises_for_series,
+    latest_released_observations,
+    next_high_impact_event,
+    provider_health,
+    relevant_reconciled_observation_history,
+)
 from models import (
     Base,
+    CurrencyStrengthSnapshot,
     EconomicEvent,
     EconomicEventObservation,
     EconomicProviderFetch,
+    FundamentalFactorInput,
+    FundamentalInsightSnapshot,
 )
 from routes import fundamentals as fundamentals_route
 
@@ -77,6 +90,57 @@ class FundamentalInsightReliabilityTests(unittest.TestCase):
             ))
             session.commit()
 
+    def _seed_production_scale_history(self, relevant_count=300, irrelevant_count=491):
+        relevant_indicators = (
+            "cpi_y_y", "core_cpi_y_y", "nonfarm_payrolls",
+            "unemployment_rate", "gdp_q_q", "retail_sales_m_m",
+            "fed_interest_rate", "ecb_interest_rate",
+        )
+        irrelevant_indicators = (
+            "us_10y_real_yield", "us_10y_treasury_yield",
+            "baker_hughes_us_oil_rig_count", "financial_stress_index",
+        )
+        with self.sessions() as session:
+            for index in range(relevant_count + irrelevant_count):
+                relevant = index < relevant_count
+                indicator = (
+                    relevant_indicators[index % len(relevant_indicators)]
+                    if relevant
+                    else irrelevant_indicators[index % len(irrelevant_indicators)]
+                )
+                currency = "USD" if index % 2 else "EUR"
+                released = NOW - timedelta(days=(index % 730) + 1)
+                event_id = f"scale-{index}"
+                economic_event = EconomicEvent(
+                    event_id=event_id,
+                    event_name=f"{currency} {indicator}",
+                    indicator=indicator,
+                    country="United States" if currency == "USD" else "Euro Area",
+                    currency=currency,
+                    impact="HIGH",
+                    release_time=released,
+                    provider="bls" if currency == "USD" else "eurostat",
+                    provider_event_id=f"scale-provider-{index}",
+                    data_status="RELEASED",
+                    first_seen_at=released,
+                    last_seen_at=released,
+                )
+                session.add(economic_event)
+                session.flush()
+                session.add(EconomicEventObservation(
+                    observation_hash=hashlib.sha256(event_id.encode()).hexdigest(),
+                    economic_event_id=economic_event.id,
+                    actual=str(2.0 + (index % 25) / 10),
+                    forecast=str(1.9 + (index % 25) / 10),
+                    previous=str(1.8 + (index % 25) / 10),
+                    provider=economic_event.provider,
+                    provider_timestamp=released,
+                    fetched_at=released,
+                    data_status="RELEASED",
+                    raw_payload={"source": economic_event.provider, "padding": "x" * 512},
+                ))
+            session.commit()
+
     def test_request_path_has_bounded_select_count_and_no_provider_call(self):
         self._seed_history()
         statements = []
@@ -100,9 +164,141 @@ class FundamentalInsightReliabilityTests(unittest.TestCase):
             sqlalchemy_event.remove(self.engine, "before_cursor_execute", capture)
 
         self.assertEqual(response["symbol"], "EURUSD")
-        self.assertLessEqual(len(statements), 9)
+        self.assertLessEqual(len(statements), 8)
+        observation_loads = [
+            statement for statement in statements
+            if "economic_event_observations" in statement
+            and "economic_events.release_time DESC" in statement
+        ]
+        self.assertEqual(len(observation_loads), 1)
         self.assertLess(time.perf_counter() - started, 2.0)
         provider_fetch.assert_not_called()
+
+    def test_eurusd_load_filters_irrelevant_series_without_shortening_history(self):
+        self._seed_production_scale_history(relevant_count=400, irrelevant_count=40)
+        timings = {}
+        current, history = relevant_reconciled_observation_history(
+            ("EUR", "USD"),
+            EURUSD_ENGINE_INDICATOR_BASES,
+            now=NOW,
+            session_factory=self.sessions,
+            timing=timings,
+        )
+        loaded_indicators = {item["indicator"] for item in history}
+        self.assertTrue(loaded_indicators)
+        self.assertNotIn("us_10y_real_yield", loaded_indicators)
+        self.assertNotIn("us_10y_treasury_yield", loaded_indicators)
+        self.assertNotIn("baker_hughes_us_oil_rig_count", loaded_indicators)
+        self.assertNotIn("financial_stress_index", loaded_indicators)
+        def aware(value):
+            return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+        self.assertTrue(any(
+            aware(item["release_time"]) < NOW - timedelta(days=365)
+            for item in history
+        ))
+        self.assertTrue(all(
+            aware(item["release_time"]) >= NOW - timedelta(days=365)
+            for item in current
+        ))
+        self.assertEqual(timings["historical_surprise_query_ms"], 0.0)
+        self.assertEqual(timings["historical_surprise_reconciliation_ms"], 0.0)
+
+    def test_optimized_result_matches_legacy_result_semantics(self):
+        self._seed_history()
+        with self.sessions() as session:
+            released = NOW - timedelta(days=2)
+            event = EconomicEvent(
+                event_id="irrelevant-yield", event_name="US 10Y real yield",
+                indicator="us_10y_real_yield", country="United States",
+                currency="USD", impact="LOW", release_time=released,
+                provider="treasury", provider_event_id="treasury-yield",
+                data_status="RELEASED", first_seen_at=released,
+                last_seen_at=released,
+            )
+            session.add(event)
+            session.flush()
+            session.add(EconomicEventObservation(
+                observation_hash="f" * 64, economic_event_id=event.id,
+                actual="1.7", forecast=None, previous="1.5",
+                provider="treasury", provider_timestamp=released,
+                fetched_at=released, data_status="RELEASED", raw_payload={},
+            ))
+            session.commit()
+
+        legacy_observations = latest_released_observations(
+            ("EUR", "USD"), now=NOW, session_factory=self.sessions
+        )
+        legacy_history = historical_surprises_for_series(
+            {(item["currency"], item["indicator"]) for item in legacy_observations},
+            session_factory=self.sessions,
+        )
+        upcoming = next_high_impact_event(
+            ("EUR", "USD"), now=NOW, session_factory=self.sessions
+        )
+        legacy = get_fundamental_insight(
+            "EURUSD", now=NOW, observations=legacy_observations,
+            next_event=upcoming or {}, persist=False, ingest=False,
+            session_factory=self.sessions,
+            history_lookup_override=_history_lookup_from_observations(legacy_history),
+        )
+        optimized = get_fundamental_insight(
+            "EURUSD", now=NOW, persist=False, ingest=False,
+            session_factory=self.sessions,
+        )
+        self.assertEqual(optimized["overall_bias"], legacy["overall_bias"])
+        self.assertEqual(optimized["currency_strength"], legacy["currency_strength"])
+        self.assertEqual(optimized["top_reasons"], legacy["top_reasons"])
+        self.assertEqual(optimized["next_high_impact_event"], legacy["next_high_impact_event"])
+        self.assertEqual(optimized["trading_guidance"], legacy["trading_guidance"])
+        for key in (
+            "coverage_percent", "active_factors", "missing_factors",
+            "provisional_factor_count", "engine_readiness", "status",
+        ):
+            self.assertEqual(optimized["data_quality"][key], legacy["data_quality"][key])
+
+    def test_raw_payload_validation_metadata_is_computed_once_per_observation(self):
+        released = NOW - timedelta(days=1)
+        event = EconomicEvent(
+            event_id="payload-event", event_name="US CPI", indicator="cpi_y_y",
+            country="United States", currency="USD", impact="HIGH",
+            release_time=released, provider="bls", provider_event_id="payload-provider",
+            data_status="RELEASED", first_seen_at=released, last_seen_at=released,
+        )
+        observation = EconomicEventObservation(
+            observation_hash="a" * 64, actual="3.0", forecast="2.9",
+            previous="2.8", revised_previous="2.85", provider="bls",
+            provider_timestamp=released, fetched_at=released,
+            data_status="RELEASED",
+            raw_payload={"nested": {"release_time": released.isoformat()}},
+        )
+        with patch(
+            "fundamentals.repositories.observations._observation_validation_metadata",
+            wraps=observation_repository._observation_validation_metadata,
+        ) as metadata:
+            _serialize_authoritative(event, [observation])
+        self.assertEqual(metadata.call_count, 1)
+
+    def test_timing_record_uses_production_visible_logger(self):
+        with self.assertLogs("uvicorn.error", level="INFO") as records:
+            get_fundamental_insight(
+                "EURUSD", now=NOW, observations=[], next_event={},
+                persist=False, ingest=False, session_factory=self.sessions,
+            )
+        self.assertTrue(any(
+            "FUNDAMENTAL_INSIGHT_TIMING" in line and '"symbol": "EURUSD"' in line
+            for line in records.output
+        ))
+
+    def test_production_scale_request_is_below_two_seconds(self):
+        self._seed_production_scale_history()
+        started = time.perf_counter()
+        get_fundamental_insight(
+            "EURUSD", now=NOW, session_factory=self.sessions,
+            persist=False, ingest=False,
+        )
+        elapsed = time.perf_counter() - started
+        self.assertLess(elapsed, 2.0)
 
     def test_in_memory_history_is_series_scoped_and_strictly_earlier(self):
         observations = [
@@ -153,6 +349,24 @@ class FundamentalInsightReliabilityTests(unittest.TestCase):
         ) as insight:
             self.assertEqual(fundamentals_route.fundamental_insight("EURUSD"), expected)
         insight.assert_called_once_with("EURUSD", persist=False)
+
+    def test_read_only_get_creates_no_fundamental_snapshot_rows(self):
+        self._seed_history(count=12)
+        before = {}
+        with self.sessions() as session:
+            for model in (
+                FundamentalFactorInput,
+                CurrencyStrengthSnapshot,
+                FundamentalInsightSnapshot,
+            ):
+                before[model] = session.query(model).count()
+        get_fundamental_insight(
+            "EURUSD", now=NOW, session_factory=self.sessions,
+            persist=False, ingest=False,
+        )
+        with self.sessions() as session:
+            for model, count in before.items():
+                self.assertEqual(session.query(model).count(), count)
 
     def test_xauusd_does_not_promote_stale_inflation_or_employment(self):
         stale_time = NOW - timedelta(days=70)

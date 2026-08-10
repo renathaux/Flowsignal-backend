@@ -43,34 +43,38 @@ def _nested_values(payload):
             yield from _nested_values(value)
 
 
-def _reported_release_time(observation):
+def _observation_validation_metadata(observation):
+    """Derive raw-payload validation facts once for all authority fields."""
+    reported_release_time = None
+    placeholder_actual = False
+    bea_release_actual_source = ""
     for key, value in _nested_values(observation.raw_payload or {}):
-        if key in {"release_time", "datetime", "date", "timestamp", "time_utc"}:
-            parsed = normalize_datetime(value)
-            if parsed is not None:
-                return parsed
-    return None
+        if reported_release_time is None and key in {
+            "release_time", "datetime", "date", "timestamp", "time_utc",
+        }:
+            reported_release_time = normalize_datetime(value)
+        if key in {"outcome", "strength", "quality", "actual", "actual_value"}:
+            text = str(value or "").strip().lower()
+            if text in _PLACEHOLDER_MARKERS or any(
+                marker in text for marker in ("data not loaded", "not available")
+            ):
+                placeholder_actual = True
+        if not bea_release_actual_source and key == "release_actual_source":
+            bea_release_actual_source = str(value or "").lower()
+    return {
+        "reported_release_time": reported_release_time,
+        "jblanked_placeholder_actual": placeholder_actual,
+        "bea_release_actual_source": bea_release_actual_source,
+    }
 
 
-def _jblanked_placeholder(observation):
-    for key, value in _nested_values(observation.raw_payload or {}):
-        if key not in {"outcome", "strength", "quality", "actual", "actual_value"}:
-            continue
-        text = str(value or "").strip().lower()
-        if text in _PLACEHOLDER_MARKERS or any(marker in text for marker in ("data not loaded", "not available")):
-            return True
-    return False
-
-
-def _bea_archive_unit_mismatch(observation, field):
+def _bea_archive_unit_mismatch(observation, field, *, source=None):
     if field not in {"previous", "revised_previous"}:
         return False
-    payload = observation.raw_payload or {}
-    source = ""
-    for key, value in _nested_values(payload):
-        if key == "release_actual_source":
-            source = str(value or "").lower()
-            break
+    if source is None:
+        source = _observation_validation_metadata(observation)[
+            "bea_release_actual_source"
+        ]
     if "bea news archive" not in source:
         return False
     try:
@@ -83,9 +87,10 @@ def _bea_archive_unit_mismatch(observation, field):
         return False
 
 
-def _candidate_rejection(event, observation, field):
+def _candidate_rejection(event, observation, field, *, validation_metadata=None):
+    metadata = validation_metadata or _observation_validation_metadata(observation)
     provider = str(observation.provider or "").lower()
-    reported = _reported_release_time(observation)
+    reported = metadata["reported_release_time"]
     canonical = _utc(event.release_time)
     if reported is not None and canonical is not None:
         if abs((reported - canonical).total_seconds()) > 18 * 60 * 60:
@@ -93,9 +98,17 @@ def _candidate_rejection(event, observation, field):
     value = getattr(observation, field)
     if value in (None, ""):
         return "MISSING_VALUE"
-    if provider in _JBLANKED_PROVIDERS and field == "actual" and _jblanked_placeholder(observation):
+    if (
+        provider in _JBLANKED_PROVIDERS
+        and field == "actual"
+        and metadata["jblanked_placeholder_actual"]
+    ):
         return "JBLANKED_PLACEHOLDER_ACTUAL"
-    if provider == "bea" and _bea_archive_unit_mismatch(observation, field):
+    if provider == "bea" and _bea_archive_unit_mismatch(
+        observation,
+        field,
+        source=metadata["bea_release_actual_source"],
+    ):
         return "BEA_INCOMPATIBLE_PREVIOUS_UNIT"
     if field in {"actual", "forecast", "previous", "revised_previous"}:
         text = str(value).strip().lower()
@@ -142,10 +155,19 @@ def _serialize_authoritative(event, observations):
         "field_sources": {},
         "data_quality_rejections": [],
     }
+    validation_metadata = {
+        id(observation): _observation_validation_metadata(observation)
+        for observation in observations
+    }
     for field in ("actual", "forecast", "previous", "revised_previous"):
         candidates = []
         for observation in observations:
-            rejection = _candidate_rejection(event, observation, field)
+            rejection = _candidate_rejection(
+                event,
+                observation,
+                field,
+                validation_metadata=validation_metadata[id(observation)],
+            )
             if rejection:
                 if rejection != "MISSING_VALUE":
                     result["data_quality_rejections"].append({
@@ -250,6 +272,106 @@ def latest_released_observations(
         timing["economic_observation_rows"] = len(rows)
         timing["canonical_observations"] = len(result)
     return result
+
+
+def relevant_reconciled_observation_history(
+    currencies,
+    indicator_bases,
+    *,
+    now=None,
+    lookback_days=365,
+    session_factory=None,
+    timing=None,
+):
+    """Load and reconcile the complete relevant history exactly once.
+
+    The returned current observations retain the existing 365-day factor
+    horizon. Surprise history remains complete for every allowed series.
+    """
+    normalized_currencies = sorted({
+        str(value).upper() for value in currencies or () if value
+    })
+    normalized_bases = sorted({
+        str(value) for value in indicator_bases or () if value
+    })
+    if not normalized_currencies or not normalized_bases:
+        return [], []
+    factory = session_factory or SessionLocal
+    current = now or datetime.now(timezone.utc)
+    cutoff = current - timedelta(days=lookback_days)
+    indicator_filter = or_(*[
+        or_(
+            EconomicEvent.indicator == base,
+            EconomicEvent.indicator.startswith(f"{base}_", autoescape=True),
+        )
+        for base in normalized_bases
+    ])
+    with factory() as session:
+        connection_started = time.perf_counter()
+        session.connection()
+        if timing is not None:
+            timing["observation_connection_acquisition_ms"] = round(
+                (time.perf_counter() - connection_started) * 1000, 2
+            )
+            # The former second history connection/query is deliberately gone.
+            timing["history_connection_acquisition_ms"] = 0.0
+        query_started = time.perf_counter()
+        rows = (
+            session.query(EconomicEvent, EconomicEventObservation)
+            .join(
+                EconomicEventObservation,
+                EconomicEventObservation.economic_event_id == EconomicEvent.id,
+            )
+            .filter(
+                EconomicEvent.currency.in_(normalized_currencies),
+                indicator_filter,
+                EconomicEvent.release_time <= current,
+            )
+            .order_by(
+                EconomicEvent.release_time.desc(),
+                EconomicEventObservation.fetched_at.desc(),
+            )
+            .all()
+        )
+    if timing is not None:
+        timing["economic_observation_query_ms"] = round(
+            (time.perf_counter() - query_started) * 1000, 2
+        )
+        timing["historical_surprise_query_ms"] = 0.0
+    reconciliation_started = time.perf_counter()
+    reconciled = _group_authoritative(rows)
+    release_by_event_id = {
+        item.get("event_id"): _utc(item.get("release_time"))
+        for item in reconciled
+    }
+    current_observations = [
+        item for item in reconciled
+        if item.get("actual") is not None
+        and cutoff <= _utc(item.get("release_time")) <= current
+    ]
+    # The former current-window query could only derive a missing `previous`
+    # value from another event inside that same window. Preserve that boundary
+    # while still reconciling the complete history just once.
+    for item in current_observations:
+        derived_event_id = item.get("previous_derived_from_event_id")
+        derived_release = release_by_event_id.get(derived_event_id)
+        if derived_event_id and (derived_release is None or derived_release < cutoff):
+            item["previous"] = None
+            item["field_sources"]["previous"] = None
+            item.pop("previous_derived_from_event_id", None)
+    history_observations = [
+        item for item in reconciled
+        if item.get("actual") is not None and item.get("forecast") is not None
+    ]
+    if timing is not None:
+        timing["reconciliation_ms"] = round(
+            (time.perf_counter() - reconciliation_started) * 1000, 2
+        )
+        timing["historical_surprise_reconciliation_ms"] = 0.0
+        timing["economic_observation_rows"] = len(rows)
+        timing["canonical_observations"] = len(current_observations)
+        timing["historical_surprise_rows"] = len(history_observations)
+    return current_observations, history_observations
 
 
 def historical_surprises(indicator, currency, *, before=None, session_factory=None):

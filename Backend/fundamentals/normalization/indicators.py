@@ -38,6 +38,22 @@ INDICATOR_RULES = (
 )
 
 
+# The EURUSD engine consumes currency policy, inflation, employment, growth,
+# and surprise evidence. Yield and risk-sentiment series belong to the XAUUSD
+# engine and must not be hydrated by the EURUSD read path.
+EURUSD_ENGINE_CATEGORIES = frozenset({
+    "policy",
+    "inflation",
+    "employment",
+    "growth",
+})
+EURUSD_ENGINE_INDICATOR_BASES = frozenset(
+    indicator
+    for indicator, _patterns, category, _higher_bullish in INDICATOR_RULES
+    if category in EURUSD_ENGINE_CATEGORIES
+)
+
+
 FREQUENCY_QUALIFIERS = (
     ("m_m", (r"\bm\s*/\s*m\b", r"\bmom\b", r"month(?:ly|\s+over\s+month)")),
     ("q_q", (r"\bq\s*/\s*q\b", r"\bqoq\b", r"quarter(?:ly|\s+over\s+quarter)")),

@@ -7,17 +7,19 @@ import uuid
 from datetime import datetime, timezone
 
 from fundamentals.engine import calculate_fundamental_state
+from fundamentals.normalization.indicators import EURUSD_ENGINE_INDICATOR_BASES
 from fundamentals.pair_bias import SUPPORTED_PAIRS
 from fundamentals.repositories.observations import (
-    historical_surprises_for_series,
-    latest_released_observations,
     next_high_impact_event,
     provider_health,
+    relevant_reconciled_observation_history,
 )
 from fundamentals.repositories.snapshots import persist_insight
 
 
-logger = logging.getLogger(__name__)
+# Uvicorn owns the production log handlers. Using its error logger makes the
+# existing private timing record visible in Render without exposing it via API.
+logger = logging.getLogger("uvicorn.error")
 
 
 def _iso(value):
@@ -139,11 +141,13 @@ def get_fundamental_insight(
     current = now or datetime.now(timezone.utc)
     currencies = SUPPORTED_PAIRS[normalized]
     repository_observations = observations is None
+    history_rows = None
     if repository_observations:
         if ingest:
             _ingest_current_calendar_safely(current)
-        observations = latest_released_observations(
+        observations, history_rows = relevant_reconciled_observation_history(
             currencies,
+            EURUSD_ENGINE_INDICATOR_BASES,
             now=current,
             session_factory=session_factory,
             timing=timings,
@@ -159,14 +163,6 @@ def get_fundamental_insight(
     if history_lookup_override is not None:
         history_lookup = history_lookup_override
     elif repository_observations:
-        history_rows = historical_surprises_for_series(
-            {
-                (item.get("currency"), item.get("indicator"))
-                for item in observations
-            },
-            session_factory=session_factory,
-            timing=timings,
-        )
         history_lookup = _history_lookup_from_observations(history_rows)
     else:
         history_lookup = _history_lookup_from_observations(observations)
