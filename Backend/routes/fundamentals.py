@@ -18,7 +18,9 @@ def fundamental_insight(symbol: str = Query(default="EURUSD")):
         )
     if normalized == "XAUUSD":
         return get_xauusd_fundamental_insight()
-    return get_fundamental_insight(normalized)
+    # GET remains genuinely read-only. Snapshot creation belongs to an
+    # independent calculation/ingestion path, not the user-facing request.
+    return get_fundamental_insight(normalized, persist=False)
 
 
 @router.get("/health")

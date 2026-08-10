@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import re
+import time
 
-from sqlalchemy import func, or_
+from sqlalchemy import and_, func, or_
 
 from db import SessionLocal
 from fundamentals.authority import choose_field
@@ -206,11 +207,19 @@ def latest_released_observations(
     now=None,
     lookback_days=365,
     session_factory=None,
+    timing=None,
 ):
     factory = session_factory or SessionLocal
     current = now or datetime.now(timezone.utc)
     cutoff = current - timedelta(days=lookback_days)
     with factory() as session:
+        connection_started = time.perf_counter()
+        session.connection()
+        if timing is not None:
+            timing["observation_connection_acquisition_ms"] = round(
+                (time.perf_counter() - connection_started) * 1000, 2
+            )
+        query_started = time.perf_counter()
         rows = (
             session.query(EconomicEvent, EconomicEventObservation)
             .join(
@@ -228,7 +237,19 @@ def latest_released_observations(
             )
             .all()
         )
-        return [item for item in _group_authoritative(rows) if item.get("actual") is not None]
+    if timing is not None:
+        timing["economic_observation_query_ms"] = round(
+            (time.perf_counter() - query_started) * 1000, 2
+        )
+    reconciliation_started = time.perf_counter()
+    result = [item for item in _group_authoritative(rows) if item.get("actual") is not None]
+    if timing is not None:
+        timing["reconciliation_ms"] = round(
+            (time.perf_counter() - reconciliation_started) * 1000, 2
+        )
+        timing["economic_observation_rows"] = len(rows)
+        timing["canonical_observations"] = len(result)
+    return result
 
 
 def historical_surprises(indicator, currency, *, before=None, session_factory=None):
@@ -255,10 +276,73 @@ def historical_surprises(indicator, currency, *, before=None, session_factory=No
                 if item.get("actual") is not None and item.get("forecast") is not None]
 
 
-def next_high_impact_event(currencies, *, now=None, session_factory=None, indicators=None):
+def historical_surprises_for_series(series, *, session_factory=None, timing=None):
+    """Load all surprise history for a bounded set of series in one query."""
+    normalized = sorted({
+        (str(currency or "").upper(), str(indicator or ""))
+        for currency, indicator in series or ()
+        if currency and indicator
+    })
+    if not normalized:
+        return []
+    factory = session_factory or SessionLocal
+    with factory() as session:
+        connection_started = time.perf_counter()
+        session.connection()
+        if timing is not None:
+            timing["history_connection_acquisition_ms"] = round(
+                (time.perf_counter() - connection_started) * 1000, 2
+            )
+        query_started = time.perf_counter()
+        rows = (
+            session.query(EconomicEvent, EconomicEventObservation)
+            .join(
+                EconomicEventObservation,
+                EconomicEventObservation.economic_event_id == EconomicEvent.id,
+            )
+            .filter(or_(*[
+                and_(
+                    EconomicEvent.currency == currency,
+                    EconomicEvent.indicator == indicator,
+                )
+                for currency, indicator in normalized
+            ]))
+            .order_by(
+                EconomicEvent.release_time.desc(),
+                EconomicEventObservation.fetched_at.desc(),
+            )
+            .all()
+        )
+    if timing is not None:
+        timing["historical_surprise_query_ms"] = round(
+            (time.perf_counter() - query_started) * 1000, 2
+        )
+    reconciliation_started = time.perf_counter()
+    result = [
+        item for item in _group_authoritative(rows)
+        if item.get("actual") is not None and item.get("forecast") is not None
+    ]
+    if timing is not None:
+        timing["historical_surprise_reconciliation_ms"] = round(
+            (time.perf_counter() - reconciliation_started) * 1000, 2
+        )
+        timing["historical_surprise_rows"] = len(rows)
+    return result
+
+
+def next_high_impact_event(
+    currencies, *, now=None, session_factory=None, indicators=None, timing=None
+):
     factory = session_factory or SessionLocal
     current = now or datetime.now(timezone.utc)
     with factory() as session:
+        connection_started = time.perf_counter()
+        session.connection()
+        if timing is not None:
+            timing["next_event_connection_acquisition_ms"] = round(
+                (time.perf_counter() - connection_started) * 1000, 2
+            )
+        query_started = time.perf_counter()
         query = (
             session.query(EconomicEvent, EconomicEventObservation)
             .join(
@@ -289,59 +373,102 @@ def next_high_impact_event(currencies, *, now=None, session_factory=None, indica
             )
             .all()
         )
-        grouped = _group_authoritative(rows)
-        return grouped[0] if grouped else None
+    if timing is not None:
+        timing["next_event_query_ms"] = round(
+            (time.perf_counter() - query_started) * 1000, 2
+        )
+    reconciliation_started = time.perf_counter()
+    grouped = _group_authoritative(rows)
+    if timing is not None:
+        timing["next_event_reconciliation_ms"] = round(
+            (time.perf_counter() - reconciliation_started) * 1000, 2
+        )
+    return grouped[0] if grouped else None
 
 
-def provider_health(*, now=None, session_factory=None):
+def provider_health(*, now=None, session_factory=None, timing=None):
     factory = session_factory or SessionLocal
     current = now or datetime.now(timezone.utc)
     with factory() as session:
+        connection_started = time.perf_counter()
+        session.connection()
+        if timing is not None:
+            timing["provider_health_connection_acquisition_ms"] = round(
+                (time.perf_counter() - connection_started) * 1000, 2
+            )
+        query_started = time.perf_counter()
+        latest_completed = (
+            session.query(
+                EconomicProviderFetch.provider.label("provider"),
+                func.max(EconomicProviderFetch.completed_at).label("completed_at"),
+            )
+            .group_by(EconomicProviderFetch.provider)
+            .subquery()
+        )
         fetches = (
             session.query(EconomicProviderFetch)
-            .order_by(EconomicProviderFetch.completed_at.desc())
-            .limit(100)
+            .join(
+                latest_completed,
+                and_(
+                    EconomicProviderFetch.provider == latest_completed.c.provider,
+                    EconomicProviderFetch.completed_at == latest_completed.c.completed_at,
+                ),
+            )
             .all()
         )
-        latest_by_provider = {}
-        last_attempt = fetches[0].completed_at if fetches else None
-        last_success = None
-        failures = 0
-        authoritative = None
-        for row in fetches:
-            latest_by_provider.setdefault(row.provider, row)
-            if row.status == "FAILED":
-                failures += 1
-            if row.status == "SUCCESS" and row.provider in TRUSTED_PROVIDERS:
-                if last_success is None:
-                    last_success = row.completed_at
-                    authoritative = row.provider
+        latest_by_provider = {row.provider: row for row in fetches}
+        last_attempt = max((row.completed_at for row in fetches), default=None)
+        last_success_row = (
+            session.query(EconomicProviderFetch)
+            .filter(
+                EconomicProviderFetch.status == "SUCCESS",
+                EconomicProviderFetch.provider.in_(sorted(TRUSTED_PROVIDERS)),
+            )
+            .order_by(EconomicProviderFetch.completed_at.desc())
+            .limit(1)
+            .one_or_none()
+        )
+        last_success = last_success_row.completed_at if last_success_row else None
+        authoritative = last_success_row.provider if last_success_row else None
+        failures = (
+            session.query(func.count(EconomicProviderFetch.id))
+            .filter(
+                EconomicProviderFetch.status == "FAILED",
+                EconomicProviderFetch.completed_at >= current - timedelta(hours=24),
+            )
+            .scalar()
+            or 0
+        )
         observation_count = session.query(func.count(EconomicEventObservation.id)).scalar() or 0
         event_count = session.query(func.count(EconomicEvent.id)).scalar() or 0
-        if last_success and last_success.tzinfo is None:
-            last_success = last_success.replace(tzinfo=timezone.utc)
-        if last_attempt and last_attempt.tzinfo is None:
-            last_attempt = last_attempt.replace(tzinfo=timezone.utc)
-        stale_age = (
-            max(0.0, (current - last_success).total_seconds())
-            if last_success
-            else None
+    if timing is not None:
+        timing["provider_health_query_ms"] = round(
+            (time.perf_counter() - query_started) * 1000, 2
         )
-        return {
-            "last_successful_provider_fetch": last_success,
-            "last_provider_fetch_attempt": last_attempt,
-            "authoritative_provider": authoritative,
-            "stale_age_seconds": stale_age,
-            "observation_count": int(observation_count),
-            "event_count": int(event_count),
-            "provider_failures_recent": failures,
-            "providers": {
-                provider: {
-                    "status": row.status,
-                    "completed_at": row.completed_at,
-                    "error": row.error,
-                    "event_count": row.normalized_event_count,
-                }
-                for provider, row in latest_by_provider.items()
-            },
-        }
+    if last_success and last_success.tzinfo is None:
+        last_success = last_success.replace(tzinfo=timezone.utc)
+    if last_attempt and last_attempt.tzinfo is None:
+        last_attempt = last_attempt.replace(tzinfo=timezone.utc)
+    stale_age = (
+        max(0.0, (current - last_success).total_seconds())
+        if last_success
+        else None
+    )
+    return {
+        "last_successful_provider_fetch": last_success,
+        "last_provider_fetch_attempt": last_attempt,
+        "authoritative_provider": authoritative,
+        "stale_age_seconds": stale_age,
+        "observation_count": int(observation_count),
+        "event_count": int(event_count),
+        "provider_failures_recent": int(failures),
+        "providers": {
+            provider: {
+                "status": row.status,
+                "completed_at": row.completed_at,
+                "error": row.error,
+                "event_count": row.normalized_event_count,
+            }
+            for provider, row in latest_by_provider.items()
+        },
+    }

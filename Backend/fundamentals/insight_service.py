@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import json
+import logging
+import time
 import uuid
 from datetime import datetime, timezone
 
 from fundamentals.engine import calculate_fundamental_state
 from fundamentals.pair_bias import SUPPORTED_PAIRS
 from fundamentals.repositories.observations import (
-    historical_surprises,
+    historical_surprises_for_series,
     latest_released_observations,
     next_high_impact_event,
     provider_health,
 )
 from fundamentals.repositories.snapshots import persist_insight
+
+
+logger = logging.getLogger(__name__)
 
 
 def _iso(value):
@@ -74,6 +80,46 @@ def _ingest_current_calendar_safely(now):
         print("FUNDAMENTAL_CALENDAR_INGEST_WARNING =", str(exc))
 
 
+def _history_lookup_from_observations(observations):
+    """Build surprise history from the already reconciled request dataset.
+
+    The previous implementation opened a new database session and repeated a
+    full historical query for every candidate event. Reusing one reconciled
+    history collection eliminates that read-path N+1 query pattern.
+    """
+    def released(item):
+        value = item.get("release_time")
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    by_series = {}
+    for item in observations or []:
+        if item.get("actual") is None or item.get("forecast") is None:
+            continue
+        key = (str(item.get("currency") or "").upper(), item.get("indicator"))
+        by_series.setdefault(key, []).append(item)
+    for rows in by_series.values():
+        rows.sort(
+            key=lambda item: released(item)
+            or datetime.min.replace(tzinfo=timezone.utc)
+        )
+
+    def lookup(event):
+        key = (str(event.get("currency") or "").upper(), event.get("indicator"))
+        before = released(event)
+        if before is None:
+            return []
+        return [
+            item for item in by_series.get(key, ())
+            if released(item) is not None and released(item) < before
+        ]
+
+    return lookup
+
+
 def get_fundamental_insight(
     symbol="EURUSD",
     *,
@@ -85,42 +131,57 @@ def get_fundamental_insight(
     ingest=False,
     history_lookup_override=None,
 ):
+    request_started = time.perf_counter()
+    timings = {"snapshot_persistence_ms": 0.0, "external_provider_calls": 0}
     normalized = str(symbol or "").upper().replace("/", "")
     if normalized not in SUPPORTED_PAIRS:
         raise ValueError("Phase 1 supports EURUSD only")
     current = now or datetime.now(timezone.utc)
     currencies = SUPPORTED_PAIRS[normalized]
-    if observations is None:
+    repository_observations = observations is None
+    if repository_observations:
         if ingest:
             _ingest_current_calendar_safely(current)
         observations = latest_released_observations(
             currencies,
             now=current,
             session_factory=session_factory,
+            timing=timings,
         )
     if next_event is None:
         next_event = next_high_impact_event(
             currencies,
             now=current,
             session_factory=session_factory,
+            timing=timings,
         )
 
-    def repository_history_lookup(event):
-        return historical_surprises(
-            event.get("indicator"),
-            event.get("currency"),
-            before=event.get("release_time"),
+    if history_lookup_override is not None:
+        history_lookup = history_lookup_override
+    elif repository_observations:
+        history_rows = historical_surprises_for_series(
+            {
+                (item.get("currency"), item.get("indicator"))
+                for item in observations
+            },
             session_factory=session_factory,
+            timing=timings,
         )
+        history_lookup = _history_lookup_from_observations(history_rows)
+    else:
+        history_lookup = _history_lookup_from_observations(observations)
 
-    history_lookup = history_lookup_override or repository_history_lookup
-
+    calculation_started = time.perf_counter()
     state = calculate_fundamental_state(
         normalized,
         observations,
         history_lookup=history_lookup,
         now=current,
     )
+    timings["factor_calculation_and_evidence_ms"] = round(
+        (time.perf_counter() - calculation_started) * 1000, 2
+    )
+    serialization_started = time.perf_counter()
     serialized_currencies = {
         currency: _serialize_currency(result)
         for currency, result in state["currency_strength"].items()
@@ -147,7 +208,9 @@ def get_fundamental_insight(
     sources = sorted({str(item.get("provider") or "unknown") for item in observations})
     fallback_active = bool(sources) and all(source.startswith("manual") for source in sources)
     try:
-        health = provider_health(now=current, session_factory=session_factory)
+        health = provider_health(
+            now=current, session_factory=session_factory, timing=timings
+        )
     except Exception as exc:
         health = {
             "last_successful_provider_fetch": None,
@@ -214,7 +277,16 @@ def get_fundamental_insight(
         },
         "read_only": True,
     }
+    timings["response_construction_ms"] = round(
+        (time.perf_counter() - serialization_started) * 1000, 2
+    )
+    serialization_started = time.perf_counter()
+    json.dumps(response, default=str)
+    timings["response_serialization_estimate_ms"] = round(
+        (time.perf_counter() - serialization_started) * 1000, 2
+    )
     if persist:
+        persistence_started = time.perf_counter()
         try:
             persist_insight(
                 calculation_id,
@@ -225,4 +297,12 @@ def get_fundamental_insight(
             )
         except Exception as exc:
             print("FUNDAMENTAL_SNAPSHOT_PERSIST_WARNING =", str(exc))
+        timings["snapshot_persistence_ms"] = round(
+            (time.perf_counter() - persistence_started) * 1000, 2
+        )
+    timings["total_service_ms"] = round((time.perf_counter() - request_started) * 1000, 2)
+    logger.info(
+        "FUNDAMENTAL_INSIGHT_TIMING %s",
+        json.dumps({"symbol": normalized, **timings}, sort_keys=True),
+    )
     return response
