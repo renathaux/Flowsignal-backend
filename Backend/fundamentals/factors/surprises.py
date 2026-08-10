@@ -6,6 +6,7 @@ import statistics
 from datetime import datetime, timedelta, timezone
 
 from fundamentals.normalization.indicators import indicator_metadata
+from fundamentals.freshness import evidence_freshness
 
 
 HISTORICAL_Z_MIN_SAMPLES = 8
@@ -26,9 +27,15 @@ PROVIDER_QUALITY = {
     "jblanked_mql5": 0.90,
     "fmp": 0.85,
     "finnhub": 0.80,
+    "bls": 1.0,
+    "bea": 1.0,
+    "eurostat": 1.0,
+    "federal_reserve": 1.0,
+    "ecb": 1.0,
     "manual": 0.0,
     "unknown": 0.25,
 }
+OFFICIAL_PROVIDERS = {"bls", "bea", "eurostat", "federal_reserve", "ecb"}
 DENOMINATOR_FLOOR = {
     "nonfarm_payrolls": 50_000.0,
     "jobless_claims": 10_000.0,
@@ -82,6 +89,10 @@ def score_event_surprise(event, historical_surprises=None, now=None):
     impact = str(event.get("impact") or "UNKNOWN").upper()
     quality = PROVIDER_QUALITY.get(provider, PROVIDER_QUALITY["unknown"])
     importance = IMPORTANCE_WEIGHT.get(impact, 0.0)
+    if importance <= 0 and provider in OFFICIAL_PROVIDERS and metadata["recognized"]:
+        # This is an internal evidence weight, not an inferred event impact.
+        # The externally reported impact remains UNKNOWN.
+        importance = 1.0 if metadata["category"] == "policy" else 0.65
     if event.get("data_status") == "UNRELIABLE_STATIC" or quality <= 0:
         return {"status": "UNRELIABLE_SOURCE", "score": None, "event_id": event.get("event_id")}
     if raw is None:
@@ -110,6 +121,7 @@ def score_event_surprise(event, historical_surprises=None, now=None):
     if metadata["higher_is_currency_bullish"] is False:
         base_score *= -1
     freshness = recency_weight(event.get("release_time"), now=now)
+    freshness_state = evidence_freshness(event, now=now)
     contribution = base_score * importance * freshness * quality
     revision_stability = 1.0
     previous = parse_numeric(event.get("previous"))
@@ -134,6 +146,10 @@ def score_event_surprise(event, historical_surprises=None, now=None):
         "revision_stability": round(revision_stability, 6),
         "release_time": event.get("release_time"),
         "provider": provider,
+        "freshness_status": freshness_state["status"],
+        "freshness_reason": freshness_state["reason"],
+        "expected_next_release": freshness_state["expected_next_release"],
+        "valid_until": freshness_state["valid_until"],
     }
 
 
@@ -148,7 +164,11 @@ def score_currency_surprises(events, currency, history_lookup=None, now=None):
         current = now or datetime.now(timezone.utc)
         if release_time.tzinfo is None:
             release_time = release_time.replace(tzinfo=timezone.utc)
-        if current - release_time > timedelta(days=90):
+        freshness_state = evidence_freshness(event, now=current)
+        if (
+            current - release_time > timedelta(days=90)
+            and freshness_state["status"] != "ACTIVE"
+        ):
             continue
         history_rows = history_lookup(event) if history_lookup else []
         history = [raw_surprise(item) for item in history_rows]
@@ -188,13 +208,9 @@ def score_currency_surprises(events, currency, history_lookup=None, now=None):
     return {
         "factor": "surprise_score",
         "score": round(_clamp(score), 2),
-        "status": (
-            "ACTIVE"
-            if max(item["recency_weight"] for item in evidence) >= recency_weight(
-                (now or datetime.now(timezone.utc)) - timedelta(days=45), now=now
-            )
-            else "STALE"
-        ),
+        "status": "ACTIVE" if any(
+            item.get("freshness_status") == "ACTIVE" for item in evidence
+        ) else "STALE",
         "coverage": round(coverage, 4),
         "confidence": round(confidence, 2),
         "method": (
