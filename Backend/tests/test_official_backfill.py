@@ -10,6 +10,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from fundamentals.official_backfill import _validate_manifest, run_official_backfill
+from fundamentals import locks as lock_module
 from models import Base, EconomicEvent, EconomicEventObservation, EconomicEventProviderLink
 
 
@@ -93,6 +94,22 @@ class OfficialBackfillTests(unittest.TestCase):
                 imported.append(node.module or "")
         forbidden = ("broker", "strategy", "trade", "ctrader", "news_mode", "auto_trade")
         self.assertFalse([name for name in imported if any(term in name.lower() for term in forbidden)])
+
+    def test_postgres_session_locks_use_direct_migration_endpoint(self):
+        class Dialect:
+            name = "postgresql"
+        class PooledBind:
+            dialect = Dialect()
+        direct = object()
+        lock_module._DIRECT_ENGINE = None
+        lock_module._DIRECT_ENGINE_URL = None
+        with unittest.mock.patch.dict(
+            "os.environ",
+            {"MIGRATION_DATABASE_URL": "postgres://user:pass@direct.example/neondb"},
+        ), unittest.mock.patch.object(lock_module, "create_engine", return_value=direct) as creator:
+            selected = lock_module._coordination_bind(PooledBind())
+        self.assertIs(selected, direct)
+        self.assertEqual(creator.call_args.args[0], "postgresql://user:pass@direct.example/neondb")
 
 
 if __name__ == "__main__":
