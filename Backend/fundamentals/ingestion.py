@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from fundamentals.config import FUNDAMENTAL_INGEST_INTERVAL_SECONDS
+from db import SessionLocal
+from fundamentals.config import (
+    FUNDAMENTAL_INGEST_INTERVAL_SECONDS,
+    OFFICIAL_INGEST_INTERVAL_SECONDS,
+    OFFICIAL_INGEST_LOOKBACK_DAYS,
+)
 from fundamentals.repositories.economic_events import (
     persist_calendar_batch,
     record_failed_fetch,
 )
 from fundamentals.repositories.observations import provider_health
 from fundamentals.locks import LIVE_INGESTION_LOCK_KEY, advisory_lock
+from models import EconomicProviderFetch
 
 
 _INGEST_LOCK = threading.Lock()
@@ -19,6 +25,69 @@ _WORKER_THREAD = None
 _LAST_KICK_MONOTONIC = 0.0
 _SCHEDULER_LOCK = threading.Lock()
 _SCHEDULER_THREAD = None
+
+
+def _official_last_attempt(provider, session_factory=None):
+    factory = session_factory or SessionLocal
+    with factory() as session:
+        return session.query(EconomicProviderFetch.completed_at).filter_by(
+            provider=provider
+        ).order_by(EconomicProviderFetch.completed_at.desc()).limit(1).scalar()
+
+
+def _official_provider_due(provider, current, *, session_factory=None):
+    last = _official_last_attempt(provider, session_factory=session_factory)
+    if last is None:
+        return True
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return (current - last).total_seconds() >= OFFICIAL_INGEST_INTERVAL_SECONDS
+
+
+def collect_official_provider_data(*, now=None, timeout=20, session_factory=None, fetchers=None):
+    """Refresh recent official releases on a low-frequency independent cadence."""
+    current = now or datetime.now(timezone.utc)
+    if fetchers is None:
+        from fundamentals.providers import bea, bls, ecb, eurostat, federal_reserve
+
+        fetchers = {
+            "bls": bls.fetch_range,
+            "bea": bea.fetch_range,
+            "eurostat": eurostat.fetch_range,
+            "federal_reserve": federal_reserve.fetch_range,
+            "ecb": ecb.fetch_range,
+        }
+    date_from = (current - timedelta(days=OFFICIAL_INGEST_LOOKBACK_DAYS)).date().isoformat()
+    date_to = current.date().isoformat()
+    results = {"successful_providers": [], "failed_providers": [], "event_count": 0}
+    for provider, fetch_provider in fetchers.items():
+        if not _official_provider_due(provider, current, session_factory=session_factory):
+            continue
+        started_at = datetime.now(timezone.utc)
+        try:
+            payload = fetch_provider(date_from, date_to, ("EUR", "USD"), timeout=timeout)
+            normalized = payload.get("normalized_events") or []
+            persisted = persist_calendar_batch(
+                provider,
+                normalized,
+                normalized,
+                started_at=started_at,
+                completed_at=datetime.now(timezone.utc),
+                session_factory=session_factory,
+            )
+            results["event_count"] += int(persisted.get("events") or 0)
+            results["successful_providers"].append(provider)
+        except Exception as exc:
+            results["failed_providers"].append({"provider": provider, "error": str(exc)})
+            try:
+                record_failed_fetch(
+                    provider, exc, started_at=started_at, session_factory=session_factory
+                )
+            except Exception as persistence_exc:
+                print("FUNDAMENTAL_OFFICIAL_FAILURE_PERSIST_ERROR =", {
+                    "provider": provider, "error": str(persistence_exc),
+                })
+    return results
 
 
 def collect_provider_data(*, now=None, timeout=8):
@@ -63,6 +132,10 @@ def collect_provider_data(*, now=None, timeout=8):
                     "provider": provider,
                     "error": str(persistence_exc),
                 })
+    official = collect_official_provider_data(now=current, timeout=max(timeout, 20))
+    total_events += int(official.get("event_count") or 0)
+    successful.extend(official.get("successful_providers") or [])
+    failed.extend(official.get("failed_providers") or [])
     return {
         "status": "FETCHED" if successful else "FAILED",
         "event_count": total_events,
