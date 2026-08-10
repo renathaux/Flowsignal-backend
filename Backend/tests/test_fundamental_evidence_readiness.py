@@ -125,6 +125,25 @@ class EffectiveEvidenceTests(unittest.TestCase):
         self.assertEqual(result["status"], "ACTIVE")
         self.assertLess(result["score"], 0)
 
+    def test_bea_archive_previous_with_incompatible_units_is_derived(self):
+        for index, actual in enumerate(("0.3%", "0.4%")):
+            self.persist("bea", {
+                "event_name": "US PCE Price Index", "indicator": "pce",
+                "currency": "USD", "release_time": NOW - timedelta(days=60 - index * 30),
+                "actual": actual, "previous": "130.932",
+                "provider_event_id": f"bea-pce-{index}", "provider_dataset": "nipa",
+                "raw": {"release_actual_source": "BEA news archive"},
+            })
+        latest = latest_released_observations(
+            ["USD"], now=NOW, session_factory=self.sessions
+        )[0]
+        self.assertEqual(latest["actual"], "0.4%")
+        self.assertEqual(latest["previous"], "0.3%")
+        self.assertEqual(latest["field_sources"]["previous"], "bea")
+        self.assertIn("BEA_INCOMPATIBLE_PREVIOUS_UNIT", {
+            item["reason"] for item in latest["data_quality_rejections"]
+        })
+
     def test_eurostat_employment_without_forecast_is_selected(self):
         self.persist("eurostat", {
             "event_name": "Euro Area Employment Change q/q",
