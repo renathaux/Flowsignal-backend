@@ -204,7 +204,7 @@ class FundamentalApiTests(unittest.TestCase):
             response = fundamentals_route.fundamental_insight("EURUSD")
         self.assertEqual(response, expected)
         with self.assertRaises(HTTPException) as invalid:
-            fundamentals_route.fundamental_insight("XAUUSD")
+            fundamentals_route.fundamental_insight("GBPUSD")
         self.assertEqual(invalid.exception.status_code, 422)
 
 

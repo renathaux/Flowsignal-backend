@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import re
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 
 from db import SessionLocal
 from fundamentals.authority import choose_field
@@ -14,7 +14,7 @@ from models import EconomicEvent, EconomicEventObservation, EconomicProviderFetc
 TRUSTED_PROVIDERS = {
     "jblanked", "jblanked_live", "jblanked_cache", "jblanked_mql5",
     "jblanked_forex_factory", "jblanked_fxstreet", "fmp", "finnhub",
-    "bls", "bea", "eurostat", "federal_reserve", "ecb",
+    "bls", "bea", "eurostat", "federal_reserve", "ecb", "treasury", "fred",
 }
 
 _JBLANKED_PROVIDERS = {item for item in TRUSTED_PROVIDERS if item.startswith("jblanked")}
@@ -255,11 +255,11 @@ def historical_surprises(indicator, currency, *, before=None, session_factory=No
                 if item.get("actual") is not None and item.get("forecast") is not None]
 
 
-def next_high_impact_event(currencies, *, now=None, session_factory=None):
+def next_high_impact_event(currencies, *, now=None, session_factory=None, indicators=None):
     factory = session_factory or SessionLocal
     current = now or datetime.now(timezone.utc)
     with factory() as session:
-        rows = (
+        query = (
             session.query(EconomicEvent, EconomicEventObservation)
             .join(
                 EconomicEventObservation,
@@ -272,7 +272,18 @@ def next_high_impact_event(currencies, *, now=None, session_factory=None):
                 EconomicEvent.data_status != "UNRELIABLE_STATIC",
                 EconomicEvent.provider.in_(sorted(TRUSTED_PROVIDERS)),
             )
-            .order_by(
+        )
+        if indicators:
+            bases = sorted(set(indicators))
+            query = query.filter(or_(*[
+                or_(
+                    EconomicEvent.indicator == base,
+                    EconomicEvent.indicator.like(f"{base}_%"),
+                )
+                for base in bases
+            ]))
+        rows = (
+            query.order_by(
                 EconomicEvent.release_time.asc(),
                 EconomicEventObservation.fetched_at.desc(),
             )

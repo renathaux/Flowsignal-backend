@@ -16,7 +16,7 @@ from pathlib import Path
 from db import SessionLocal, engine
 from fundamentals.locks import HISTORICAL_BACKFILL_LOCK_KEY, LIVE_INGESTION_LOCK_KEY, advisory_lock
 from fundamentals.preflight import parse_currencies
-from fundamentals.providers import bea, ecb, eurostat, federal_reserve
+from fundamentals.providers import bea, ecb, eurostat, federal_reserve, treasury
 from fundamentals.providers import bls as bls_provider
 from fundamentals.providers.official_common import official_event
 from fundamentals.repositories.economic_events import persist_calendar_batch_in_session, preview_calendar_batch
@@ -28,6 +28,7 @@ PROVIDERS = {
     "eurostat": eurostat.fetch_range,
     "federal_reserve": federal_reserve.fetch_range,
     "ecb": ecb.fetch_range,
+    "treasury": treasury.fetch_range,
 }
 DEFAULT_MANIFEST = Path(__file__).with_name("bls_timestamp_manifest_12m.json")
 

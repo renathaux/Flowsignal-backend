@@ -32,10 +32,12 @@ PROVIDER_QUALITY = {
     "eurostat": 1.0,
     "federal_reserve": 1.0,
     "ecb": 1.0,
+    "treasury": 1.0,
+    "fred": 0.95,
     "manual": 0.0,
     "unknown": 0.25,
 }
-OFFICIAL_PROVIDERS = {"bls", "bea", "eurostat", "federal_reserve", "ecb"}
+OFFICIAL_PROVIDERS = {"bls", "bea", "eurostat", "federal_reserve", "ecb", "treasury", "fred"}
 DENOMINATOR_FLOOR = {
     "nonfarm_payrolls": 50_000.0,
     "jobless_claims": 10_000.0,

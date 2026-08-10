@@ -10,7 +10,7 @@ from fundamentals.normalization.indicators import indicator_metadata
 
 
 RULE_VERSION = "official-v1"
-OFFICIAL_PROVIDERS = {"bls", "bea", "eurostat", "federal_reserve", "ecb"}
+OFFICIAL_PROVIDERS = {"bls", "bea", "eurostat", "federal_reserve", "ecb", "treasury", "fred"}
 JBLANKED_PROVIDERS = {
     "jblanked", "jblanked_live", "jblanked_cache", "jblanked_mql5",
     "jblanked_forex_factory", "jblanked_fxstreet",
@@ -21,6 +21,8 @@ def expected_official_provider(indicator, currency):
     base = indicator_metadata(indicator).get("base_indicator")
     currency = str(currency or "").upper()
     if currency == "USD":
+        if base in {"us_10y_treasury_yield", "us_10y_real_yield"}:
+            return "treasury"
         if base in {
             "cpi", "core_cpi", "ppi", "nonfarm_payrolls",
             "unemployment_rate", "average_hourly_earnings",

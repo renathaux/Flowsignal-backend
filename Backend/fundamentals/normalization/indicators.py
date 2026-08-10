@@ -2,6 +2,9 @@ import re
 
 
 INDICATOR_RULES = (
+    ("us_10y_real_yield", ("us 10y real yield", "10-year real yield", "10 year real yield", "dfii10"), "yields", False),
+    ("us_10y_treasury_yield", ("us 10y treasury yield", "10-year treasury yield", "10 year treasury yield", "dgs10"), "yields", False),
+    ("financial_stress_index", ("financial stress index", "stlfsi"), "risk_sentiment", False),
     ("average_hourly_earnings", ("average hourly earnings", "wage growth", "earnings"), "employment", True),
     ("core_cpi", ("core cpi", "core consumer price"), "inflation", True),
     ("cpi", ("cpi", "consumer price"), "inflation", True),

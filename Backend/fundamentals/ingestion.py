@@ -48,7 +48,7 @@ def collect_official_provider_data(*, now=None, timeout=20, session_factory=None
     """Refresh recent official releases on a low-frequency independent cadence."""
     current = now or datetime.now(timezone.utc)
     if fetchers is None:
-        from fundamentals.providers import bea, bls, ecb, eurostat, federal_reserve
+        from fundamentals.providers import bea, bls, ecb, eurostat, federal_reserve, treasury
 
         fetchers = {
             "bls": bls.fetch_range,
@@ -56,6 +56,7 @@ def collect_official_provider_data(*, now=None, timeout=20, session_factory=None
             "eurostat": eurostat.fetch_range,
             "federal_reserve": federal_reserve.fetch_range,
             "ecb": ecb.fetch_range,
+            "treasury": treasury.fetch_range,
         }
     date_from = (current - timedelta(days=OFFICIAL_INGEST_LOOKBACK_DAYS)).date().isoformat()
     date_to = current.date().isoformat()
