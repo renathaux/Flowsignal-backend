@@ -5,12 +5,14 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func
 
 from db import SessionLocal
+from fundamentals.authority import choose_field
 from models import EconomicEvent, EconomicEventObservation, EconomicProviderFetch
 
 
 TRUSTED_PROVIDERS = {
     "jblanked", "jblanked_live", "jblanked_cache", "jblanked_mql5",
     "jblanked_forex_factory", "jblanked_fxstreet", "fmp", "finnhub",
+    "bls", "bea", "eurostat", "federal_reserve", "ecb",
 }
 
 
@@ -35,6 +37,50 @@ def _serialize(event, observation):
     }
 
 
+def _serialize_authoritative(event, observations):
+    """Merge fields by authority while preserving source attribution per field."""
+    result = {
+        "event_id": event.event_id,
+        "event_name": event.event_name,
+        "indicator": event.indicator,
+        "country": event.country,
+        "currency": event.currency,
+        "impact": event.impact,
+        "release_time": event.release_time,
+        "provider_event_id": event.provider_event_id,
+        "data_status": event.data_status,
+        "field_sources": {},
+    }
+    for field in ("actual", "forecast", "previous", "revised_previous"):
+        candidates = [{
+            "value": getattr(observation, field),
+            "provider": observation.provider,
+            "sequence": observation.id or 0,
+            "observation": observation,
+        } for observation in observations]
+        selected = choose_field(field, candidates, event.indicator, event.currency)
+        result[field] = selected["value"] if selected else None
+        result["field_sources"][field] = selected["provider"] if selected else None
+    actual_source = result["field_sources"].get("actual")
+    forecast_source = result["field_sources"].get("forecast")
+    selected_observation = next((
+        item for item in observations if item.provider == actual_source
+    ), observations[0] if observations else None)
+    result.update({
+        "provider": actual_source or forecast_source or event.provider,
+        "provider_timestamp": selected_observation.provider_timestamp if selected_observation else None,
+        "fetched_at": max((item.fetched_at for item in observations), default=event.last_seen_at),
+    })
+    return result
+
+
+def _group_authoritative(rows):
+    grouped = {}
+    for event, observation in rows:
+        grouped.setdefault(event.id, [event, []])[1].append(observation)
+    return [_serialize_authoritative(event, observations) for event, observations in grouped.values()]
+
+
 def latest_released_observations(
     currencies,
     *,
@@ -56,8 +102,6 @@ def latest_released_observations(
                 EconomicEvent.currency.in_([str(value).upper() for value in currencies]),
                 EconomicEvent.release_time <= current,
                 EconomicEvent.release_time >= cutoff,
-                EconomicEventObservation.actual.isnot(None),
-                EconomicEventObservation.forecast.isnot(None),
             )
             .order_by(
                 EconomicEvent.release_time.desc(),
@@ -65,10 +109,8 @@ def latest_released_observations(
             )
             .all()
         )
-        latest = {}
-        for event, observation in rows:
-            latest.setdefault(event.event_id, _serialize(event, observation))
-        return list(latest.values())
+        return [item for item in _group_authoritative(rows)
+                if item.get("actual") is not None and item.get("forecast") is not None]
 
 
 def historical_surprises(indicator, currency, *, before=None, session_factory=None):
@@ -83,8 +125,6 @@ def historical_surprises(indicator, currency, *, before=None, session_factory=No
             .filter(
                 EconomicEvent.indicator == indicator,
                 EconomicEvent.currency == currency,
-                EconomicEventObservation.actual.isnot(None),
-                EconomicEventObservation.forecast.isnot(None),
             )
         )
         if before is not None:
@@ -93,17 +133,15 @@ def historical_surprises(indicator, currency, *, before=None, session_factory=No
             EconomicEvent.release_time.desc(),
             EconomicEventObservation.fetched_at.desc(),
         ).all()
-        latest = {}
-        for event, observation in rows:
-            latest.setdefault(event.event_id, _serialize(event, observation))
-        return list(latest.values())
+        return [item for item in _group_authoritative(rows)
+                if item.get("actual") is not None and item.get("forecast") is not None]
 
 
 def next_high_impact_event(currencies, *, now=None, session_factory=None):
     factory = session_factory or SessionLocal
     current = now or datetime.now(timezone.utc)
     with factory() as session:
-        row = (
+        rows = (
             session.query(EconomicEvent, EconomicEventObservation)
             .join(
                 EconomicEventObservation,
@@ -120,9 +158,10 @@ def next_high_impact_event(currencies, *, now=None, session_factory=None):
                 EconomicEvent.release_time.asc(),
                 EconomicEventObservation.fetched_at.desc(),
             )
-            .first()
+            .all()
         )
-        return _serialize(*row) if row else None
+        grouped = _group_authoritative(rows)
+        return grouped[0] if grouped else None
 
 
 def provider_health(*, now=None, session_factory=None):

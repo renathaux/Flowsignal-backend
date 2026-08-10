@@ -164,6 +164,62 @@ class EconomicEventObservation(Base):
     raw_payload = Column(JSON, nullable=True)
 
 
+class EconomicEventProviderLink(Base):
+    """Durable link from a provider release to one canonical economic event."""
+
+    __tablename__ = "economic_event_provider_links"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    economic_event_id = Column(
+        Integer,
+        ForeignKey("economic_events.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    provider = Column(String(32), nullable=False, index=True)
+    provider_dataset = Column(String(64), nullable=False, default="default")
+    provider_event_id = Column(String(255), nullable=True)
+    provider_fingerprint = Column(String(64), nullable=False, unique=True, index=True)
+    reported_event_name = Column(String(255), nullable=False)
+    reported_indicator = Column(String(128), nullable=False)
+    reported_release_time = Column(DateTime(timezone=True), nullable=False)
+    reported_impact = Column(String(16), nullable=False, default="UNKNOWN")
+    first_seen_at = Column(DateTime(timezone=True), nullable=False)
+    last_seen_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_economic_provider_link_identity",
+            "provider",
+            "provider_dataset",
+            "provider_event_id",
+        ),
+    )
+
+
+class EconomicEventDisagreement(Base):
+    """Append-only record of conflicting non-null provider field values."""
+
+    __tablename__ = "economic_event_disagreements"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    disagreement_hash = Column(String(64), nullable=False, unique=True, index=True)
+    economic_event_id = Column(
+        Integer,
+        ForeignKey("economic_events.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    field_name = Column(String(40), nullable=False, index=True)
+    authoritative_provider = Column(String(32), nullable=False)
+    authoritative_value = Column(Text, nullable=False)
+    conflicting_provider = Column(String(32), nullable=False)
+    conflicting_value = Column(Text, nullable=False)
+    rule_version = Column(String(24), nullable=False)
+    detected_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class EconomicProviderFetch(Base):
     __tablename__ = "economic_provider_fetches"
 

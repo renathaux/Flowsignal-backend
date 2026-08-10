@@ -5,6 +5,7 @@ INDICATOR_RULES = (
     ("average_hourly_earnings", ("average hourly earnings", "wage growth", "earnings"), "employment", True),
     ("core_cpi", ("core cpi", "core consumer price"), "inflation", True),
     ("cpi", ("cpi", "consumer price"), "inflation", True),
+    ("ppi", ("ppi", "producer price", "final demand"), "inflation", True),
     ("core_hicp", ("core hicp", "core harmonised", "core harmonized"), "inflation", True),
     ("hicp", ("hicp", "harmonised index", "harmonized index"), "inflation", True),
     ("core_pce", ("core pce",), "inflation", True),
@@ -63,6 +64,16 @@ def _qualifier(title, rules):
 
 def normalize_indicator(name):
     title = re.sub(r"\s+", " ", str(name or "").strip().lower())
+    canonical = re.sub(r"[^a-z0-9]+", "_", title).strip("_")
+    known_bases = {rule[0] for rule in INDICATOR_RULES}
+    if any(
+        canonical == base
+        or canonical.startswith(f"{base}_m_m")
+        or canonical.startswith(f"{base}_q_q")
+        or canonical.startswith(f"{base}_y_y")
+        for base in known_bases
+    ):
+        return canonical
     rule = _matching_rule(title)
     if rule:
         indicator = rule[0]

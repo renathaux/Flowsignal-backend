@@ -5,8 +5,25 @@ import json
 from datetime import datetime, timezone
 
 from db import SessionLocal
+from fundamentals.authority import (
+    RULE_VERSION,
+    choose_field,
+    values_disagree,
+)
 from fundamentals.normalization.events import normalize_economic_event
-from models import EconomicEvent, EconomicEventObservation, EconomicProviderFetch
+from fundamentals.reconciliation import (
+    find_canonical_event,
+    provider_dataset,
+    provider_fingerprint,
+    provider_neutral_event_id,
+)
+from models import (
+    EconomicEvent,
+    EconomicEventDisagreement,
+    EconomicEventObservation,
+    EconomicEventProviderLink,
+    EconomicProviderFetch,
+)
 
 
 def _json_safe(value):
@@ -28,6 +45,109 @@ def _observation_hash(event):
     }
     encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _record_provider_link(session, row, event):
+    fingerprint = provider_fingerprint(event)
+    link = session.query(EconomicEventProviderLink).filter_by(
+        provider_fingerprint=fingerprint
+    ).one_or_none()
+    if link is None:
+        link = EconomicEventProviderLink(
+            economic_event_id=row.id,
+            provider=event.provider,
+            provider_dataset=provider_dataset(event),
+            provider_event_id=event.provider_event_id,
+            provider_fingerprint=fingerprint,
+            reported_event_name=event.event_name,
+            reported_indicator=event.indicator,
+            reported_release_time=event.release_time,
+            reported_impact=event.impact,
+            first_seen_at=event.fetched_at,
+            last_seen_at=event.fetched_at,
+        )
+        session.add(link)
+    else:
+        link.last_seen_at = event.fetched_at
+        link.reported_event_name = event.event_name
+        link.reported_indicator = event.indicator
+        link.reported_release_time = event.release_time
+        link.reported_impact = event.impact
+
+
+def _select_event_metadata(row, event):
+    release = choose_field("release_time", [
+        {"value": row.release_time, "provider": row.provider, "sequence": 0},
+        {"value": event.release_time, "provider": event.provider, "sequence": 1},
+    ], event.indicator, event.currency)
+    impact = choose_field("impact", [
+        {"value": None if row.impact == "UNKNOWN" else row.impact, "provider": row.provider, "sequence": 0},
+        {"value": None if event.impact == "UNKNOWN" else event.impact, "provider": event.provider, "sequence": 1},
+    ], event.indicator, event.currency)
+    if release and release["provider"] == event.provider:
+        row.release_time = event.release_time
+        row.provider = event.provider
+        row.provider_event_id = event.provider_event_id
+        row.event_name = event.event_name
+    if impact:
+        row.impact = impact["value"]
+    row.country = event.country or row.country
+    row.data_status = "RELEASED" if "RELEASED" in {row.data_status, event.data_status} else event.data_status
+    row.last_seen_at = event.fetched_at
+
+
+def _disagreement_hash(event_id, field, authoritative, conflicting):
+    basis = "|".join((
+        str(event_id), field, authoritative["provider"], str(authoritative["value"]),
+        conflicting["provider"], str(conflicting["value"]), RULE_VERSION,
+    ))
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
+def _record_disagreements(session, row, event):
+    previous_rows = session.query(EconomicEventObservation).filter_by(
+        economic_event_id=row.id
+    ).all()
+    incoming = {
+        "actual": event.actual,
+        "forecast": event.forecast,
+        "previous": event.previous,
+        "revised_previous": event.revised_previous,
+    }
+    for field, new_value in incoming.items():
+        if new_value in (None, ""):
+            continue
+        candidates = [{
+            "value": getattr(old, field), "provider": old.provider, "sequence": old.id or 0,
+        } for old in previous_rows if getattr(old, field) not in (None, "")]
+        candidates.append({
+            "value": new_value, "provider": event.provider,
+            "sequence": max([item["sequence"] for item in candidates] or [0]) + 1,
+        })
+        authoritative = choose_field(field, candidates, event.indicator, event.currency)
+        for candidate in candidates:
+            if (
+                candidate is authoritative
+                or candidate["provider"] == authoritative["provider"]
+                or not values_disagree(authoritative["value"], candidate["value"])
+            ):
+                continue
+            digest = _disagreement_hash(row.id, field, authoritative, candidate)
+            if session.query(EconomicEventDisagreement.id).filter_by(
+                disagreement_hash=digest
+            ).first():
+                continue
+            session.add(EconomicEventDisagreement(
+                disagreement_hash=digest,
+                economic_event_id=row.id,
+                field_name=field,
+                authoritative_provider=authoritative["provider"],
+                authoritative_value=str(authoritative["value"]),
+                conflicting_provider=candidate["provider"],
+                conflicting_value=str(candidate["value"]),
+                rule_version=RULE_VERSION,
+                detected_at=event.fetched_at,
+            ))
 
 
 def prepare_calendar_batch(provider, raw_events, normalized_events=None, *, completed_at=None):
@@ -94,8 +214,9 @@ def persist_calendar_batch_in_session(
     observations_added = 0
     duplicates_skipped = 0
     for event in canonical:
-        row = session.query(EconomicEvent).filter_by(event_id=event.event_id).one_or_none()
+        row = find_canonical_event(session, event)
         if row is None:
+            event.event_id = provider_neutral_event_id(event)
             row = EconomicEvent(
                 event_id=event.event_id,
                 event_name=event.event_name,
@@ -113,16 +234,11 @@ def persist_calendar_batch_in_session(
             session.add(row)
             session.flush()
         else:
-            row.event_name = event.event_name
-            row.indicator = event.indicator
-            row.country = event.country
-            row.currency = event.currency
-            row.impact = event.impact
-            row.release_time = event.release_time
-            row.provider = event.provider
-            row.provider_event_id = event.provider_event_id
-            row.data_status = event.data_status
-            row.last_seen_at = event.fetched_at
+            event.event_id = row.event_id
+            _select_event_metadata(row, event)
+
+        _record_provider_link(session, row, event)
+        _record_disagreements(session, row, event)
 
         observation_hash = _observation_hash(event)
         exists = session.query(EconomicEventObservation.id).filter_by(
