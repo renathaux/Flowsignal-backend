@@ -246,7 +246,6 @@ def fetch_period_data(date_from, date_to, currencies=("USD",), *, timeout=20, re
                 # Historical releases must never be populated with a later API
                 # revision when the original archive value cannot be proved.
                 continue
-            previous_item = by_indicator_period.get((indicator, _previous_period(period)))
             events.append(official_event(
                 provider=PROVIDER,
                 dataset=item["provider_dataset"],
@@ -261,7 +260,11 @@ def fetch_period_data(date_from, date_to, currencies=("USD",), *, timeout=20, re
                 country="United States",
                 release_time=timestamp,
                 actual=original_actual if original_actual is not None else item["actual"],
-                previous=previous_item["actual"] if previous_item else None,
+                # The archive actual is a release-period percentage while the
+                # NIPA table value can be an index/level.  Leaving previous
+                # unset lets evidence reconciliation derive it from the prior
+                # comparable archived release instead of mixing units.
+                previous=None,
                 raw={
                     "reference_period": period,
                     "line_description": item.get("line_description"),
