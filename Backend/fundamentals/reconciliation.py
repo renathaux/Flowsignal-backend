@@ -21,9 +21,12 @@ def provider_dataset(event):
 
 
 def provider_fingerprint(event):
-    identity = event.provider_event_id or (
-        f"{event.indicator}|{event.currency}|{event.release_time.isoformat()}"
-    )
+    identity = event.provider_event_id or f"{event.indicator}|{event.currency}"
+    # MQL5 Event_ID identifies the economic series, not one dated release.  A
+    # timestamp is therefore part of the provider-release identity; otherwise
+    # every monthly release is permanently linked to the first month ingested.
+    if str(event.provider or "").lower().startswith("jblanked"):
+        identity = f"{identity}|{event.release_time.astimezone(timezone.utc).isoformat()}"
     basis = f"{event.provider}|{provider_dataset(event)}|{identity}"
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 

@@ -158,7 +158,9 @@ def _release_actual(indicator, html_text):
         return _signed_percent(match.group(1), match.group(2)) if match else None
     if indicator == "core_pce":
         match = re.search(
-            r"Excluding food and energy, the PCE price index\s+(increased|decreased)\s+([0-9]+(?:\.[0-9]+)?)\s+percent",
+            r"(?:Excluding food and energy, the PCE price index|"
+            r"The PCE price index excluding food and energy)\s+"
+            r"(increased|decreased)\s+([0-9]+(?:\.[0-9]+)?)\s+percent",
             text, flags=re.I,
         )
         return _signed_percent(match.group(1), match.group(2)) if match else None

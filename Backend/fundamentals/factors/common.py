@@ -5,9 +5,12 @@ from datetime import datetime, timezone
 
 from fundamentals.factors.surprises import (
     IMPORTANCE_WEIGHT,
+    OFFICIAL_PROVIDERS,
     PROVIDER_QUALITY,
     parse_numeric,
 )
+from fundamentals.freshness import evidence_freshness
+from fundamentals.normalization.indicators import indicator_metadata
 
 
 def clamp(value, minimum=-100.0, maximum=100.0):
@@ -64,10 +67,14 @@ def trusted_event(event):
 def event_quality(event):
     provider = str(event.get("provider") or "unknown").lower()
     impact = str(event.get("impact") or "UNKNOWN").upper()
-    return (
-        PROVIDER_QUALITY.get(provider, PROVIDER_QUALITY["unknown"])
-        * IMPORTANCE_WEIGHT.get(impact, 0.0)
-    )
+    importance = IMPORTANCE_WEIGHT.get(impact, 0.0)
+    metadata = indicator_metadata(event.get("indicator") or event.get("event_name"))
+    if importance <= 0 and provider in OFFICIAL_PROVIDERS and metadata["recognized"]:
+        # Official releases may not publish commercial HIGH/MEDIUM labels.
+        # Give recognized evidence a scoring weight without changing its
+        # externally visible impact from UNKNOWN.
+        importance = 1.0 if metadata["category"] == "policy" else 0.65
+    return PROVIDER_QUALITY.get(provider, PROVIDER_QUALITY["unknown"]) * importance
 
 
 def normalized_delta(current, reference, floor=0.10):
@@ -105,9 +112,12 @@ def weighted_factor_result(
         if not trusted_event(event):
             continue
         age = event_age_days(event, current)
-        if age > horizon_days:
+        freshness_state = evidence_freshness(event, now=current)
+        if age > horizon_days and freshness_state["status"] != "ACTIVE":
             continue
         recency = tiered_recency_weight(age, policy=factor == "policy_score")
+        if recency <= 0 and freshness_state["status"] == "ACTIVE":
+            recency = 0.15
         quality = event_quality(event)
         if recency <= 0 or quality <= 0:
             continue
@@ -135,8 +145,12 @@ def weighted_factor_result(
             "revision_affected": revised,
             "revision_change": round(revision_change, 4),
             "reason": item.get("reason"),
+            "freshness_status": freshness_state["status"],
+            "freshness_reason": freshness_state["reason"],
+            "expected_next_release": freshness_state["expected_next_release"],
+            "valid_until": freshness_state["valid_until"],
         }
-        usable.append((score, weight, age, evidence))
+        usable.append((score, weight, age, evidence, freshness_state))
 
     if len(usable) < minimum_events:
         return {
@@ -152,14 +166,14 @@ def weighted_factor_result(
             "updated_at": None,
         }
 
-    denominator = sum(weight for _score, weight, _age, _evidence in usable)
-    score = sum(score * weight for score, weight, _age, _evidence in usable) / denominator
-    newest_age = min(age for _score, _weight, age, _evidence in usable)
+    denominator = sum(weight for _score, weight, _age, _evidence, _freshness in usable)
+    score = sum(score * weight for score, weight, _age, _evidence, _freshness in usable) / denominator
+    newest_age = min(age for _score, _weight, age, _evidence, _freshness in usable)
     average_quality = sum(
-        evidence["provider_quality"] for _score, _weight, _age, evidence in usable
+        evidence["provider_quality"] for _score, _weight, _age, evidence, _freshness in usable
     ) / len(usable)
     average_revision = sum(
-        evidence["revision_stability"] for _score, _weight, _age, evidence in usable
+        evidence["revision_stability"] for _score, _weight, _age, evidence, _freshness in usable
     ) / len(usable)
     evidence_depth = min(1.0, len(usable) / 4.0)
     # One ordinary release cannot swing a full factor. A structured central-bank
@@ -178,10 +192,11 @@ def weighted_factor_result(
         + 0.20 * evidence_depth
         + 0.20 * average_revision
     )
-    status = "ACTIVE" if newest_age <= stale_after_days else "STALE"
+    newest = min(usable, key=lambda item: item[2])
+    status = newest[4]["status"]
     newest_time = max(
         utc(evidence["release_time"])
-        for _score, _weight, _age, evidence in usable
+        for _score, _weight, _age, evidence, _freshness in usable
         if evidence.get("release_time") is not None
     )
     return {
