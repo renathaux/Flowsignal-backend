@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import re
 
 from sqlalchemy import func
 
 from db import SessionLocal
 from fundamentals.authority import choose_field
+from fundamentals.normalization.events import normalize_datetime
 from models import EconomicEvent, EconomicEventObservation, EconomicProviderFetch
 
 
@@ -14,6 +16,70 @@ TRUSTED_PROVIDERS = {
     "jblanked_forex_factory", "jblanked_fxstreet", "fmp", "finnhub",
     "bls", "bea", "eurostat", "federal_reserve", "ecb",
 }
+
+_JBLANKED_PROVIDERS = {item for item in TRUSTED_PROVIDERS if item.startswith("jblanked")}
+_PLACEHOLDER_MARKERS = {
+    "data not loaded", "not loaded", "no data", "missing", "unavailable",
+    "n/a", "na", "null", "none", "--", "-",
+}
+
+
+def _utc(value):
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _nested_values(payload):
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            yield str(key).lower(), value
+            yield from _nested_values(value)
+    elif isinstance(payload, list):
+        for value in payload:
+            yield from _nested_values(value)
+
+
+def _reported_release_time(observation):
+    for key, value in _nested_values(observation.raw_payload or {}):
+        if key in {"release_time", "datetime", "date", "timestamp", "time_utc"}:
+            parsed = normalize_datetime(value)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _jblanked_placeholder(observation):
+    for key, value in _nested_values(observation.raw_payload or {}):
+        if key not in {"outcome", "strength", "quality", "actual", "actual_value"}:
+            continue
+        text = str(value or "").strip().lower()
+        if text in _PLACEHOLDER_MARKERS or any(marker in text for marker in ("data not loaded", "not available")):
+            return True
+    return False
+
+
+def _candidate_rejection(event, observation, field):
+    provider = str(observation.provider or "").lower()
+    reported = _reported_release_time(observation)
+    canonical = _utc(event.release_time)
+    if reported is not None and canonical is not None:
+        if abs((reported - canonical).total_seconds()) > 18 * 60 * 60:
+            return "PROVIDER_RELEASE_MISMATCH"
+    value = getattr(observation, field)
+    if value in (None, ""):
+        return "MISSING_VALUE"
+    if provider in _JBLANKED_PROVIDERS and field == "actual" and _jblanked_placeholder(observation):
+        return "JBLANKED_PLACEHOLDER_ACTUAL"
+    if field in {"actual", "forecast", "previous", "revised_previous"}:
+        text = str(value).strip().lower()
+        if text in _PLACEHOLDER_MARKERS:
+            return "PLACEHOLDER_VALUE"
+        if not re.search(r"[-+]?\d", text):
+            return "MALFORMED_NUMERIC_VALUE"
+    return None
 
 
 def _serialize(event, observation):
@@ -50,14 +116,27 @@ def _serialize_authoritative(event, observations):
         "provider_event_id": event.provider_event_id,
         "data_status": event.data_status,
         "field_sources": {},
+        "data_quality_rejections": [],
     }
     for field in ("actual", "forecast", "previous", "revised_previous"):
-        candidates = [{
-            "value": getattr(observation, field),
-            "provider": observation.provider,
-            "sequence": observation.id or 0,
-            "observation": observation,
-        } for observation in observations]
+        candidates = []
+        for observation in observations:
+            rejection = _candidate_rejection(event, observation, field)
+            if rejection:
+                if rejection != "MISSING_VALUE":
+                    result["data_quality_rejections"].append({
+                        "field": field,
+                        "provider": observation.provider,
+                        "observation_id": observation.id,
+                        "reason": rejection,
+                    })
+                continue
+            candidates.append({
+                "value": getattr(observation, field),
+                "provider": observation.provider,
+                "sequence": observation.id or 0,
+                "observation": observation,
+            })
         selected = choose_field(field, candidates, event.indicator, event.currency)
         result[field] = selected["value"] if selected else None
         result["field_sources"][field] = selected["provider"] if selected else None
@@ -78,7 +157,24 @@ def _group_authoritative(rows):
     grouped = {}
     for event, observation in rows:
         grouped.setdefault(event.id, [event, []])[1].append(observation)
-    return [_serialize_authoritative(event, observations) for event, observations in grouped.values()]
+    effective = [_serialize_authoritative(event, observations) for event, observations in grouped.values()]
+    effective.sort(key=lambda item: _utc(item["release_time"]) or datetime.min.replace(tzinfo=timezone.utc))
+    prior_by_series = {}
+    for item in effective:
+        key = (item.get("currency"), item.get("indicator"))
+        prior = prior_by_series.get(key)
+        if item.get("previous") is None and prior and prior.get("actual") is not None:
+            item["previous"] = prior["actual"]
+            item["field_sources"]["previous"] = prior["field_sources"].get("actual")
+            item["previous_derived_from_event_id"] = prior.get("event_id")
+        if item.get("actual") is not None:
+            prior_by_series[key] = item
+    latest_seen = set()
+    for item in reversed(effective):
+        key = (item.get("currency"), item.get("indicator"))
+        item["is_latest_release_for_indicator"] = key not in latest_seen
+        latest_seen.add(key)
+    return list(reversed(effective))
 
 
 def latest_released_observations(
@@ -109,8 +205,7 @@ def latest_released_observations(
             )
             .all()
         )
-        return [item for item in _group_authoritative(rows)
-                if item.get("actual") is not None and item.get("forecast") is not None]
+        return [item for item in _group_authoritative(rows) if item.get("actual") is not None]
 
 
 def historical_surprises(indicator, currency, *, before=None, session_factory=None):
