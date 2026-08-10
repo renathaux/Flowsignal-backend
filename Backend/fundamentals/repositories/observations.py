@@ -181,7 +181,7 @@ def latest_released_observations(
     currencies,
     *,
     now=None,
-    lookback_days=180,
+    lookback_days=365,
     session_factory=None,
 ):
     factory = session_factory or SessionLocal
