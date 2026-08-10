@@ -19,3 +19,8 @@ POLICY_STALE_AFTER_DAYS = 180
 
 FUNDAMENTAL_INGEST_INTERVAL_SECONDS = 15 * 60
 
+# Official agencies publish on daily/monthly schedules.  Poll them separately
+# from the 15-minute commercial calendar refresh to keep the engine current
+# without repeatedly downloading the same archives.
+OFFICIAL_INGEST_INTERVAL_SECONDS = 24 * 60 * 60
+OFFICIAL_INGEST_LOOKBACK_DAYS = 60
