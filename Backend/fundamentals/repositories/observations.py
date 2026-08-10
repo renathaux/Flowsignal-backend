@@ -61,6 +61,27 @@ def _jblanked_placeholder(observation):
     return False
 
 
+def _bea_archive_unit_mismatch(observation, field):
+    if field not in {"previous", "revised_previous"}:
+        return False
+    payload = observation.raw_payload or {}
+    source = ""
+    for key, value in _nested_values(payload):
+        if key == "release_actual_source":
+            source = str(value or "").lower()
+            break
+    if "bea news archive" not in source:
+        return False
+    try:
+        actual_match = re.search(r"[-+]?\d+(?:\.\d+)?", str(observation.actual))
+        value_match = re.search(r"[-+]?\d+(?:\.\d+)?", str(getattr(observation, field)))
+        if not actual_match or not value_match:
+            return False
+        return abs(float(actual_match.group())) <= 25 and abs(float(value_match.group())) > 25
+    except (TypeError, ValueError):
+        return False
+
+
 def _candidate_rejection(event, observation, field):
     provider = str(observation.provider or "").lower()
     reported = _reported_release_time(observation)
@@ -73,6 +94,8 @@ def _candidate_rejection(event, observation, field):
         return "MISSING_VALUE"
     if provider in _JBLANKED_PROVIDERS and field == "actual" and _jblanked_placeholder(observation):
         return "JBLANKED_PLACEHOLDER_ACTUAL"
+    if provider == "bea" and _bea_archive_unit_mismatch(observation, field):
+        return "BEA_INCOMPATIBLE_PREVIOUS_UNIT"
     if field in {"actual", "forecast", "previous", "revised_previous"}:
         text = str(value).strip().lower()
         if text in _PLACEHOLDER_MARKERS:
