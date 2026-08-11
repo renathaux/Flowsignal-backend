@@ -388,6 +388,80 @@ class StrategyDiagnosticsTests(unittest.TestCase):
             self.assertEqual(result.get(key), value)
         self.assertIn("audit_diagnostics", result)
 
+    def test_xauusd_deep_swing_history_is_projected_without_recursion(self):
+        result = self.result()
+        prior = None
+        swings = []
+        for index in range(1200):
+            swing = {
+                "type": "HIGH" if index % 2 else "LOW",
+                "time": f"2026-07-{(index % 28) + 1:02d}T12:00:00+00:00",
+                "price": 2400.0 + index,
+                "index": index,
+                "swing_size": 1.5,
+                "valid": True,
+                "valid_reason": "single_100_point_swing",
+                "reference_swing": prior,
+            }
+            swings.append(swing)
+            prior = swing
+        result["fifteen_m_swing_break"]["raw_swings"] = swings
+        result["fifteen_m_swing_break"]["swings"] = swings
+        result["fifteen_m_swing_break"]["swing"] = swings[-1]
+
+        snapshot = diagnostics.build_snapshot("XAUUSD", result)
+
+        selected = snapshot["swings"]["selected"]
+        self.assertEqual(selected["type"], swings[-1]["type"])
+        self.assertEqual(
+            selected["reference_swing"]["price"],
+            swings[-2]["price"],
+        )
+        self.assertNotIn(
+            "reference_swing",
+            selected["reference_swing"],
+        )
+        self.assertEqual(snapshot["symbol"], "XAUUSD")
+        self.assertIn("bos", snapshot)
+        self.assertIn("noise_consolidation", snapshot)
+        self.assertIn("final_decision", snapshot)
+
+    def test_cycle_guard_replaces_only_offending_diagnostic_subfield(self):
+        result = self.result()
+        source_state = {"symbol": "XAUUSD", "available": True}
+        source_state["recursive_state"] = source_state
+
+        with self.assertLogs(
+            diagnostics.__name__, level="WARNING"
+        ) as captured:
+            snapshot = diagnostics.build_snapshot(
+                "XAUUSD",
+                result,
+                source_state=source_state,
+            )
+
+        self.assertEqual(snapshot["source_state"]["symbol"], "XAUUSD")
+        self.assertTrue(snapshot["source_state"]["available"])
+        self.assertEqual(
+            snapshot["source_state"]["recursive_state"],
+            "CYCLE_DETECTED",
+        )
+        self.assertEqual(snapshot["final_decision"]["decision"], "WAIT")
+        self.assertTrue(any(
+            "$.source_state.recursive_state" in message
+            for message in captured.output
+        ))
+
+    def test_eurusd_swing_projection_preserves_immediate_reference_fields(self):
+        result = self.result()
+        snapshot = diagnostics.build_snapshot("EURUSD", result)
+
+        watched_high = snapshot["swings"]["watched_high"]
+        self.assertEqual(watched_high["price"], 1.105)
+        self.assertEqual(watched_high["size"], 0.002)
+        self.assertTrue(watched_high["qualified"])
+        self.assertIsNone(watched_high["reference_swing"])
+
     def test_read_filter_uses_symbol_decision_and_reason(self):
         result = self.result()
         diagnostics.persist_cycle_safely("EURUSD", result)

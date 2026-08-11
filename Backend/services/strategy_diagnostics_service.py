@@ -8,6 +8,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import logging
 import math
 import os
 import threading
@@ -19,6 +20,7 @@ from db import SessionLocal
 from models import StrategyCycleDiagnostic
 
 
+logger = logging.getLogger(__name__)
 SESSION_ID = os.getenv("RENDER_INSTANCE_ID") or f"boot-{uuid.uuid4()}"
 RETENTION_DAYS = max(1, int(os.getenv("STRATEGY_DIAGNOSTICS_RETENTION_DAYS", "30")))
 RETENTION_CLEANUP_INTERVAL_SECONDS = max(
@@ -59,7 +61,19 @@ def _utc_datetime(value):
     return parsed.astimezone(timezone.utc)
 
 
-def _json_safe(value):
+def _cycle_marker(path, value):
+    logger.warning(
+        "STRATEGY_DIAGNOSTICS_CYCLE_DETECTED path=%s object_type=%s",
+        path,
+        type(value).__name__,
+    )
+    return "CYCLE_DETECTED"
+
+
+def _json_safe(value, _path="$", _active_ids=None):
+    """Project a value to JSON primitives without following object cycles."""
+    if _active_ids is None:
+        _active_ids = set()
     if value is None or isinstance(value, (str, int, bool)):
         return value
     if isinstance(value, float):
@@ -67,12 +81,39 @@ def _json_safe(value):
     if isinstance(value, datetime):
         return value.astimezone(timezone.utc).isoformat()
     if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
+        identity = id(value)
+        if identity in _active_ids:
+            return _cycle_marker(_path, value)
+        _active_ids.add(identity)
+        try:
+            return {
+                str(key): _json_safe(
+                    item,
+                    f"{_path}.{key}",
+                    _active_ids,
+                )
+                for key, item in value.items()
+            }
+        finally:
+            _active_ids.remove(identity)
     if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
+        identity = id(value)
+        if identity in _active_ids:
+            return _cycle_marker(_path, value)
+        _active_ids.add(identity)
+        try:
+            return [
+                _json_safe(item, f"{_path}[{index}]", _active_ids)
+                for index, item in enumerate(value)
+            ]
+        finally:
+            _active_ids.remove(identity)
     if hasattr(value, "item"):
         try:
-            return _json_safe(value.item())
+            converted = value.item()
+            if converted is value:
+                return _cycle_marker(_path, value)
+            return _json_safe(converted, _path, _active_ids)
         except Exception:
             pass
     return str(value)
@@ -334,6 +375,22 @@ def _swing_record(swing, minimum_size=None):
     reason = swing.get("valid_reason")
     if not reason:
         reason = "PASSED_MINIMUM_SWING" if qualified else "SWING_UNDER_MINIMUM"
+    reference = swing.get("reference_swing")
+    reference_identity = None
+    if isinstance(reference, dict):
+        # A qualified swing points to the prior opposite swing, which points
+        # to the one before it. XAUUSD can contain thousands of these linked
+        # records. Diagnostics need the immediate anchor identity, not the
+        # complete historical linked list.
+        reference_identity = {
+            "type": reference.get("type"),
+            "time": reference.get("time"),
+            "price": reference.get("price"),
+            "index": reference.get("index"),
+            "swing_size": reference.get("swing_size"),
+            "valid": bool(reference.get("valid")),
+            "valid_reason": reference.get("valid_reason"),
+        }
     return {
         "type": swing.get("type"),
         "timestamp": swing.get("time"),
@@ -342,7 +399,7 @@ def _swing_record(swing, minimum_size=None):
         "minimum_size": minimum_size,
         "qualified": qualified,
         "reason": reason,
-        "reference_swing": swing.get("reference_swing"),
+        "reference_swing": reference_identity,
     }
 
 
