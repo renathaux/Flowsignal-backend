@@ -87,7 +87,10 @@ from services.auto_trade_state_service import (
     save_mode as save_durable_auto_trade_mode,
     save_state as save_durable_auto_trade_state,
 )
-from services.strategy_diagnostics_service import update_execution_outcome_safely
+from services.strategy_diagnostics_service import (
+    record_execution_gate_safely,
+    update_execution_outcome_safely,
+)
 from db import database_status as get_database_status, engine as database_engine
 from paths import DATA_DIR
 from risk_management.account_balance import (
@@ -763,6 +766,75 @@ def calculate_fresh_panel_data(reason, force_refresh=False):
     })
     return get_panel_data(force_refresh=force_refresh)
 
+
+def _actionable_panel_plans(panel_data):
+    if not isinstance(panel_data, dict):
+        return []
+    actionable = []
+    for symbol in ("EURUSD", "XAUUSD"):
+        plan = get_panel_trade_plan(panel_data, symbol) or {}
+        signal = str(plan.get("signal") or "WAIT").upper()
+        if signal in {"BUY", "SELL"}:
+            actionable.append((symbol, signal, plan))
+    return actionable
+
+
+def record_auto_execution_gate(
+    symbol,
+    plan,
+    gate,
+    result,
+    reason,
+    details=None,
+):
+    """Emit and best-effort persist one READY-to-order gate decision."""
+    plan = plan if isinstance(plan, dict) else {}
+    signal = str(plan.get("signal") or "WAIT").upper()
+    setup_id = (
+        plan.get("signal_setup_id")
+        or plan.get("setup_id")
+        or (
+            get_signal_setup_id(plan, signal)
+            if signal in {"BUY", "SELL"}
+            else None
+        )
+    )
+    event = {
+        "symbol": str(symbol or "").upper(),
+        "setup_id": setup_id,
+        "gate": str(gate or "UNKNOWN").upper(),
+        "result": str(result or "UNKNOWN").upper(),
+        "reason": reason,
+        "details": details or {},
+    }
+    print("AUTO_EXECUTION_GATE =", event)
+    record_execution_gate_safely(
+        (plan.get("audit_diagnostics") or {}).get("cycle_id"),
+        event["symbol"],
+        setup_id,
+        event["gate"],
+        event["result"],
+        reason,
+        details=event["details"],
+    )
+    return event
+
+
+def inspect_strategy_panel_handoff(plan):
+    """Observe required READY fields without adding a new execution rule."""
+    plan = plan if isinstance(plan, dict) else {}
+    signal = str(plan.get("signal") or "WAIT").upper()
+    missing = [
+        key
+        for key in ("entry_price", "stop_loss", "tp1", "tp2")
+        if is_missing_trade_value(plan.get(key))
+    ]
+    if signal not in {"BUY", "SELL"}:
+        return False, "STRATEGY_NOT_ACTIONABLE", {"missing_fields": missing}
+    if missing:
+        return False, "STRATEGY_PAYLOAD_INVALID", {"missing_fields": missing}
+    return True, "VALIDATED_STRATEGY_PAYLOAD", {"missing_fields": []}
+
 def refresh_panel_cache(reason="background", force_refresh=False):
     if not PANEL_REFRESH_LOCK.acquire(blocking=False):
         print("PANEL_REFRESH_SKIPPED =", {
@@ -797,6 +869,19 @@ def refresh_panel_cache(reason="background", force_refresh=False):
             "reason": reason,
             "error": str(exc),
         })
+        for symbol in ("EURUSD", "XAUUSD"):
+            record_auto_execution_gate(
+                symbol,
+                {},
+                "PANEL_HANDOFF",
+                "BLOCK",
+                "STRATEGY_CALCULATION_FAILED",
+                {
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "refresh_reason": reason,
+                },
+            )
         return False
     finally:
         PANEL_REFRESH_STATE["running"] = False
@@ -1522,36 +1607,129 @@ def overlay_live_forming_candles(panel_data, live_price_status, now=None):
 
 
 def refresh_live_panel_meta(panel_data):
+    actionable_plans = _actionable_panel_plans(panel_data)
+
     try:
         live_positions = sync_live_positions(panel_data)
-        apply_trade_signal_lifecycle(panel_data)
-        apply_broker_closed_to_panel_signal_history(panel_data)
-        run_ctrader_auto_trade_checks(panel_data)
-        update_live_trade_exit_states(panel_data)
-        live_price_status = get_live_prices()
-        live_pl_sync = calculate_live_pl_sync()
-        live_recent_history = get_live_recent_history_for_panel()
-        live_trade_stats = calculate_live_trade_stats()
-
-        LIVE_PANEL_META_CACHE.update({
-            "live_positions": live_positions or [],
-            "live_price_status": live_price_status or {},
-            "live_pl_sync": live_pl_sync or {},
-            "live_recent_history": live_recent_history or [],
-            "live_trade_stats": live_trade_stats or {},
-            "last_execution_time": get_last_execution_time(),
-            "last_update": time.time(),
-            "last_error": None,
-        })
-        print("LIVE_PANEL_META_REFRESH_SUCCESS =", {
-            "positions": len(live_positions or []),
-            "history": len(live_recent_history or []),
-        })
-        return True
     except Exception as exc:
         LIVE_PANEL_META_CACHE["last_error"] = str(exc)
-        print("LIVE_PANEL_META_REFRESH_ERROR =", str(exc))
+        for symbol, _signal, plan in actionable_plans:
+            record_auto_execution_gate(
+                symbol,
+                plan,
+                "POSITION_STATE_SYNC",
+                "BLOCK",
+                "BROKER_POSITION_SYNC_FAILED",
+                {"error_type": type(exc).__name__, "error": str(exc)},
+            )
+        print("LIVE_PANEL_META_CRITICAL_ERROR =", {
+            "stage": "position_state_sync",
+            "error": str(exc),
+        })
         return False
+
+    try:
+        apply_trade_signal_lifecycle(panel_data)
+    except Exception as exc:
+        LIVE_PANEL_META_CACHE["last_error"] = str(exc)
+        for symbol, _signal, plan in actionable_plans:
+            record_auto_execution_gate(
+                symbol,
+                plan,
+                "TRADE_SIGNAL_LIFECYCLE",
+                "BLOCK",
+                "LIFECYCLE_SAFETY_CHECK_FAILED",
+                {"error_type": type(exc).__name__, "error": str(exc)},
+            )
+        print("LIVE_PANEL_META_CRITICAL_ERROR =", {
+            "stage": "trade_signal_lifecycle",
+            "error": str(exc),
+        })
+        return False
+
+    try:
+        apply_broker_closed_to_panel_signal_history(panel_data)
+    except Exception as exc:
+        print("LIVE_PANEL_METADATA_WARNING =", {
+            "stage": "broker_closed_display_overlay",
+            "error": str(exc),
+            "execution_blocked": False,
+        })
+
+    try:
+        run_ctrader_auto_trade_checks(panel_data)
+    except Exception as exc:
+        LIVE_PANEL_META_CACHE["last_error"] = str(exc)
+        for symbol, _signal, plan in actionable_plans:
+            record_auto_execution_gate(
+                symbol,
+                plan,
+                "AUTO_EXECUTION",
+                "BLOCK",
+                "AUTO_EXECUTION_EVALUATION_FAILED",
+                {"error_type": type(exc).__name__, "error": str(exc)},
+            )
+        print("LIVE_PANEL_META_CRITICAL_ERROR =", {
+            "stage": "auto_execution",
+            "error": str(exc),
+        })
+        return False
+
+    trade_management_error = None
+    try:
+        update_live_trade_exit_states(panel_data)
+    except Exception as exc:
+        trade_management_error = str(exc)
+        print("LIVE_TRADE_MANAGEMENT_ERROR =", {
+            "stage": "open_position_lifecycle",
+            "error": str(exc),
+        })
+
+    def optional_metadata(stage, getter, fallback):
+        try:
+            return getter()
+        except Exception as exc:
+            print("LIVE_PANEL_METADATA_WARNING =", {
+                "stage": stage,
+                "error": str(exc),
+                "execution_blocked": False,
+            })
+            return fallback
+
+    live_price_status = optional_metadata("live_prices", get_live_prices, {})
+    live_pl_sync = optional_metadata("live_pl_sync", calculate_live_pl_sync, {})
+    live_recent_history = optional_metadata(
+        "live_recent_history",
+        get_live_recent_history_for_panel,
+        [],
+    )
+    live_trade_stats = optional_metadata(
+        "live_trade_stats",
+        calculate_live_trade_stats,
+        {},
+    )
+    last_execution_time = optional_metadata(
+        "last_execution_time",
+        get_last_execution_time,
+        LIVE_PANEL_META_CACHE.get("last_execution_time"),
+    )
+
+    LIVE_PANEL_META_CACHE.update({
+        "live_positions": live_positions or [],
+        "live_price_status": live_price_status or {},
+        "live_pl_sync": live_pl_sync or {},
+        "live_recent_history": live_recent_history or [],
+        "live_trade_stats": live_trade_stats or {},
+        "last_execution_time": last_execution_time,
+        "last_update": time.time(),
+        "last_error": trade_management_error,
+    })
+    print("LIVE_PANEL_META_REFRESH_SUCCESS =", {
+        "positions": len(live_positions or []),
+        "history": len(live_recent_history or []),
+        "trade_management_error": trade_management_error,
+    })
+    return trade_management_error is None
 
 
 def background_fetch():
@@ -6699,6 +6877,17 @@ def run_ctrader_auto_trade_checks(panel_data):
         for symbol in ["EURUSD", "XAUUSD"]:
             plan = get_panel_trade_plan(panel_data, symbol) or {}
             if str(plan.get("signal") or "WAIT").upper() in ["BUY", "SELL"]:
+                handoff_ok, handoff_reason, handoff_details = (
+                    inspect_strategy_panel_handoff(plan)
+                )
+                record_auto_execution_gate(
+                    symbol,
+                    plan,
+                    "PANEL_HANDOFF",
+                    "PASS" if handoff_ok else "BLOCK",
+                    handoff_reason,
+                    handoff_details,
+                )
                 update_execution_outcome_safely(
                     (plan.get("audit_diagnostics") or {}).get("cycle_id"),
                     "BLOCKED",
@@ -6716,6 +6905,20 @@ def run_ctrader_auto_trade_checks(panel_data):
 
     for symbol in ["EURUSD", "XAUUSD"]:
         plan = get_panel_trade_plan(panel_data, symbol) or {}
+        initial_plan = plan
+        initial_signal = str(plan.get("signal") or "WAIT").upper()
+        if initial_signal in ["BUY", "SELL"]:
+            handoff_ok, handoff_reason, handoff_details = (
+                inspect_strategy_panel_handoff(plan)
+            )
+            record_auto_execution_gate(
+                symbol,
+                plan,
+                "PANEL_HANDOFF",
+                "PASS" if handoff_ok else "BLOCK",
+                handoff_reason,
+                handoff_details,
+            )
         news_state = evaluate_news_entry_state(
             panel_data,
             symbol,
@@ -6731,6 +6934,20 @@ def run_ctrader_auto_trade_checks(panel_data):
             )
             if news_state.get("allow_news_entry"):
                 plan = news_state.get("news_plan") or plan
+                if plan is not initial_plan:
+                    news_signal = str(plan.get("signal") or "WAIT").upper()
+                    if news_signal in ["BUY", "SELL"]:
+                        handoff_ok, handoff_reason, handoff_details = (
+                            inspect_strategy_panel_handoff(plan)
+                        )
+                        record_auto_execution_gate(
+                            symbol,
+                            plan,
+                            "PANEL_HANDOFF",
+                            "PASS" if handoff_ok else "BLOCK",
+                            handoff_reason,
+                            handoff_details,
+                        )
 
         if not news_state.get("allow_news_entry") and not news_state.get(
             "allow_normal_entry", True
@@ -9104,7 +9321,20 @@ def validate_fresh_ema_permission_locked(symbol, side, setup_identity=None):
         }
 
 
-def execute_live_order_core(payload: dict, source="manual"):
+def place_market_order_with_inflight_cleanup(symbol, **order_kwargs):
+    """Release the symbol guard if the broker call raises or times out."""
+    broker_call_completed = False
+    try:
+        result = place_market_order(symbol=symbol, **order_kwargs)
+        broker_call_completed = True
+        return result
+    finally:
+        if not broker_call_completed:
+            with LIVE_ORDER_LOCK:
+                LIVE_ORDER_IN_FLIGHT.discard(symbol)
+
+
+def _execute_live_order_core_impl(payload: dict, source="manual", _inflight_guard=None):
     global LAST_EXECUTION_TIME
 
     trade_payload = prepare_ctrader_trade(payload)
@@ -10009,6 +10239,9 @@ def execute_live_order_core(payload: dict, source="manual"):
                 )
 
         LIVE_ORDER_IN_FLIGHT.add(symbol)
+        if isinstance(_inflight_guard, dict):
+            _inflight_guard["symbol"] = symbol
+            _inflight_guard["acquired"] = True
 
     if any(
         normalize_symbol(position.get("symbol")) == symbol
@@ -10130,8 +10363,8 @@ def execute_live_order_core(payload: dict, source="manual"):
         "tp2": trade_payload.get("tp2"),
         "volume_units": trade_payload.get("volume_units"),
     }
-    result = place_market_order(
-        symbol=symbol,
+    result = place_market_order_with_inflight_cleanup(
+        symbol,
         action=side,
         entry=trade_payload["entry"],
         sl=trade_payload["sl"],
@@ -10455,6 +10688,21 @@ def execute_live_order_core(payload: dict, source="manual"):
     finally:
         with LIVE_ORDER_LOCK:
             LIVE_ORDER_IN_FLIGHT.discard(symbol)
+
+def execute_live_order_core(payload: dict, source="manual"):
+    """Execute with guaranteed release of any guard acquired by this call."""
+    inflight_guard = {"symbol": None, "acquired": False}
+    try:
+        return _execute_live_order_core_impl(
+            payload,
+            source=source,
+            _inflight_guard=inflight_guard,
+        )
+    finally:
+        if inflight_guard["acquired"] and inflight_guard["symbol"]:
+            with LIVE_ORDER_LOCK:
+                LIVE_ORDER_IN_FLIGHT.discard(inflight_guard["symbol"])
+
 
 @app.post("/execute-live-order")
 def execute_live_order(payload: dict):

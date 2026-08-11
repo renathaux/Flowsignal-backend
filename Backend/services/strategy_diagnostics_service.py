@@ -865,3 +865,69 @@ def update_execution_outcome_safely(cycle_id, decision, reason=None, details=Non
             "error": str(exc),
         })
         return False
+
+
+def record_execution_gate_safely(
+    cycle_id,
+    symbol,
+    setup_id,
+    gate,
+    result,
+    reason,
+    details=None,
+):
+    """Append execution observability without changing the strategy decision.
+
+    Gate audit persistence is deliberately best-effort: a database or
+    serialization failure must never permit or suppress an order.
+    """
+    if not cycle_id:
+        return False
+    try:
+        db = SessionLocal()
+        try:
+            row = db.execute(
+                select(StrategyCycleDiagnostic)
+                .where(StrategyCycleDiagnostic.cycle_id == str(cycle_id))
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                return False
+            snapshot = dict(row.snapshot_json or {})
+            gates = list(snapshot.get("execution_gates") or [])
+            gate_record = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "symbol": str(symbol or row.symbol or "").upper(),
+                "setup_id": setup_id,
+                "gate": str(gate or "UNKNOWN").upper(),
+                "result": str(result or "UNKNOWN").upper(),
+                "reason": reason,
+                "details": _json_safe(details or {}),
+            }
+            if gates:
+                previous = dict(gates[-1] or {})
+                previous.pop("timestamp", None)
+                comparable = dict(gate_record)
+                comparable.pop("timestamp", None)
+                if previous == comparable:
+                    return True
+            gates.append(gate_record)
+            # Keep the durable cycle useful without allowing repeated retries
+            # to grow one JSON row indefinitely.
+            snapshot["execution_gates"] = gates[-50:]
+            row.snapshot_json = snapshot
+            db.commit()
+            return True
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+    except Exception as exc:
+        print("STRATEGY_DIAGNOSTICS_EXECUTION_GATE_WARNING =", {
+            "cycle_id": cycle_id,
+            "gate": gate,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        })
+        return False

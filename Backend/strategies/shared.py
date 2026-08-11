@@ -47,6 +47,101 @@ FIFTEEN_M_PENDING_MAX_5M_CANDLES = 3
 XAUUSD_FIFTEEN_M_PENDING_MAX_5M_CANDLES = 5
 MIN_LIVE_FRESHNESS_SCORE = 70
 
+PANEL_SWING_REFERENCE_FIELDS = (
+    "type",
+    "time",
+    "price",
+    "index",
+    "swing_size",
+    "valid",
+    "valid_reason",
+)
+PANEL_CACHE_CYCLE_MARKER = "CYCLE_DETECTED"
+
+
+def _panel_reference_identity(reference):
+    """Keep one swing anchor without following its historical linked list."""
+    if not isinstance(reference, dict):
+        return None
+    return {
+        field: bounded_panel_snapshot(reference.get(field))
+        for field in PANEL_SWING_REFERENCE_FIELDS
+    }
+
+
+def bounded_panel_snapshot(value, _active_ids=None):
+    """Create a finite JSON-safe copy for UI/cache use only.
+
+    Strict strategy results may contain a linked ``reference_swing`` chain.
+    That graph is useful while calculating structure, but the last-open panel
+    cache only needs the immediate anchor identity.  This function never
+    mutates the strategy result used by execution.
+    """
+    if _active_ids is None:
+        _active_ids = set()
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (datetime, pd.Timestamp)):
+        timestamp = pd.Timestamp(value)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("UTC")
+        else:
+            timestamp = timestamp.tz_convert("UTC")
+        return timestamp.isoformat()
+    if isinstance(value, dict):
+        identity = id(value)
+        if identity in _active_ids:
+            return PANEL_CACHE_CYCLE_MARKER
+        _active_ids.add(identity)
+        try:
+            snapshot = {}
+            for key, item in value.items():
+                key_text = str(key)
+                if key_text == "reference_swing":
+                    snapshot[key_text] = _panel_reference_identity(item)
+                else:
+                    snapshot[key_text] = bounded_panel_snapshot(
+                        item,
+                        _active_ids,
+                    )
+            return snapshot
+        finally:
+            _active_ids.remove(identity)
+    if isinstance(value, (list, tuple)):
+        identity = id(value)
+        if identity in _active_ids:
+            return PANEL_CACHE_CYCLE_MARKER
+        _active_ids.add(identity)
+        try:
+            return [bounded_panel_snapshot(item, _active_ids) for item in value]
+        finally:
+            _active_ids.remove(identity)
+    if hasattr(value, "item"):
+        try:
+            converted = value.item()
+            if converted is value:
+                return str(value)
+            return bounded_panel_snapshot(converted, _active_ids)
+        except Exception:
+            pass
+    return str(value)
+
+
+def remember_last_open_payload(payload):
+    """Best-effort optional cache update; never suppress strategy execution."""
+    try:
+        get_panel_data._last_open_payload = bounded_panel_snapshot(payload)
+        return True
+    except Exception as exc:
+        print("PANEL_CACHE_SNAPSHOT_WARNING =", {
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "execution_blocked": False,
+        })
+        return False
+
 # =========================
 # SIMPLE MOMENTUM MODE
 # =========================
@@ -10059,7 +10154,7 @@ def get_panel_data(force_refresh=False):
     # MARKET CLOSED / STALE FEED MODE
     # =========================
     if all_closed and get_panel_data._last_open_payload is not None:
-        payload = copy.deepcopy(get_panel_data._last_open_payload)
+        payload = bounded_panel_snapshot(get_panel_data._last_open_payload)
 
         payload["EURUSD"] = _make_closed_result(
             "EURUSD",
@@ -10289,7 +10384,7 @@ def get_panel_data(force_refresh=False):
 
     # save last valid fully-live payload
     if not all_closed:
-        get_panel_data._last_open_payload = copy.deepcopy(payload)
+        remember_last_open_payload(payload)
 
     return payload
 

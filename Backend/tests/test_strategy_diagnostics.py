@@ -117,6 +117,47 @@ class StrategyDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result["audit_diagnostics"]["cycle_id"], rows[0].cycle_id)
         self.assertEqual(rows[0].snapshot_json["final_decision"]["decision"], "WAIT")
 
+    def test_execution_gate_is_durable_without_overwriting_strategy_decision(self):
+        snapshot = diagnostics.persist_cycle_safely(
+            "XAUUSD",
+            self.result(),
+            *self.frames(),
+        )
+        self.assertTrue(diagnostics.record_execution_gate_safely(
+            snapshot["cycle_id"],
+            "XAUUSD",
+            "setup-123",
+            "PANEL_HANDOFF",
+            "PASS",
+            "VALIDATED_STRATEGY_PAYLOAD",
+            {"missing_fields": []},
+        ))
+        self.assertTrue(diagnostics.record_execution_gate_safely(
+            snapshot["cycle_id"],
+            "XAUUSD",
+            "setup-123",
+            "PANEL_HANDOFF",
+            "PASS",
+            "VALIDATED_STRATEGY_PAYLOAD",
+            {"missing_fields": []},
+        ))
+
+        with self.Session() as db:
+            row = db.execute(
+                select(StrategyCycleDiagnostic).where(
+                    StrategyCycleDiagnostic.cycle_id == snapshot["cycle_id"]
+                )
+            ).scalar_one()
+            gate = row.snapshot_json["execution_gates"][-1]
+            self.assertEqual(len(row.snapshot_json["execution_gates"]), 1)
+            self.assertEqual(gate["gate"], "PANEL_HANDOFF")
+            self.assertEqual(gate["result"], "PASS")
+            self.assertEqual(row.decision, "WAIT")
+            self.assertEqual(
+                row.snapshot_json["final_decision"]["decision"],
+                "WAIT",
+            )
+
     def test_first_cycle_persists_and_identical_cycle_is_skipped(self):
         first_at = datetime(2026, 8, 7, 15, 0, tzinfo=timezone.utc)
         result = self.result()
