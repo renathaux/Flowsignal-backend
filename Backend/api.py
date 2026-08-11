@@ -76,6 +76,14 @@ from services.news_mode_service import (
     record_audit as record_news_mode_audit,
     save_mode as save_news_mode,
 )
+from services.strategy_settings_service import (
+    StrategySettingsValidationError,
+    get_configured_cooldown_seconds,
+    get_configured_rr_window,
+    get_strategy_settings,
+    reset_strategy_settings,
+    save_strategy_settings,
+)
 from services.settings_service import (
     get_tp1_ratio_of_tp2,
     load_feature_flags,
@@ -224,6 +232,14 @@ class NewsTradingModeRequest(BaseModel):
     time: str | None = None
 
 
+class StrategySettingsUpdateRequest(BaseModel):
+    settings: dict
+
+
+class StrategySettingsResetRequest(BaseModel):
+    confirm: bool = False
+
+
 class AccessCodeSessionRequest(BaseModel):
     code: str
 
@@ -321,8 +337,6 @@ ENGINE_RUNTIME_STATE = {
 BACKGROUND_THREAD_LOCK = threading.Lock()
 BACKGROUND_THREAD = None
 
-MIN_LIVE_TRADE_RR = 1.20
-MAX_LIVE_TRADE_RR = 2.00
 LIVE_MONTHLY_HISTORY_CACHE = {
     "history": [],
     "updated_at": 0,
@@ -2551,6 +2565,44 @@ def _allow_live_news_trading():
     }
 
 
+def _strategy_settings_user_id(request):
+    user = _authenticated_settings_user(request)
+    return user.get("email") or user.get("id") or "authenticated_user"
+
+
+@app.get("/strategy/settings")
+def get_strategy_settings_endpoint(request: Request):
+    _strategy_settings_user_id(request)
+    return get_strategy_settings()
+
+
+@app.put("/strategy/settings")
+def put_strategy_settings_endpoint(
+    payload: StrategySettingsUpdateRequest,
+    request: Request,
+):
+    user_id = _strategy_settings_user_id(request)
+    try:
+        return save_strategy_settings(payload.settings, updated_by=user_id)
+    except StrategySettingsValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/strategy/settings/reset")
+def reset_strategy_settings_endpoint(
+    payload: StrategySettingsResetRequest,
+    request: Request,
+):
+    user_id = _strategy_settings_user_id(request)
+    try:
+        return reset_strategy_settings(
+            confirmed=payload.confirm,
+            updated_by=user_id,
+        )
+    except StrategySettingsValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 def _news_mode_response(setting):
     account_id, environment = _news_mode_account_context()
     return {
@@ -2962,9 +3014,6 @@ LIVE_ORDER_LOCK = threading.RLock()
 LIVE_ORDER_IN_FLIGHT = set()
 MAX_LIVE_TRADE_HISTORY = 50
 LIVE_EXECUTION_COOLDOWN_SECONDS = 30
-LIVE_POST_CLOSE_COOLDOWN_SECONDS = int(
-    os.getenv("LIVE_POST_CLOSE_COOLDOWN_SECONDS", "900")
-)
 BROKER_SYNC_GRACE_SECONDS = 10
 LIVE_RISK_PERCENT = 1.0
 MAX_LIVE_RISK_PERCENT = 1.0
@@ -2978,6 +3027,11 @@ LIVE_LAST_POSITION_CLOSED_AT = {
     "EURUSD": 0.0,
     "XAUUSD": 0.0,
 }
+
+
+def get_live_post_close_cooldown_seconds():
+    """Shared configured duration; defaults safely to the production 15 minutes."""
+    return get_configured_cooldown_seconds()
 
 
 def invalidate_symbol_setup_state(
@@ -3063,7 +3117,7 @@ def invalidate_symbol_setup_state(
         "symbol": normalized_symbol,
         "closed_at": closed_timestamp,
         "reason": reason,
-        "cooldown_seconds": LIVE_POST_CLOSE_COOLDOWN_SECONDS,
+        "cooldown_seconds": get_live_post_close_cooldown_seconds(),
     })
     return closed_timestamp
 
@@ -5540,6 +5594,7 @@ def reject_ctrader_order(symbol, action, entry, sl, tp1, tp2, reason):
     }
 
 def validate_live_trade_risk_reward(symbol, action, entry, sl, tp2):
+    minimum_rr, maximum_rr = get_configured_rr_window()
     try:
         entry_value = float(entry)
         sl_value = float(sl)
@@ -5587,22 +5642,28 @@ def validate_live_trade_risk_reward(symbol, action, entry, sl, tp2):
         "risk_distance": risk_distance,
         "reward_distance": reward_distance,
         "risk_reward_ratio": round(risk_reward, 4),
-        "minimum_risk_reward": MIN_LIVE_TRADE_RR,
-        "maximum_risk_reward": MAX_LIVE_TRADE_RR,
+        "minimum_risk_reward": minimum_rr,
+        "maximum_risk_reward": maximum_rr,
     }
 
-    if risk_reward < MIN_LIVE_TRADE_RR - 1e-9:
+    if risk_reward < minimum_rr - 1e-9:
         return {
             **details,
             "ok": False,
-            "reason": "LIVE BLOCKED: TP2 reward must be at least 1:1.20 before execution.",
+            "reason": (
+                "LIVE BLOCKED: TP2 reward must be at least "
+                f"1:{minimum_rr:.2f} before execution."
+            ),
         }
 
-    if risk_reward > MAX_LIVE_TRADE_RR + 1e-9:
+    if risk_reward > maximum_rr + 1e-9:
         return {
             **details,
             "ok": False,
-            "reason": "LIVE BLOCKED: TP2 reward must stay at or below 1:2.00 before execution.",
+            "reason": (
+                "LIVE BLOCKED: TP2 reward must stay at or below "
+                f"1:{maximum_rr:.2f} before execution."
+            ),
         }
 
     return details
@@ -7551,8 +7612,9 @@ def log_structure_tp_trade_audit(symbol, side, trade_payload, risk_size, plan=No
         structure_rr = rr
 
     structure_reward_dollars = risk_amount * structure_rr
-    minimum_reward_dollars = risk_amount * 1.2
-    maximum_reward_dollars = risk_amount * 2.0
+    minimum_rr, maximum_rr = get_configured_rr_window()
+    minimum_reward_dollars = risk_amount * minimum_rr
+    maximum_reward_dollars = risk_amount * maximum_rr
 
     print("STRUCTURE_TP_TRADE_AUDIT:", {
         "symbol": symbol,
@@ -9137,7 +9199,7 @@ def validate_auto_entry_state_locked(
         "ema_trend": trend.get("trend"),
         "buy_allowed": bool(trend.get("buy_allowed")),
         "sell_allowed": bool(trend.get("sell_allowed")),
-        "post_close_cooldown_seconds": LIVE_POST_CLOSE_COOLDOWN_SECONDS,
+        "post_close_cooldown_seconds": get_live_post_close_cooldown_seconds(),
         "setup_identity": copy.deepcopy(setup_identity),
     }
 
@@ -9193,9 +9255,10 @@ def validate_auto_entry_state_locked(
             return {"ok": False, "reason": "15m BOS predates position close", "details": details}
         if confirmation_close <= previous_close:
             return {"ok": False, "reason": "5m confirmation predates position close", "details": details}
-        if now - last_closed_at < LIVE_POST_CLOSE_COOLDOWN_SECONDS:
+        cooldown_seconds = get_live_post_close_cooldown_seconds()
+        if now - last_closed_at < cooldown_seconds:
             details["post_close_cooldown_remaining_seconds"] = round(
-                LIVE_POST_CLOSE_COOLDOWN_SECONDS - (now - last_closed_at),
+                cooldown_seconds - (now - last_closed_at),
                 2,
             )
             return {"ok": False, "reason": "post-close cooldown active", "details": details}
@@ -10023,7 +10086,7 @@ def _execute_live_order_core_impl(payload: dict, source="manual", _inflight_guar
             cooldown_active = bool(
                 previous_close
                 and time.time() - previous_close
-                < LIVE_POST_CLOSE_COOLDOWN_SECONDS
+                < get_live_post_close_cooldown_seconds()
             )
             expected_news = {
                 "event_id": trade_payload.get("news_event_id"),

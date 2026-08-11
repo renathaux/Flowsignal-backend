@@ -23,6 +23,7 @@ from ctrader_connector import (
 )
 from paths import DATA_DIR
 from services.settings_service import get_tp1_ratio_of_tp2
+from services.strategy_settings_service import get_configured_cooldown_seconds
 from services.strategy_diagnostics_service import persist_cycle_safely
 
 MARKET_DATA_SOURCES = ["ctrader"]
@@ -2876,7 +2877,6 @@ PAPER_TRADE_HISTORY = []
 PAPER_BACKUP_FILE = os.path.join(DATA_DIR, "paper_backup.json")
 PAPER_RESET_KEY = "last_paper_reset"
 PAPER_MAX_OPEN_SECONDS = 24 * 60 * 60
-PAPER_REENTRY_COOLDOWN_SECONDS = 15 * 60
 LAST_PAPER_RESET = 0
 PAPER_SETUP_LOCKS = {}
 LIVE_TRADES = {
@@ -3556,7 +3556,8 @@ def is_paper_reentry_cooling_down(symbol, side):
     if age_seconds is None:
         return False, None
 
-    return age_seconds < PAPER_REENTRY_COOLDOWN_SECONDS, age_seconds
+    cooldown_seconds = get_configured_cooldown_seconds()
+    return age_seconds < cooldown_seconds, age_seconds
 
 def trim_paper_trade_history(max_trades=50):
     while len(PAPER_TRADE_HISTORY) > max_trades:
@@ -3810,11 +3811,12 @@ def update_paper_trade(
         cooling_down, cooldown_age = is_paper_reentry_cooling_down(symbol, side)
 
         if cooling_down:
+            cooldown_seconds = get_configured_cooldown_seconds()
             print("PAPER BLOCKED:", {
                 "symbol": symbol,
                 "side": side,
                 "reason": "paper re-entry cooldown active",
-                "cooldown_seconds": PAPER_REENTRY_COOLDOWN_SECONDS,
+                "cooldown_seconds": cooldown_seconds,
                 "age_seconds": round(cooldown_age or 0, 1),
                 "signal_key": signal_key,
             })

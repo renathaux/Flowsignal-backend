@@ -33,6 +33,19 @@ class RuntimeSetting(Base):
     updated_by = Column(String(255), nullable=False)
 
 
+class StrategySettingAudit(Base):
+    """Append-only history for backend-authoritative strategy setting changes."""
+
+    __tablename__ = "strategy_setting_audit"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    setting_name = Column(String(100), nullable=False, index=True)
+    previous_value = Column(String(100), nullable=False)
+    new_value = Column(String(100), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    updated_by = Column(String(255), nullable=False)
+
+
 class NewsTradingModeAudit(Base):
     __tablename__ = "news_trading_mode_audit"
 

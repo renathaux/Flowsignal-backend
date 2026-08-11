@@ -4,14 +4,13 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from . import shared
+from services.strategy_settings_service import get_configured_rr_window
 
 
 MIN_SWING_POINTS = 100
 SL_BUFFER_POINTS = 50
 MIN_SL_POINTS = 100
-MIN_RR = 1.20
-MAX_RR = 2.00
-FALLBACK_RR = 2.00
+DEFAULT_FALLBACK_RR = 2.00
 PULLBACK_MIN_POINTS = 30
 BOS_MIN_BUFFER_POINTS = 10
 REMEMBERED_BREAKOUT_MAX_15M_CANDLES = 4
@@ -912,7 +911,21 @@ def select_stop_loss(swings, side, entry, symbol):
     }
 
 
-def select_tp2(swings, side, entry, risk, symbol):
+def select_tp2(
+    swings,
+    side,
+    entry,
+    risk,
+    symbol,
+    minimum_rr=None,
+    maximum_rr=None,
+):
+    if minimum_rr is None or maximum_rr is None:
+        configured_minimum, configured_maximum = get_configured_rr_window()
+        minimum_rr = configured_minimum if minimum_rr is None else float(minimum_rr)
+        maximum_rr = configured_maximum if maximum_rr is None else float(maximum_rr)
+    minimum_rr = float(minimum_rr)
+    maximum_rr = float(maximum_rr)
     inverse = "HIGH" if side == "BUY" else "LOW"
     candidates = [
         swing
@@ -934,7 +947,7 @@ def select_tp2(swings, side, entry, risk, symbol):
         if reward <= 0:
             continue
         rr = reward / risk
-        if MIN_RR <= rr <= MAX_RR:
+        if minimum_rr <= rr <= maximum_rr:
             return {
                 "tp2": price,
                 "rr": rr,
@@ -946,18 +959,22 @@ def select_tp2(swings, side, entry, risk, symbol):
             "price": price,
             "rr": rr,
             "reason": (
-                "TP swing reward below 1.20R"
-                if rr < MIN_RR
-                else "TP swing reward above 2.00R"
+                f"TP swing reward below {minimum_rr:.2f}R"
+                if rr < minimum_rr
+                else f"TP swing reward above {maximum_rr:.2f}R"
             ),
             "swing": swing,
         })
 
-    tp2 = entry + (risk * FALLBACK_RR) if side == "BUY" else entry - (risk * FALLBACK_RR)
+    fallback_rr = min(
+        max(DEFAULT_FALLBACK_RR, minimum_rr),
+        maximum_rr,
+    )
+    tp2 = entry + (risk * fallback_rr) if side == "BUY" else entry - (risk * fallback_rr)
     return {
         "tp2": tp2,
-        "rr": FALLBACK_RR,
-        "source": "fallback_2r",
+        "rr": fallback_rr,
+        "source": f"fallback_{fallback_rr:g}r",
         "swing": None,
         "rejected_tp_candidates": rejected,
     }

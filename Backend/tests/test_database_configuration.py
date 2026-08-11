@@ -31,6 +31,7 @@ class DatabaseConfigurationTests(unittest.TestCase):
         expected = {
             "users",
             "runtime_settings",
+            "strategy_setting_audit",
             "news_trading_mode_audit",
             "auto_trade_state_audit",
             "ctrader_oauth_tokens",
@@ -58,6 +59,7 @@ class DatabaseConfigurationTests(unittest.TestCase):
             "fundamental_factor_inputs",
             "currency_strength_snapshots",
             "fundamental_insight_snapshots",
+            "strategy_setting_audit",
         }
         self.assertTrue(
             legacy_tables.issubset(set(inspect(db.engine).get_table_names()))
@@ -71,6 +73,8 @@ class DatabaseConfigurationTests(unittest.TestCase):
             BACKEND_DIR / "migrations" / "versions" / "20260807_0003_strategy_cycle_diagnostics.py",
             BACKEND_DIR / "migrations" / "versions" / "20260807_0004_fundamental_engine_phase1.py",
             BACKEND_DIR / "migrations" / "versions" / "20260808_0005_economic_backfill_jobs.py",
+            BACKEND_DIR / "migrations" / "versions" / "20260808_0006_official_provider_reconciliation.py",
+            BACKEND_DIR / "migrations" / "versions" / "20260811_0007_strategy_setting_audit.py",
             BACKEND_DIR / "scripts" / "migrate_sqlite_to_neon.py",
         ]
         for path in files:
@@ -116,6 +120,7 @@ class DatabaseConfigurationTests(unittest.TestCase):
             "fundamental_factor_inputs",
             "currency_strength_snapshots",
             "fundamental_insight_snapshots",
+            "strategy_setting_audit",
         }
         self.assertTrue(source_tables.issubset(tables))
 
