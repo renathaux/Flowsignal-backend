@@ -2,9 +2,11 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -42,6 +44,7 @@ class StrategySettingsExecutionCacheTests(unittest.TestCase):
                 "bos_buffer_points": 10,
                 "minimum_sl_distance_points": 100,
                 "post_trade_cooldown_minutes": 15,
+                "consolidation_filter_enabled": True,
             },
         )
 
@@ -84,6 +87,7 @@ class StrategySettingsExecutionCacheTests(unittest.TestCase):
         for setting_name, setting_value in (
             ("strategy.bos_buffer_points", '"not-a-number"'),
             ("strategy.minimum_sl_distance_points", "null"),
+            ("strategy.consolidation_filter_enabled", '"not-a-boolean"'),
         ):
             with self.subTest(setting_name=setting_name):
                 with self.sessions() as session:
@@ -216,6 +220,36 @@ class StrategySettingsExecutionCacheTests(unittest.TestCase):
             settings_service.get_cached_execution_settings(self.sessions)["minimum_rr"],
             1.4,
         )
+
+
+class StrategySettingsHistoryEndpointTests(unittest.TestCase):
+    def tearDown(self):
+        api.SESSIONS.pop("strategy-history-test", None)
+
+    def test_history_endpoint_requires_authentication(self):
+        request = SimpleNamespace(headers={})
+        with self.assertRaises(HTTPException) as caught:
+            api.get_strategy_settings_history_endpoint(request)
+        self.assertEqual(caught.exception.status_code, 401)
+
+    def test_history_endpoint_is_authenticated_and_read_only(self):
+        api.SESSIONS["strategy-history-test"] = {
+            "email": "owner@example.com",
+            "role": "owner",
+        }
+        request = SimpleNamespace(headers={
+            "authorization": "Bearer strategy-history-test",
+        })
+        expected = {
+            "items": [], "count": 0, "total": 0,
+            "limit": 25, "offset": 0, "read_only": True,
+        }
+        with patch.object(api, "get_strategy_settings_history", return_value=expected) as reader:
+            result = api.get_strategy_settings_history_endpoint(
+                request, limit=25, offset=0
+            )
+        self.assertEqual(result, expected)
+        reader.assert_called_once_with(limit=25, offset=0)
 
 
 class StrategySettingsRRWiringTests(unittest.TestCase):
@@ -479,6 +513,107 @@ class StrategySettingsStructureWiringTests(unittest.TestCase):
             breakout.call_args.kwargs["execution_settings"],
             settings,
         )
+
+    def test_consolidation_setting_only_changes_final_permission(self):
+        frame_15m = self.atr_frame("XAUUSD", 0.4, rows=25)
+        frame_5m = self.atr_frame("XAUUSD", 0.1, rows=30)
+        breakout = {
+            "side": "BUY",
+            "reason": None,
+            "level": 100.0,
+            "break_time": "2026-06-01T05:30:00Z",
+            "break_close_time": "2026-06-01T05:45:00Z",
+            "break_close": 100.5,
+            "break_type": "CHOCH",
+            "remembered": False,
+            "swings": self.swings(),
+        }
+        confirmation = {
+            "side": "BUY",
+            "close": 100.6,
+            "close_confirmed": True,
+            "confirmation_close_time": "2026-06-01T05:50:00Z",
+        }
+        levels = {
+            "ok": True,
+            "entry": 100.6,
+            "stop_loss": 99.0,
+            "tp1": 102.52,
+            "tp2": 103.0,
+            "protected_sl_price": 101.8,
+            "risk_reward": "1:1.50",
+            "risk_reward_ratio": 1.5,
+            "tp1_rule": "80%",
+            "tp_structure_source": "test",
+            "protected_sl_rule": "50%",
+        }
+        common = [
+            patch.object(strict_trader, "trend_filter", return_value={
+                "trend": "BULLISH", "buy_allowed": True, "sell_allowed": False,
+            }),
+            patch.object(strict_trader, "classify_consolidation", return_value={
+                "is_consolidation": True, "conditions_met": 2,
+            }),
+            patch.object(strict_trader, "evaluate_15m_breakout", return_value=breakout),
+            patch.object(strict_trader, "confirm_5m", return_value=confirmation),
+            patch.object(strict_trader, "last_position_closed_time", return_value=None),
+            patch.object(strict_trader, "build_risk_levels", return_value=levels),
+            patch.object(shared, "save_fifteen_m_swing_watch"),
+            patch.object(strict_trader, "save_remembered_breakout"),
+        ]
+        for context in common:
+            context.start()
+            self.addCleanup(context.stop)
+
+        with patch.object(
+            strict_trader,
+            "get_cached_execution_settings",
+            return_value={**settings_service.execution_defaults(), "consolidation_filter_enabled": True},
+        ):
+            enabled = strict_trader.get_mtf_signal(
+                frame_5m, frame_15m, pd.DataFrame(), "XAUUSD"
+            )
+        with patch.object(
+            strict_trader,
+            "get_cached_execution_settings",
+            return_value={**settings_service.execution_defaults(), "consolidation_filter_enabled": False},
+        ):
+            disabled = strict_trader.get_mtf_signal(
+                frame_5m, frame_15m, pd.DataFrame(), "XAUUSD"
+            )
+
+        self.assertEqual(enabled["signal"], "WAIT")
+        self.assertEqual(enabled["blocked_reason"], "WAIT_CONSOLIDATION")
+        self.assertTrue(enabled["consolidation"]["is_consolidation"])
+        self.assertTrue(enabled["consolidation"]["blocking"])
+        self.assertEqual(disabled["signal"], "BUY")
+        self.assertTrue(disabled["consolidation"]["is_consolidation"])
+        self.assertFalse(disabled["consolidation"]["blocking"])
+
+    def test_final_execution_gate_respects_same_consolidation_setting(self):
+        frame = self.atr_frame("XAUUSD", 0.4, rows=25)
+        with patch.object(api, "get_ctrader_market_data", return_value=frame), patch.object(
+            strict_trader, "closed_frame", return_value=frame
+        ), patch.object(strict_trader, "trend_filter", return_value={
+            "trend": "BULLISH", "buy_allowed": True, "sell_allowed": False,
+        }), patch.object(strict_trader, "classify_consolidation", return_value={
+            "is_consolidation": True,
+        }), patch.object(api, "get_cached_execution_settings", return_value={
+            **settings_service.execution_defaults(), "consolidation_filter_enabled": True,
+        }):
+            enabled = api.validate_fresh_ema_permission_locked("XAUUSD", "BUY")
+        with patch.object(api, "get_ctrader_market_data", return_value=frame), patch.object(
+            strict_trader, "closed_frame", return_value=frame
+        ), patch.object(strict_trader, "trend_filter", return_value={
+            "trend": "BULLISH", "buy_allowed": True, "sell_allowed": False,
+        }), patch.object(strict_trader, "classify_consolidation", return_value={
+            "is_consolidation": True,
+        }), patch.object(api, "get_cached_execution_settings", return_value={
+            **settings_service.execution_defaults(), "consolidation_filter_enabled": False,
+        }):
+            disabled = api.validate_fresh_ema_permission_locked("XAUUSD", "BUY")
+        self.assertEqual(enabled["reason"], "WAIT_CONSOLIDATION")
+        self.assertEqual(disabled["reason"], "WAIT_SETUP_SWING_IDENTITY_MISSING")
 
     def test_risk_plan_uses_supplied_snapshot_without_second_cache_read(self):
         settings = {

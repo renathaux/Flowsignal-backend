@@ -1362,6 +1362,17 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
     execution_settings = get_cached_execution_settings()
     trend = trend_filter(closed_15m, normalized_symbol)
     consolidation = classify_consolidation(closed_15m, normalized_symbol)
+    consolidation_filter_enabled = bool(
+        execution_settings.get("consolidation_filter_enabled", True)
+    )
+    consolidation_blocked = bool(
+        consolidation_filter_enabled and consolidation.get("is_consolidation")
+    )
+    consolidation = {
+        **consolidation,
+        "filter_enabled": consolidation_filter_enabled,
+        "blocking": consolidation_blocked,
+    }
     base_meta["consolidation"] = consolidation
     base_meta["market_condition"] = (
         "CONSOLIDATION" if consolidation.get("is_consolidation") else "STRUCTURE"
@@ -1384,7 +1395,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             fifteen_m_bos=STAGE_FAILED,
             consolidation_gate=(
                 STAGE_BLOCKED
-                if consolidation.get("is_consolidation")
+                if consolidation_blocked
                 else STAGE_PASSED
             ),
             execution=STAGE_BLOCKED,
@@ -1410,7 +1421,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
     if (
         breakout.get("remembered")
         and watch_status == BLOCKED_BREAKOUT_STATUS
-        and not consolidation.get("is_consolidation")
+        and not consolidation_blocked
     ):
         clear_breakout_watch(
             normalized_symbol,
@@ -1461,7 +1472,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             ema=STAGE_FAILED,
             consolidation_gate=(
                 STAGE_BLOCKED
-                if consolidation.get("is_consolidation")
+                if consolidation_blocked
                 else STAGE_PASSED
             ),
             execution=STAGE_BLOCKED,
@@ -1502,7 +1513,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             ema=STAGE_PASSED,
             consolidation_gate=(
                 STAGE_BLOCKED
-                if consolidation.get("is_consolidation")
+                if consolidation_blocked
                 else STAGE_PASSED
             ),
             execution=STAGE_BLOCKED,
@@ -1567,7 +1578,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
                 invalidation_level=breakout.get("invalidation_level"),
                 status=(
                     BLOCKED_BREAKOUT_STATUS
-                    if consolidation.get("is_consolidation")
+                    if consolidation_blocked
                     else "PENDING"
                 ),
             )
@@ -1575,7 +1586,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             swing_detection=STAGE_PASSED,
             fifteen_m_bos=(
                 STAGE_BLOCKED
-                if consolidation.get("is_consolidation")
+                if consolidation_blocked
                 else STAGE_PASSED
             ),
             fifteen_m_close=STAGE_PASSED,
@@ -1583,7 +1594,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             five_m_confirmation=STAGE_FAILED,
             consolidation_gate=(
                 STAGE_BLOCKED
-                if consolidation.get("is_consolidation")
+                if consolidation_blocked
                 else STAGE_PASSED
             ),
             execution=STAGE_BLOCKED,
@@ -1609,7 +1620,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             ),
         })
 
-    if consolidation.get("is_consolidation"):
+    if consolidation_blocked:
         save_remembered_breakout(
             normalized_symbol,
             side,

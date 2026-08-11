@@ -25,7 +25,9 @@ WIRED_EXECUTION_SETTINGS = frozenset({
     "bos_buffer_points",
     "minimum_sl_distance_points",
     "post_trade_cooldown_minutes",
+    "consolidation_filter_enabled",
 })
+EDITABLE_STRATEGY_SETTINGS = WIRED_EXECUTION_SETTINGS
 LEGACY_SETTING_ALIASES = {
     "bos_buffer_points": "bos_buffer_min_points",
 }
@@ -197,6 +199,10 @@ def _validate_execution_values(values):
         candidate["minimum_sl_distance_points"],
         FIELD_DEFINITIONS["minimum_sl_distance_points"],
     )
+    consolidation_filter_enabled = _coerce(
+        candidate["consolidation_filter_enabled"],
+        FIELD_DEFINITIONS["consolidation_filter_enabled"],
+    )
     if maximum_rr < minimum_rr:
         raise StrategySettingsValidationError(
             "maximum_rr must be greater than or equal to minimum_rr"
@@ -207,6 +213,7 @@ def _validate_execution_values(values):
         "bos_buffer_points": bos_buffer_points,
         "minimum_sl_distance_points": minimum_sl_distance_points,
         "post_trade_cooldown_minutes": cooldown,
+        "consolidation_filter_enabled": consolidation_filter_enabled,
     }
 
 
@@ -353,7 +360,7 @@ def get_strategy_settings(session_factory=None):
                 if key == legacy and canonical not in canonical_rows:
                     key = canonical
                     break
-            if key not in FIELD_DEFINITIONS:
+            if key not in WIRED_EXECUTION_SETTINGS:
                 continue
             current[key] = _deserialize(row.setting_value, FIELD_DEFINITIONS[key])
             if latest is None or row.updated_at > latest:
@@ -374,12 +381,61 @@ def get_strategy_settings(session_factory=None):
         "execution_wiring": {
             key: key in WIRED_EXECUTION_SETTINGS for key in FIELD_DEFINITIONS
         },
-        "phase": "PHASE_3_PARTIAL",
+        "fixed_rules": {
+            "ema_trend_filter": {"enabled": True, "fast_period": 9, "slow_period": 21},
+            "m15_closed_break_required": True,
+            "later_m5_confirmation_required": True,
+            "fresh_bos_after_consolidation_required": True,
+            "atr_bos_buffer_fraction": 0.10,
+            "atr_period": 14,
+        },
+        "phase": "V1_COMPLETE",
+    }
+
+
+def get_strategy_settings_history(*, limit=50, offset=0, session_factory=None):
+    """Return a bounded, newest-first view of append-only strategy changes."""
+    factory = session_factory or SessionLocal
+    safe_limit = max(1, min(int(limit), 100))
+    safe_offset = max(0, int(offset))
+    with factory() as session:
+        query = session.query(StrategySettingAudit)
+        total = query.count()
+        rows = (
+            query.order_by(
+                StrategySettingAudit.updated_at.desc(),
+                StrategySettingAudit.id.desc(),
+            )
+            .offset(safe_offset)
+            .limit(safe_limit)
+            .all()
+        )
+    return {
+        "items": [
+            {
+                "setting_name": row.setting_name,
+                "previous_value": json.loads(row.previous_value),
+                "new_value": json.loads(row.new_value),
+                "changed_at": _utc_iso(row.updated_at),
+                "changed_by": row.updated_by,
+            }
+            for row in rows
+        ],
+        "count": len(rows),
+        "total": total,
+        "limit": safe_limit,
+        "offset": safe_offset,
+        "read_only": True,
     }
 
 
 def save_strategy_settings(payload, updated_by, session_factory=None, now=None):
     validated = validate_settings(payload)
+    fixed = sorted(set(validated) - EDITABLE_STRATEGY_SETTINGS)
+    if fixed:
+        raise StrategySettingsValidationError(
+            f"fixed strategy setting(s) are read-only: {', '.join(fixed)}"
+        )
     factory = session_factory or SessionLocal
     updated_at = now or datetime.now(timezone.utc)
     with _LOCK:
@@ -412,7 +468,8 @@ def save_strategy_settings(payload, updated_by, session_factory=None, now=None):
             merged.update(validated)
             validate_settings(merged, require_all=True)
 
-            for key, value in merged.items():
+            for key in validated:
+                value = merged[key]
                 row = existing.get(key)
                 if row is None:
                     row = RuntimeSetting(setting_name=f"{SETTING_PREFIX}{key}")
@@ -441,5 +498,8 @@ def reset_strategy_settings(*, confirmed, updated_by, session_factory=None, now=
             "reset requires explicit confirmation"
         )
     return save_strategy_settings(
-        defaults(), updated_by=updated_by, session_factory=session_factory, now=now
+        execution_defaults(),
+        updated_by=updated_by,
+        session_factory=session_factory,
+        now=now,
     )

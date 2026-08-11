@@ -78,9 +78,11 @@ from services.news_mode_service import (
 )
 from services.strategy_settings_service import (
     StrategySettingsValidationError,
+    get_cached_execution_settings,
     get_configured_cooldown_seconds,
     get_configured_rr_window,
     get_strategy_settings,
+    get_strategy_settings_history,
     reset_strategy_settings,
     save_strategy_settings,
 )
@@ -2601,6 +2603,19 @@ def reset_strategy_settings_endpoint(
         )
     except StrategySettingsValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/strategy/settings/history")
+def get_strategy_settings_history_endpoint(
+    request: Request,
+    limit: int = 50,
+    offset: int = 0,
+):
+    _strategy_settings_user_id(request)
+    try:
+        return get_strategy_settings_history(limit=limit, offset=offset)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid history pagination.") from exc
 
 
 def _news_mode_response(setting):
@@ -9305,6 +9320,13 @@ def validate_fresh_ema_permission_locked(symbol, side, setup_identity=None):
             closed_15m,
             normalized_symbol,
         )
+        execution_settings = get_cached_execution_settings()
+        consolidation_filter_enabled = bool(
+            execution_settings.get("consolidation_filter_enabled", True)
+        )
+        consolidation_blocked = bool(
+            consolidation_filter_enabled and consolidation.get("is_consolidation")
+        )
         details.update({
             "fresh_ema_recalculated": True,
             "fresh_ema_trend": trend.get("trend"),
@@ -9315,6 +9337,8 @@ def validate_fresh_ema_permission_locked(symbol, side, setup_identity=None):
             "fresh_sell_allowed": bool(trend.get("sell_allowed")),
             "fresh_last_closed_15m": str(closed_15m.index[-1]),
             "fresh_consolidation": consolidation,
+            "consolidation_filter_enabled": consolidation_filter_enabled,
+            "consolidation_blocked": consolidation_blocked,
         })
         allowed = (
             side == "BUY" and bool(trend.get("buy_allowed"))
@@ -9327,7 +9351,7 @@ def validate_fresh_ema_permission_locked(symbol, side, setup_identity=None):
                 "reason": "WAIT_EMA_CHANGED_BEFORE_EXECUTION",
                 "details": details,
             }
-        if consolidation.get("is_consolidation"):
+        if consolidation_blocked:
             return {
                 "ok": False,
                 "reason": "WAIT_CONSOLIDATION",

@@ -11,6 +11,7 @@ from services.strategy_settings_service import (
     StrategySettingsValidationError,
     defaults,
     get_strategy_settings,
+    get_strategy_settings_history,
     reset_strategy_settings,
     save_strategy_settings,
 )
@@ -37,7 +38,7 @@ class StrategySettingsTests(unittest.TestCase):
         self.assertEqual(result["limits"]["minimum_rr"]["min"], 1.0)
         self.assertEqual(result["limits"]["risk_per_trade_percent"]["max"], 1.0)
         self.assertIsNone(result["last_updated"])
-        self.assertEqual(result["phase"], "PHASE_3_PARTIAL")
+        self.assertEqual(result["phase"], "V1_COMPLETE")
         self.assertEqual(
             {key for key, wired in result["execution_wiring"].items() if wired},
             {
@@ -46,6 +47,7 @@ class StrategySettingsTests(unittest.TestCase):
                 "bos_buffer_points",
                 "minimum_sl_distance_points",
                 "post_trade_cooldown_minutes",
+                "consolidation_filter_enabled",
             },
         )
 
@@ -95,7 +97,7 @@ class StrategySettingsTests(unittest.TestCase):
                 session.query(RuntimeSetting)
                 .filter(RuntimeSetting.setting_name.like("strategy.%"))
                 .count(),
-                len(defaults()),
+                2,
             )
             audits = session.query(StrategySettingAudit).all()
             self.assertEqual(len(audits), 2)
@@ -144,7 +146,7 @@ class StrategySettingsTests(unittest.TestCase):
         self.assertEqual(reset["current"], defaults())
 
     def test_cross_field_and_unknown_setting_validation(self):
-        with self.assertRaisesRegex(StrategySettingsValidationError, "ema_fast_period"):
+        with self.assertRaisesRegex(StrategySettingsValidationError, "read-only"):
             save_strategy_settings(
                 {"ema_fast_period": 21, "ema_slow_period": 21},
                 updated_by="owner",
@@ -156,6 +158,56 @@ class StrategySettingsTests(unittest.TestCase):
                 updated_by="owner",
                 session_factory=self.sessions,
             )
+
+    def test_fixed_rule_rows_are_ignored_and_cannot_be_saved(self):
+        now = datetime(2026, 8, 11, tzinfo=timezone.utc)
+        with self.sessions() as session:
+            session.add(RuntimeSetting(
+                setting_name="strategy.ema_fast_period",
+                setting_value="50",
+                updated_at=now,
+                updated_by="legacy",
+            ))
+            session.commit()
+        self.assertEqual(get_strategy_settings(self.sessions)["current"]["ema_fast_period"], 9)
+        with self.assertRaisesRegex(StrategySettingsValidationError, "read-only"):
+            save_strategy_settings(
+                {"ema_fast_period": 12},
+                updated_by="owner",
+                session_factory=self.sessions,
+            )
+
+    def test_history_is_newest_first_bounded_and_read_only(self):
+        save_strategy_settings(
+            {"minimum_rr": 1.3},
+            updated_by="first",
+            session_factory=self.sessions,
+            now=datetime(2026, 8, 11, 15, 0, tzinfo=timezone.utc),
+        )
+        save_strategy_settings(
+            {"minimum_rr": 1.4, "consolidation_filter_enabled": False},
+            updated_by="second",
+            session_factory=self.sessions,
+            now=datetime(2026, 8, 11, 16, 0, tzinfo=timezone.utc),
+        )
+        history = get_strategy_settings_history(
+            limit=2,
+            session_factory=self.sessions,
+        )
+        self.assertTrue(history["read_only"])
+        self.assertEqual(history["count"], 2)
+        self.assertEqual(history["total"], 3)
+        self.assertEqual(history["items"][0]["changed_by"], "second")
+        self.assertEqual(history["items"][0]["changed_at"], "2026-08-11T16:00:00Z")
+        self.assertIn(
+            history["items"][0]["setting_name"],
+            {"minimum_rr", "consolidation_filter_enabled"},
+        )
+
+    def test_history_empty_state(self):
+        history = get_strategy_settings_history(session_factory=self.sessions)
+        self.assertEqual(history["items"], [])
+        self.assertEqual(history["total"], 0)
 
     def test_foundation_service_does_not_import_trading_or_broker_modules(self):
         source = (
