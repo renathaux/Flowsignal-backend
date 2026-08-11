@@ -8,9 +8,9 @@ import threading
 import time
 
 
-DEFAULT_TTL_SECONDS = 180
-MIN_TTL_SECONDS = 30
-MAX_TTL_SECONDS = 300
+DEFAULT_TTL_SECONDS = 600
+MIN_TTL_SECONDS = 60
+MAX_TTL_SECONDS = 900
 
 
 def _configured_ttl_seconds(environment=None):

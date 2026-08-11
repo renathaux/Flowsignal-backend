@@ -6,6 +6,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from fundamentals.insight_cache import (
+    DEFAULT_TTL_SECONDS,
+    MAX_TTL_SECONDS,
+    MIN_TTL_SECONDS,
+    _configured_ttl_seconds,
     _reset_for_tests,
     get_or_calculate,
 )
@@ -23,6 +27,24 @@ class FundamentalInsightCacheTests(unittest.TestCase):
 
     def tearDown(self):
         _reset_for_tests()
+
+    def test_default_ttl_is_ten_minutes(self):
+        self.assertEqual(DEFAULT_TTL_SECONDS, 600)
+        self.assertEqual(_configured_ttl_seconds({}), 600)
+
+    def test_configured_ttl_is_clamped_to_safe_range(self):
+        self.assertEqual(
+            _configured_ttl_seconds({"FUNDAMENTAL_INSIGHT_CACHE_TTL_SECONDS": "1"}),
+            MIN_TTL_SECONDS,
+        )
+        self.assertEqual(
+            _configured_ttl_seconds({"FUNDAMENTAL_INSIGHT_CACHE_TTL_SECONDS": "1200"}),
+            MAX_TTL_SECONDS,
+        )
+        self.assertEqual(
+            _configured_ttl_seconds({"FUNDAMENTAL_INSIGHT_CACHE_TTL_SECONDS": "invalid"}),
+            DEFAULT_TTL_SECONDS,
+        )
 
     def test_eurusd_cache_hit(self):
         calls = []
@@ -63,7 +85,7 @@ class FundamentalInsightCacheTests(unittest.TestCase):
             "XAUUSD",
         )
 
-    def test_ttl_expiry_recalculates(self):
+    def test_five_minute_poll_hits_and_ten_minute_expiry_recalculates(self):
         current = [100.0]
         calls = []
 
@@ -72,22 +94,64 @@ class FundamentalInsightCacheTests(unittest.TestCase):
             return {"value": calls[-1]}
 
         first = get_or_calculate(
-            "EURUSD", calculate, ttl_seconds=180, monotonic=lambda: current[0]
+            "EURUSD", calculate, ttl_seconds=600, monotonic=lambda: current[0]
         )
-        current[0] = 279.9
+        current[0] = 400.0
         self.assertEqual(
             get_or_calculate(
-                "EURUSD", calculate, ttl_seconds=180, monotonic=lambda: current[0]
+                "EURUSD", calculate, ttl_seconds=600, monotonic=lambda: current[0]
             ),
             first,
         )
-        current[0] = 280.0
+        self.assertEqual(calls, [1])
+        current[0] = 699.9
         self.assertEqual(
             get_or_calculate(
-                "EURUSD", calculate, ttl_seconds=180, monotonic=lambda: current[0]
+                "EURUSD", calculate, ttl_seconds=600, monotonic=lambda: current[0]
+            ),
+            first,
+        )
+        current[0] = 700.0
+        self.assertEqual(
+            get_or_calculate(
+                "EURUSD", calculate, ttl_seconds=600, monotonic=lambda: current[0]
             )["value"],
             2,
         )
+
+    def test_time_only_freshness_change_is_visible_at_ttl_boundary(self):
+        current = [0.0]
+        freshness_boundary = 450.0
+        calls = []
+
+        def calculate():
+            calls.append(current[0])
+            return {
+                "symbol": "EURUSD",
+                "factor_status": (
+                    "ACTIVE" if current[0] <= freshness_boundary else "STALE"
+                ),
+            }
+
+        active = get_or_calculate(
+            "EURUSD", calculate, ttl_seconds=600, monotonic=lambda: current[0]
+        )
+        self.assertEqual(active["factor_status"], "ACTIVE")
+        current[0] = freshness_boundary + 1
+        self.assertEqual(
+            get_or_calculate(
+                "EURUSD", calculate, ttl_seconds=600, monotonic=lambda: current[0]
+            )["factor_status"],
+            "ACTIVE",
+        )
+        current[0] = 600.0
+        self.assertEqual(
+            get_or_calculate(
+                "EURUSD", calculate, ttl_seconds=600, monotonic=lambda: current[0]
+            )["factor_status"],
+            "STALE",
+        )
+        self.assertEqual(calls, [0.0, 600.0])
 
     def test_manual_refresh_bypasses_and_revalidates_cache(self):
         responses = [
