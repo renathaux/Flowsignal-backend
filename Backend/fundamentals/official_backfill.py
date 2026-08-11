@@ -12,6 +12,7 @@ import json
 import time
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from db import SessionLocal, engine
 from fundamentals.locks import HISTORICAL_BACKFILL_LOCK_KEY, LIVE_INGESTION_LOCK_KEY, advisory_lock
@@ -69,7 +70,14 @@ def _validate_manifest(path):
             raise ValueError("BLS manifest contains a non-official source")
         if len(str(row["content_hash"])) != 64 or any(c not in "0123456789abcdef" for c in str(row["content_hash"]).lower()):
             raise ValueError(f"invalid content hash for {expected}")
-        datetime.fromisoformat(str(row["release_timestamp_utc"]).replace("Z", "+00:00"))
+        published_utc = datetime.fromisoformat(
+            str(row["release_timestamp_utc"]).replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+        published_local = datetime.fromisoformat(
+            f"{row['release_date']}T{row['release_time']}"
+        ).replace(tzinfo=ZoneInfo(str(row["timezone"])))
+        if published_local.astimezone(timezone.utc) != published_utc:
+            raise ValueError(f"BLS timezone conversion conflict: {expected}")
         prior = identities.get(expected)
         if prior and prior != row:
             raise ValueError(f"BLS manifest identity conflict: {expected}")
@@ -161,7 +169,9 @@ def fetch_bls_manifest_range(date_from, date_to, currencies=("USD",), *, manifes
     return {
         "provider": "bls", "dataset": "public_data_api_v2_manifest_v1",
         "request_count": 1, "normalized_events": events,
-        "manifest_rows": len(rows), "missing_manifest_matches": [],
+        "manifest_rows": len(rows), "matched_values": len(events),
+        "missing_manifest_matches": [], "duplicate_manifest_ids": 0,
+        "timestamp_conflicts": 0, "parsing_errors": [],
     }
 
 
@@ -203,7 +213,10 @@ def run_official_backfill(*, provider, date_from, date_to, chunk_days=31, curren
     report = {"provider": provider, "date_from": str(start), "date_to": str(end), "status": "DRY_RUN" if dry_run else "PENDING",
               "dry_run": dry_run, "events_seen": 0, "observations_added": 0,
               "observations_would_add": 0, "duplicates_skipped": 0, "chunks_completed": 0,
-              "requests_completed": 0, "database_writes": 0 if dry_run else "ATOMIC_CHUNK_TRANSACTIONS"}
+              "requests_completed": 0, "database_writes": 0 if dry_run else "ATOMIC_CHUNK_TRANSACTIONS",
+              "parsed_releases": 0, "matched_values": 0, "unmatched_values": [],
+              "duplicate_manifest_ids": 0, "timestamp_conflicts": 0,
+              "parsing_errors": [], "proposed_inserts": 0}
     cursor, job_id = start, None
     if not dry_run:
         job_id, cursor, status = _load_or_create_job(factory, provider, start, end, chunk_days, currency_list, resume)
@@ -233,10 +246,17 @@ def run_official_backfill(*, provider, date_from, date_to, chunk_days=31, curren
                 normalized = list(result.get("normalized_events") or [])
                 report["requests_completed"] += int(result.get("request_count") or 0)
                 report["events_seen"] += len(normalized)
+                report["parsed_releases"] += int(result.get("manifest_rows") or 0)
+                report["matched_values"] += int(result.get("matched_values") or len(normalized))
+                report["unmatched_values"].extend(result.get("missing_manifest_matches") or [])
+                report["duplicate_manifest_ids"] += int(result.get("duplicate_manifest_ids") or 0)
+                report["timestamp_conflicts"] += int(result.get("timestamp_conflicts") or 0)
+                report["parsing_errors"].extend(result.get("parsing_errors") or [])
                 if dry_run:
                     with factory() as session:
                         preview = preview_calendar_batch(session, provider, normalized, normalized)
                     report["observations_would_add"] += preview["observations_would_add"]
+                    report["proposed_inserts"] += preview["observations_would_add"]
                     report["duplicates_skipped"] += preview["duplicates_skipped"]
                 else:
                     with factory() as session, session.begin():

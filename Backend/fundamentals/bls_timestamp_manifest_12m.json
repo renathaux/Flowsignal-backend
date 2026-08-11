@@ -1,13 +1,13 @@
 {
   "schema_version": "1.0",
-  "generated_at": "2026-08-10T02:03:33.396Z",
+  "generated_at": "2026-08-11T01:20:00.000Z",
   "source": "BLS official archive pages",
   "coverage": {
-    "release_count": 36,
-    "cpi": 12,
-    "ppi": 12,
-    "employment_situation": 12,
-    "publication_window": "2025-06-01/2026-06-30",
+    "release_count": 40,
+    "cpi": 13,
+    "ppi": 13,
+    "employment_situation": 14,
+    "publication_window": "2025-06-01/2026-08-10",
     "shutdown_gap_policy": "missing official releases are not fabricated"
   },
   "content_hash_basis": "browser_dom_outer_html_sha256",
@@ -478,6 +478,58 @@
       "official_url": "https://www.bls.gov/news.release/archives/ppi_06112026.htm",
       "content_hash": "4fbba73c90f7bd9eac62de87c26817addcf22ca658070598ae5d4fbfc0f96b7d",
       "stable_manifest_id": "bls_manifest:ppi:2026-05",
+      "source": "BLS",
+      "content_hash_basis": "browser_dom_outer_html_sha256"
+    },
+    {
+      "release_family": "employment_situation",
+      "reference_period": "2026-06",
+      "release_date": "2026-07-02",
+      "release_time": "08:30:00",
+      "timezone": "America/New_York",
+      "release_timestamp_utc": "2026-07-02T12:30:00.000Z",
+      "official_url": "https://www.bls.gov/news.release/archives/empsit_07022026.htm",
+      "content_hash": "924494081add49081928b7f2fb9d54d4da205436e5626fa8e048021a960cf897",
+      "stable_manifest_id": "bls_manifest:employment_situation:2026-06",
+      "source": "BLS",
+      "content_hash_basis": "browser_dom_outer_html_sha256"
+    },
+    {
+      "release_family": "cpi",
+      "reference_period": "2026-06",
+      "release_date": "2026-07-14",
+      "release_time": "08:30:00",
+      "timezone": "America/New_York",
+      "release_timestamp_utc": "2026-07-14T12:30:00.000Z",
+      "official_url": "https://www.bls.gov/news.release/archives/cpi_07142026.htm",
+      "content_hash": "974fea4d9e29b6b6ed8dd778202a8ce725e92991df80462d089eafe47898f83e",
+      "stable_manifest_id": "bls_manifest:cpi:2026-06",
+      "source": "BLS",
+      "content_hash_basis": "browser_dom_outer_html_sha256"
+    },
+    {
+      "release_family": "ppi",
+      "reference_period": "2026-06",
+      "release_date": "2026-07-15",
+      "release_time": "08:30:00",
+      "timezone": "America/New_York",
+      "release_timestamp_utc": "2026-07-15T12:30:00.000Z",
+      "official_url": "https://www.bls.gov/news.release/archives/ppi_07152026.htm",
+      "content_hash": "6aad4957c32c4433293703f91d085db1619abf41147389229cfd5bca5d00e3d4",
+      "stable_manifest_id": "bls_manifest:ppi:2026-06",
+      "source": "BLS",
+      "content_hash_basis": "browser_dom_outer_html_sha256"
+    },
+    {
+      "release_family": "employment_situation",
+      "reference_period": "2026-07",
+      "release_date": "2026-08-07",
+      "release_time": "08:30:00",
+      "timezone": "America/New_York",
+      "release_timestamp_utc": "2026-08-07T12:30:00.000Z",
+      "official_url": "https://www.bls.gov/news.release/archives/empsit_08072026.htm",
+      "content_hash": "547f241fdcfb1fe9160e30add4a34f5afdd18d1e6059c136bc005ce606e06a78",
+      "stable_manifest_id": "bls_manifest:employment_situation:2026-07",
       "source": "BLS",
       "content_hash_basis": "browser_dom_outer_html_sha256"
     }

@@ -3,13 +3,14 @@ import contextlib
 import json
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from fundamentals.official_backfill import _validate_manifest, run_official_backfill
+from fundamentals.official_backfill import DEFAULT_MANIFEST, _validate_manifest, run_official_backfill
 from fundamentals import locks as lock_module
 from models import Base, EconomicEvent, EconomicEventObservation, EconomicEventProviderLink
 
@@ -51,11 +52,54 @@ class OfficialBackfillTests(unittest.TestCase):
         return run_official_backfill(**args)
 
     def test_dry_run_writes_nothing(self):
-        report = self.run_job(dry_run=True)
+        report = self.run_job(
+            dry_run=True,
+            fetcher=lambda *_args: {
+                "request_count": 1,
+                "normalized_events": [event()],
+                "manifest_rows": 1,
+                "matched_values": 1,
+                "missing_manifest_matches": [],
+                "duplicate_manifest_ids": 0,
+                "timestamp_conflicts": 0,
+                "parsing_errors": [],
+            },
+        )
         self.assertEqual(report["status"], "DRY_RUN")
+        self.assertEqual(report["parsed_releases"], 1)
+        self.assertEqual(report["matched_values"], 1)
+        self.assertEqual(report["unmatched_values"], [])
+        self.assertEqual(report["duplicate_manifest_ids"], 0)
+        self.assertEqual(report["timestamp_conflicts"], 0)
+        self.assertEqual(report["parsing_errors"], [])
+        self.assertEqual(report["proposed_inserts"], 1)
+        self.assertEqual(report["database_writes"], 0)
         with self.sessions() as session:
             self.assertEqual(session.query(EconomicEvent).count(), 0)
             self.assertEqual(session.query(EconomicEventObservation).count(), 0)
+
+    def test_verified_manifest_includes_new_bls_releases(self):
+        rows = _validate_manifest(DEFAULT_MANIFEST)
+        indexed = {row["stable_manifest_id"]: row for row in rows}
+        expected = {
+            "bls_manifest:employment_situation:2026-06": "2026-07-02T12:30:00.000Z",
+            "bls_manifest:cpi:2026-06": "2026-07-14T12:30:00.000Z",
+            "bls_manifest:ppi:2026-06": "2026-07-15T12:30:00.000Z",
+            "bls_manifest:employment_situation:2026-07": "2026-08-07T12:30:00.000Z",
+        }
+        for stable_id, timestamp in expected.items():
+            self.assertIn(stable_id, indexed)
+            self.assertEqual(indexed[stable_id]["release_timestamp_utc"], timestamp)
+            self.assertEqual(indexed[stable_id]["release_time"], "08:30:00")
+            self.assertEqual(indexed[stable_id]["timezone"], "America/New_York")
+            self.assertTrue(indexed[stable_id]["official_url"].startswith(
+                "https://www.bls.gov/news.release/archives/"
+            ))
+
+    def test_dry_run_report_is_repeatable(self):
+        first = self.run_job(dry_run=True)
+        second = self.run_job(dry_run=True)
+        self.assertEqual(first, second)
 
     def test_backfill_is_idempotent_and_resumable(self):
         first = self.run_job()
@@ -83,6 +127,21 @@ class OfficialBackfillTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "conflict"):
                 _validate_manifest(path)
 
+    def test_manifest_rejects_incorrect_eastern_to_utc_conversion(self):
+        row = {
+            "release_family": "cpi", "reference_period": "2026-06",
+            "release_date": "2026-07-14", "release_time": "08:30:00",
+            "timezone": "America/New_York", "release_timestamp_utc": "2026-07-14T13:30:00Z",
+            "official_url": "https://www.bls.gov/news.release/archives/cpi_07142026.htm",
+            "content_hash": "a" * 64, "stable_manifest_id": "bls_manifest:cpi:2026-06",
+            "source": "BLS",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "manifest.json"
+            path.write_text(json.dumps({"schema_version": "1.0", "manifests": [row]}))
+            with self.assertRaisesRegex(ValueError, "timezone conversion conflict"):
+                _validate_manifest(path)
+
     def test_module_has_no_trading_or_broker_imports(self):
         source = Path(__file__).parents[1] / "fundamentals" / "official_backfill.py"
         tree = ast.parse(source.read_text())
@@ -103,10 +162,10 @@ class OfficialBackfillTests(unittest.TestCase):
         direct = object()
         lock_module._DIRECT_ENGINE = None
         lock_module._DIRECT_ENGINE_URL = None
-        with unittest.mock.patch.dict(
+        with mock.patch.dict(
             "os.environ",
             {"MIGRATION_DATABASE_URL": "postgres://user:pass@direct.example/neondb"},
-        ), unittest.mock.patch.object(lock_module, "create_engine", return_value=direct) as creator:
+        ), mock.patch.object(lock_module, "create_engine", return_value=direct) as creator:
             selected = lock_module._coordination_bind(PooledBind())
         self.assertIs(selected, direct)
         self.assertEqual(creator.call_args.args[0], "postgresql://user:pass@direct.example/neondb")
