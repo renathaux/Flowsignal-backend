@@ -4,7 +4,10 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from . import shared
-from services.strategy_settings_service import get_configured_rr_window
+from services.strategy_settings_service import (
+    get_cached_execution_settings,
+    get_configured_rr_window,
+)
 
 
 MIN_SWING_POINTS = 100
@@ -50,8 +53,15 @@ def sl_buffer(symbol):
     return SL_BUFFER_POINTS * point_size(symbol)
 
 
-def minimum_sl_distance(symbol):
-    return MIN_SL_POINTS * point_size(symbol)
+def minimum_sl_distance(symbol, configured_points=None):
+    points = MIN_SL_POINTS if configured_points is None else configured_points
+    try:
+        points = float(points)
+        if not math.isfinite(points) or points < 1:
+            raise ValueError("invalid minimum SL points")
+    except (TypeError, ValueError):
+        points = MIN_SL_POINTS
+    return points * point_size(symbol)
 
 
 def atr14(data):
@@ -73,9 +83,20 @@ def atr14(data):
     return float(value) if pd.notna(value) and value > 0 else None
 
 
-def bos_buffer(data_15m, symbol):
+def bos_buffer(data_15m, symbol, configured_floor_points=None):
     atr = atr14(data_15m) or 0.0
-    return max(BOS_MIN_BUFFER_POINTS * point_size(symbol), 0.10 * atr)
+    floor_points = (
+        BOS_MIN_BUFFER_POINTS
+        if configured_floor_points is None
+        else configured_floor_points
+    )
+    try:
+        floor_points = float(floor_points)
+        if not math.isfinite(floor_points) or floor_points < 0:
+            raise ValueError("invalid BOS floor points")
+    except (TypeError, ValueError):
+        floor_points = BOS_MIN_BUFFER_POINTS
+    return max(floor_points * point_size(symbol), 0.10 * atr)
 
 
 def minimum_pullback_size(data_15m, symbol):
@@ -616,7 +637,7 @@ def remembered_breakout(symbol, side, current_close_time=None, current_close=Non
         return None
 
 
-def evaluate_15m_breakout(data_15m, symbol):
+def evaluate_15m_breakout(data_15m, symbol, execution_settings=None):
     result = {
         "side": "WAIT",
         "level": None,
@@ -663,7 +684,12 @@ def evaluate_15m_breakout(data_15m, symbol):
     previous_close = float(previous["Close"])
     break_time = candle_time(data_15m.index[-1])
     break_close_time = candle_close_time(data_15m.index[-1], 15)
-    required_buffer = bos_buffer(data_15m, symbol)
+    configured = execution_settings or get_cached_execution_settings()
+    required_buffer = bos_buffer(
+        data_15m,
+        symbol,
+        configured.get("bos_buffer_points", BOS_MIN_BUFFER_POINTS),
+    )
     result["bos_buffer"] = required_buffer
 
     high_swing = latest_swing(swings, "HIGH")
@@ -880,10 +906,16 @@ def confirm_5m(
     return base
 
 
-def select_stop_loss(swings, side, entry, symbol):
+def select_stop_loss(
+    swings,
+    side,
+    entry,
+    symbol,
+    minimum_sl_distance_points=None,
+):
     required = "LOW" if side == "BUY" else "HIGH"
     buffer = sl_buffer(symbol)
-    minimum = minimum_sl_distance(symbol)
+    minimum = minimum_sl_distance(symbol, minimum_sl_distance_points)
     candidates = older_swings(swings, required)
 
     for swing in reversed(candidates):
@@ -980,7 +1012,14 @@ def select_tp2(
     }
 
 
-def build_risk_levels(data_15m, side, entry, symbol, setup_break_time=None):
+def build_risk_levels(
+    data_15m,
+    side,
+    entry,
+    symbol,
+    setup_break_time=None,
+    execution_settings=None,
+):
     dec = decimals(symbol)
     swing_source = data_15m.copy()
     setup_timestamp = utc_timestamp(setup_break_time)
@@ -997,12 +1036,31 @@ def build_risk_levels(data_15m, side, entry, symbol, setup_break_time=None):
     else:
         swing_source = swing_source.iloc[:-1].copy()
     swings = detect_valid_swings(swing_source, symbol)
-    stop = select_stop_loss(swings, side, float(entry), symbol)
+    configured = execution_settings or get_cached_execution_settings()
+    configured_minimum_sl_points = configured.get(
+        "minimum_sl_distance_points",
+        MIN_SL_POINTS,
+    )
+    stop = select_stop_loss(
+        swings,
+        side,
+        float(entry),
+        symbol,
+        minimum_sl_distance_points=configured_minimum_sl_points,
+    )
     if not stop.get("ok"):
         return {**stop, "ok": False}
 
     risk = float(stop["distance"])
-    tp2 = select_tp2(swings, side, float(entry), risk, symbol)
+    tp2 = select_tp2(
+        swings,
+        side,
+        float(entry),
+        risk,
+        symbol,
+        minimum_rr=configured.get("minimum_rr"),
+        maximum_rr=configured.get("maximum_rr"),
+    )
     tp2_price = float(tp2["tp2"])
     tp1_ratio = shared.get_tp1_ratio_of_tp2()
     if side == "BUY":
@@ -1025,7 +1083,7 @@ def build_risk_levels(data_15m, side, entry, symbol, setup_break_time=None):
         "risk_reward": f"1:{round(float(tp2['rr']), 2):g}",
         "sl_buffer": round(stop["buffer"], dec),
         "sl_buffer_points": SL_BUFFER_POINTS,
-        "minimum_sl_points": MIN_SL_POINTS,
+        "minimum_sl_points": int(configured_minimum_sl_points),
         "sl_distance_points": round(stop["distance_points"], 2),
         "sl_swing_used": round(float(stop["swing"]["price"]), dec),
         "tp_structure_used": (
@@ -1299,13 +1357,20 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
             },
         )
 
+    # One atomic cached settings snapshot is shared by BOS qualification,
+    # SL validation, and RR selection for this complete evaluation.
+    execution_settings = get_cached_execution_settings()
     trend = trend_filter(closed_15m, normalized_symbol)
     consolidation = classify_consolidation(closed_15m, normalized_symbol)
     base_meta["consolidation"] = consolidation
     base_meta["market_condition"] = (
         "CONSOLIDATION" if consolidation.get("is_consolidation") else "STRUCTURE"
     )
-    breakout = evaluate_15m_breakout(closed_15m, normalized_symbol)
+    breakout = evaluate_15m_breakout(
+        closed_15m,
+        normalized_symbol,
+        execution_settings=execution_settings,
+    )
     base_meta = {
         **base_meta,
         **bias_scores_from_context(trend=trend, breakout=breakout),
@@ -1594,6 +1659,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
         entry,
         normalized_symbol,
         setup_break_time=breakout.get("break_time"),
+        execution_settings=execution_settings,
     )
     if not levels.get("ok"):
         stages = strategy_stage_states(

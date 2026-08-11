@@ -22,12 +22,17 @@ EXECUTION_FAILURE_CACHE_TTL_SECONDS = 5.0
 WIRED_EXECUTION_SETTINGS = frozenset({
     "minimum_rr",
     "maximum_rr",
+    "bos_buffer_points",
+    "minimum_sl_distance_points",
     "post_trade_cooldown_minutes",
 })
+LEGACY_SETTING_ALIASES = {
+    "bos_buffer_points": "bos_buffer_min_points",
+}
 logger = logging.getLogger("flowsignal.strategy_settings")
 
-# Defaults mirror the currently deployed strategy. Only the three fields in
-# WIRED_EXECUTION_SETTINGS are consumed by execution during Phase 2.
+# Defaults mirror the currently deployed strategy. Only fields in
+# WIRED_EXECUTION_SETTINGS are consumed by execution.
 FIELD_DEFINITIONS = OrderedDict(
     (
         ("minimum_rr", {"default": 1.20, "type": "number", "min": 1.0, "max": 5.0, "step": 0.05, "unit": "R"}),
@@ -35,7 +40,7 @@ FIELD_DEFINITIONS = OrderedDict(
         ("risk_per_trade_percent", {"default": 1.0, "type": "number", "min": 0.05, "max": 1.0, "step": 0.05, "unit": "%"}),
         ("tp1_percent_of_tp2", {"default": 80.0, "type": "number", "min": 1.0, "max": 100.0, "step": 1.0, "unit": "%"}),
         ("protected_sl_percent_of_tp2", {"default": 50.0, "type": "number", "min": 0.0, "max": 100.0, "step": 1.0, "unit": "%"}),
-        ("bos_buffer_min_points", {"default": 10, "type": "integer", "min": 0, "max": 500, "step": 1, "unit": "points"}),
+        ("bos_buffer_points", {"default": 10, "type": "integer", "min": 0, "max": 500, "step": 1, "unit": "points"}),
         ("minimum_sl_distance_points", {"default": 100, "type": "integer", "min": 1, "max": 2000, "step": 1, "unit": "points"}),
         ("ema_filter_enabled", {"default": True, "type": "boolean"}),
         ("ema_fast_period", {"default": 9, "type": "integer", "min": 2, "max": 100, "step": 1, "unit": "candles"}),
@@ -84,6 +89,29 @@ def execution_defaults():
     }
 
 
+def _persisted_names(keys):
+    names = [f"{SETTING_PREFIX}{key}" for key in keys]
+    names.extend(
+        f"{SETTING_PREFIX}{legacy}"
+        for key, legacy in LEGACY_SETTING_ALIASES.items()
+        if key in keys
+    )
+    return names
+
+
+def _normalize_payload_aliases(payload):
+    normalized = dict(payload or {})
+    for canonical, legacy in LEGACY_SETTING_ALIASES.items():
+        if legacy not in normalized:
+            continue
+        if canonical in normalized:
+            raise StrategySettingsValidationError(
+                f"use only {canonical}; {legacy} is a legacy alias"
+            )
+        normalized[canonical] = normalized.pop(legacy)
+    return normalized
+
+
 def _deserialize(value, definition):
     try:
         decoded = json.loads(value)
@@ -120,6 +148,7 @@ def _coerce(value, definition):
 def validate_settings(payload, *, require_all=False):
     if not isinstance(payload, dict):
         raise StrategySettingsValidationError("settings must be an object")
+    payload = _normalize_payload_aliases(payload)
     unknown = sorted(set(payload) - set(FIELD_DEFINITIONS))
     if unknown:
         raise StrategySettingsValidationError(
@@ -160,6 +189,14 @@ def _validate_execution_values(values):
         candidate["post_trade_cooldown_minutes"],
         FIELD_DEFINITIONS["post_trade_cooldown_minutes"],
     )
+    bos_buffer_points = _coerce(
+        candidate["bos_buffer_points"],
+        FIELD_DEFINITIONS["bos_buffer_points"],
+    )
+    minimum_sl_distance_points = _coerce(
+        candidate["minimum_sl_distance_points"],
+        FIELD_DEFINITIONS["minimum_sl_distance_points"],
+    )
     if maximum_rr < minimum_rr:
         raise StrategySettingsValidationError(
             "maximum_rr must be greater than or equal to minimum_rr"
@@ -167,6 +204,8 @@ def _validate_execution_values(values):
     return {
         "minimum_rr": minimum_rr,
         "maximum_rr": maximum_rr,
+        "bos_buffer_points": bos_buffer_points,
+        "minimum_sl_distance_points": minimum_sl_distance_points,
         "post_trade_cooldown_minutes": cooldown,
     }
 
@@ -195,20 +234,21 @@ def _prime_execution_settings_cache(values, factory, *, source="runtime_setting"
 
 def _read_execution_settings(factory):
     safe = execution_defaults()
-    names = [f"{SETTING_PREFIX}{key}" for key in WIRED_EXECUTION_SETTINGS]
+    names = _persisted_names(WIRED_EXECUTION_SETTINGS)
     with factory() as session:
         rows = (
             session.query(RuntimeSetting)
             .filter(RuntimeSetting.setting_name.in_(names))
             .all()
         )
-    by_key = {
-        row.setting_name[len(SETTING_PREFIX):]: row
-        for row in rows
-    }
+    by_name = {row.setting_name: row for row in rows}
     loaded = dict(safe)
     for key in WIRED_EXECUTION_SETTINGS:
-        row = by_key.get(key)
+        row = by_name.get(f"{SETTING_PREFIX}{key}")
+        if row is None and key in LEGACY_SETTING_ALIASES:
+            row = by_name.get(
+                f"{SETTING_PREFIX}{LEGACY_SETTING_ALIASES[key]}"
+            )
         if row is None:
             continue
         try:
@@ -229,7 +269,7 @@ def get_cached_execution_settings(
     force_refresh=False,
     monotonic_now=None,
 ):
-    """Return the three wired settings without querying PostgreSQL each cycle.
+    """Return the wired settings without querying PostgreSQL each cycle.
 
     A failed or malformed authoritative read returns the complete production
     defaults, never a partially loaded or more permissive configuration.
@@ -298,12 +338,21 @@ def get_strategy_settings(session_factory=None):
         rows = (
             session.query(RuntimeSetting)
             .filter(RuntimeSetting.setting_name.in_(
-                [f"{SETTING_PREFIX}{key}" for key in FIELD_DEFINITIONS]
+                _persisted_names(FIELD_DEFINITIONS)
             ))
             .all()
         )
+        canonical_rows = {
+            row.setting_name[len(SETTING_PREFIX):]: row
+            for row in rows
+            if row.setting_name[len(SETTING_PREFIX):] in FIELD_DEFINITIONS
+        }
         for row in rows:
             key = row.setting_name[len(SETTING_PREFIX):]
+            for canonical, legacy in LEGACY_SETTING_ALIASES.items():
+                if key == legacy and canonical not in canonical_rows:
+                    key = canonical
+                    break
             if key not in FIELD_DEFINITIONS:
                 continue
             current[key] = _deserialize(row.setting_value, FIELD_DEFINITIONS[key])
@@ -325,7 +374,7 @@ def get_strategy_settings(session_factory=None):
         "execution_wiring": {
             key: key in WIRED_EXECUTION_SETTINGS for key in FIELD_DEFINITIONS
         },
-        "phase": "PHASE_2_PARTIAL",
+        "phase": "PHASE_3_PARTIAL",
     }
 
 
@@ -335,17 +384,30 @@ def save_strategy_settings(payload, updated_by, session_factory=None, now=None):
     updated_at = now or datetime.now(timezone.utc)
     with _LOCK:
         with factory() as session:
-            existing = {
-                row.setting_name[len(SETTING_PREFIX):]: row
-                for row in session.query(RuntimeSetting)
+            rows = (
+                session.query(RuntimeSetting)
                 .filter(RuntimeSetting.setting_name.in_(
-                    [f"{SETTING_PREFIX}{key}" for key in FIELD_DEFINITIONS]
+                    _persisted_names(FIELD_DEFINITIONS)
                 ))
                 .all()
+            )
+            by_name = {row.setting_name: row for row in rows}
+            existing = {
+                key: by_name.get(f"{SETTING_PREFIX}{key}")
+                for key in FIELD_DEFINITIONS
             }
             merged = defaults()
             for key, row in existing.items():
-                merged[key] = _deserialize(row.setting_value, FIELD_DEFINITIONS[key])
+                source_row = row
+                if source_row is None and key in LEGACY_SETTING_ALIASES:
+                    source_row = by_name.get(
+                        f"{SETTING_PREFIX}{LEGACY_SETTING_ALIASES[key]}"
+                    )
+                if source_row is not None:
+                    merged[key] = _deserialize(
+                        source_row.setting_value,
+                        FIELD_DEFINITIONS[key],
+                    )
             previous = dict(merged)
             merged.update(validated)
             validate_settings(merged, require_all=True)

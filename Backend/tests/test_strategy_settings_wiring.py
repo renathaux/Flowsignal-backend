@@ -39,6 +39,8 @@ class StrategySettingsExecutionCacheTests(unittest.TestCase):
             {
                 "minimum_rr": 1.2,
                 "maximum_rr": 2.0,
+                "bos_buffer_points": 10,
+                "minimum_sl_distance_points": 100,
                 "post_trade_cooldown_minutes": 15,
             },
         )
@@ -76,6 +78,57 @@ class StrategySettingsExecutionCacheTests(unittest.TestCase):
             ),
             settings_service.execution_defaults(),
         )
+
+    def test_malformed_bos_or_sl_value_never_creates_partial_configuration(self):
+        now = datetime(2026, 8, 11, tzinfo=timezone.utc)
+        for setting_name, setting_value in (
+            ("strategy.bos_buffer_points", '"not-a-number"'),
+            ("strategy.minimum_sl_distance_points", "null"),
+        ):
+            with self.subTest(setting_name=setting_name):
+                with self.sessions() as session:
+                    session.query(RuntimeSetting).delete()
+                    session.add(RuntimeSetting(
+                        setting_name=setting_name,
+                        setting_value=setting_value,
+                        updated_at=now,
+                        updated_by="test",
+                    ))
+                    session.commit()
+                settings_service.invalidate_execution_settings_cache(self.sessions)
+                self.assertEqual(
+                    settings_service.get_cached_execution_settings(
+                        self.sessions,
+                        force_refresh=True,
+                    ),
+                    settings_service.execution_defaults(),
+                )
+
+    def test_failed_reads_use_five_second_failure_cache(self):
+        def unavailable_factory():
+            raise RuntimeError("database unavailable")
+
+        settings_service.invalidate_execution_settings_cache(unavailable_factory)
+        with patch.object(
+            settings_service,
+            "_read_execution_settings",
+            side_effect=RuntimeError("database unavailable"),
+        ) as reader:
+            settings_service.get_cached_execution_settings(
+                unavailable_factory,
+                force_refresh=True,
+                monotonic_now=0,
+            )
+            settings_service.get_cached_execution_settings(
+                unavailable_factory,
+                monotonic_now=4,
+            )
+            self.assertEqual(reader.call_count, 1)
+            settings_service.get_cached_execution_settings(
+                unavailable_factory,
+                monotonic_now=6,
+            )
+            self.assertEqual(reader.call_count, 2)
 
     def test_cache_avoids_cycle_reads_and_save_reset_refresh_it(self):
         with patch.object(
@@ -258,6 +311,203 @@ class StrategySettingsRRWiringTests(unittest.TestCase):
                         "XAUUSD", "BUY", 100.0, 90.0, 100.0 + (10.0 * rr)
                     )
                 self.assertEqual(result["ok"], expected_ok)
+
+
+class StrategySettingsStructureWiringTests(unittest.TestCase):
+    @staticmethod
+    def atr_frame(symbol, true_range, rows=20):
+        base = 100.0 if symbol == "XAUUSD" else 1.10000
+        index = pd.date_range("2026-06-01", periods=rows, freq="15min", tz="UTC")
+        return pd.DataFrame(
+            {
+                "Open": [base] * rows,
+                "High": [base + true_range] * rows,
+                "Low": [base] * rows,
+                "Close": [base + (true_range / 2.0)] * rows,
+            },
+            index=index,
+        )
+
+    @staticmethod
+    def breakout_frame(side, close_price):
+        index = pd.date_range("2026-06-01", periods=20, freq="15min", tz="UTC")
+        frame = pd.DataFrame(
+            {
+                "Open": [95.0] * 20,
+                "High": [96.0] * 20,
+                "Low": [94.0] * 20,
+                "Close": [95.0] * 20,
+            },
+            index=index,
+        )
+        if side == "BUY":
+            frame.iloc[-2, frame.columns.get_loc("Close")] = 99.0
+            frame.iloc[-1] = [100.0, close_price + 0.05, 99.5, close_price]
+        else:
+            frame.iloc[-2, frame.columns.get_loc("Close")] = 91.0
+            frame.iloc[-1] = [90.0, 90.5, close_price - 0.05, close_price]
+        return frame
+
+    @staticmethod
+    def swings():
+        return [
+            {"type": "LOW", "price": 90.0, "time": "2026-06-01T01:00:00Z", "index": 4, "valid": True},
+            {"type": "HIGH", "price": 100.0, "time": "2026-06-01T02:00:00Z", "index": 8, "valid": True},
+        ]
+
+    def test_default_bos_formula_matches_previous_production_for_both_symbols(self):
+        for symbol, true_range in (("EURUSD", 0.0004), ("XAUUSD", 0.4)):
+            with self.subTest(symbol=symbol):
+                frame = self.atr_frame(symbol, true_range)
+                previous = max(
+                    strict_trader.BOS_MIN_BUFFER_POINTS * strict_trader.point_size(symbol),
+                    0.10 * strict_trader.atr14(frame),
+                )
+                self.assertAlmostEqual(
+                    strict_trader.bos_buffer(frame, symbol, 10),
+                    previous,
+                )
+
+    def test_bos_floor_values_and_atr_dominance(self):
+        quiet = self.atr_frame("XAUUSD", 0.02)
+        for points in (5, 10, 25, 50):
+            with self.subTest(points=points):
+                self.assertAlmostEqual(
+                    strict_trader.bos_buffer(quiet, "XAUUSD", points),
+                    points * 0.01,
+                )
+        volatile = self.atr_frame("XAUUSD", 10.0)
+        self.assertAlmostEqual(
+            strict_trader.bos_buffer(volatile, "XAUUSD", 50),
+            1.0,
+        )
+
+    def test_buy_sell_and_choch_use_the_same_configured_floor(self):
+        settings = {"bos_buffer_points": 25}
+        with patch.object(strict_trader, "atr14", return_value=0.0), patch.object(
+            strict_trader, "detect_raw_swings", return_value=self.swings()
+        ), patch.object(strict_trader, "clear_opposite_watch"):
+            buy = strict_trader.evaluate_15m_breakout(
+                self.breakout_frame("BUY", 100.26),
+                "XAUUSD",
+                execution_settings=settings,
+            )
+            sell = strict_trader.evaluate_15m_breakout(
+                self.breakout_frame("SELL", 89.74),
+                "XAUUSD",
+                execution_settings=settings,
+            )
+        self.assertEqual((buy["side"], buy["break_type"]), ("BUY", "CHOCH"))
+        self.assertEqual((sell["side"], sell["break_type"]), ("SELL", "CHOCH"))
+        self.assertAlmostEqual(buy["bos_buffer"], 0.25)
+        self.assertAlmostEqual(sell["bos_buffer"], 0.25)
+
+    def test_stricter_floor_blocks_weak_close_and_wick_only_remains_rejected(self):
+        with patch.object(strict_trader, "atr14", return_value=0.0), patch.object(
+            strict_trader, "detect_raw_swings", return_value=self.swings()
+        ), patch.object(strict_trader, "clear_opposite_watch"):
+            accepted = strict_trader.evaluate_15m_breakout(
+                self.breakout_frame("BUY", 100.11),
+                "XAUUSD",
+                execution_settings={"bos_buffer_points": 10},
+            )
+            rejected = strict_trader.evaluate_15m_breakout(
+                self.breakout_frame("BUY", 100.11),
+                "XAUUSD",
+                execution_settings={"bos_buffer_points": 25},
+            )
+            wick_only = strict_trader.evaluate_15m_breakout(
+                self.breakout_frame("BUY", 100.0),
+                "XAUUSD",
+                execution_settings={"bos_buffer_points": 5},
+            )
+        self.assertEqual(accepted["side"], "BUY")
+        self.assertEqual(rejected["side"], "WAIT")
+        self.assertEqual(wick_only["side"], "WAIT")
+
+    def test_minimum_sl_values_change_only_distance_acceptance_symmetrically(self):
+        buy_swings = [{"type": "LOW", "price": 99.1, "valid": True}]
+        sell_swings = [{"type": "HIGH", "price": 100.9, "valid": True}]
+        expected = {50: True, 100: True, 150: False, 250: False}
+        for minimum_points, expected_ok in expected.items():
+            with self.subTest(minimum_points=minimum_points):
+                buy = strict_trader.select_stop_loss(
+                    buy_swings, "BUY", 100.0, "XAUUSD", minimum_points
+                )
+                sell = strict_trader.select_stop_loss(
+                    sell_swings, "SELL", 100.0, "XAUUSD", minimum_points
+                )
+                self.assertEqual(buy["ok"], expected_ok)
+                self.assertEqual(sell["ok"], expected_ok)
+                if not expected_ok:
+                    self.assertEqual(buy["reason"], "WAIT_SL_TOO_SMALL")
+                    self.assertEqual(sell["reason"], "WAIT_SL_TOO_SMALL")
+
+    def test_one_cached_snapshot_is_passed_into_bos_evaluation(self):
+        frame_15m = self.atr_frame("XAUUSD", 0.4, rows=25)
+        settings = settings_service.execution_defaults()
+        no_breakout = {
+            "side": None,
+            "reason": "WAIT_NO_VALID_SWING",
+            "swings": [],
+        }
+        with patch.object(
+            strict_trader,
+            "get_cached_execution_settings",
+            return_value=settings,
+        ) as cached, patch.object(
+            strict_trader,
+            "trend_filter",
+            return_value={"trend": "NEUTRAL", "buy_allowed": False, "sell_allowed": False},
+        ), patch.object(
+            strict_trader,
+            "classify_consolidation",
+            return_value={"is_consolidation": False},
+        ), patch.object(
+            strict_trader,
+            "evaluate_15m_breakout",
+            return_value=no_breakout,
+        ) as breakout:
+            strict_trader.get_mtf_signal(
+                pd.DataFrame(),
+                frame_15m,
+                pd.DataFrame(),
+                "XAUUSD",
+            )
+        cached.assert_called_once_with()
+        self.assertIs(
+            breakout.call_args.kwargs["execution_settings"],
+            settings,
+        )
+
+    def test_risk_plan_uses_supplied_snapshot_without_second_cache_read(self):
+        settings = {
+            **settings_service.execution_defaults(),
+            "minimum_sl_distance_points": 100,
+        }
+        swings = [
+            {"type": "LOW", "price": 99.1, "valid": True},
+            {"type": "HIGH", "price": 103.0, "valid": True},
+        ]
+        frame = self.atr_frame("XAUUSD", 0.4, rows=25)
+        with patch.object(
+            strict_trader,
+            "detect_valid_swings",
+            return_value=swings,
+        ), patch.object(
+            strict_trader,
+            "get_cached_execution_settings",
+            side_effect=AssertionError("unexpected second settings read"),
+        ):
+            levels = strict_trader.build_risk_levels(
+                frame,
+                "BUY",
+                100.0,
+                "XAUUSD",
+                execution_settings=settings,
+            )
+        self.assertTrue(levels["ok"])
+        self.assertEqual(levels["minimum_sl_points"], 100)
 
 
 class StrategySettingsCooldownWiringTests(unittest.TestCase):

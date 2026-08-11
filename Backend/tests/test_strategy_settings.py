@@ -37,11 +37,31 @@ class StrategySettingsTests(unittest.TestCase):
         self.assertEqual(result["limits"]["minimum_rr"]["min"], 1.0)
         self.assertEqual(result["limits"]["risk_per_trade_percent"]["max"], 1.0)
         self.assertIsNone(result["last_updated"])
-        self.assertEqual(result["phase"], "PHASE_2_PARTIAL")
+        self.assertEqual(result["phase"], "PHASE_3_PARTIAL")
         self.assertEqual(
             {key for key, wired in result["execution_wiring"].items() if wired},
-            {"minimum_rr", "maximum_rr", "post_trade_cooldown_minutes"},
+            {
+                "minimum_rr",
+                "maximum_rr",
+                "bos_buffer_points",
+                "minimum_sl_distance_points",
+                "post_trade_cooldown_minutes",
+            },
         )
+
+    def test_legacy_bos_floor_row_is_read_without_losing_saved_value(self):
+        now = datetime(2026, 8, 11, tzinfo=timezone.utc)
+        with self.sessions() as session:
+            session.add(RuntimeSetting(
+                setting_name="strategy.bos_buffer_min_points",
+                setting_value="25",
+                updated_at=now,
+                updated_by="legacy",
+            ))
+            session.commit()
+        loaded = get_strategy_settings(self.sessions)
+        self.assertEqual(loaded["current"]["bos_buffer_points"], 25)
+        self.assertNotIn("bos_buffer_min_points", loaded["current"])
 
     def test_invalid_update_is_rejected_without_partial_write(self):
         with self.assertRaisesRegex(
