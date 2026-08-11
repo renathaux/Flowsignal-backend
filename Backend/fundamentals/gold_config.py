@@ -1,5 +1,8 @@
 """Central configuration for the read-only XAUUSD macro model."""
 
+from fundamentals.normalization.indicators import EURUSD_ENGINE_INDICATOR_BASES
+
+
 GOLD_FACTOR_WEIGHTS = {
     "policy": 0.25,
     "real_yields": 0.25,
@@ -33,3 +36,17 @@ GOLD_RELEVANT_EVENT_INDICATORS = {
     "fed_interest_rate", "interest_rate", "gdp", "retail_sales",
     "manufacturing_pmi", "services_pmi", "pmi",
 }
+
+# Complete SQL allowlist for the XAUUSD engine. The calendar subset above is
+# intentionally narrower because daily yields and financial-stress series are
+# evidence inputs, not scheduled high-impact calendar events.
+XAUUSD_ENGINE_INDICATOR_BASES = frozenset({
+    *(EURUSD_ENGINE_INDICATOR_BASES - {
+        "core_hicp",
+        "hicp",
+        "ecb_interest_rate",
+    }),
+    "us_10y_real_yield",
+    "us_10y_treasury_yield",
+    "financial_stress_index",
+})

@@ -12,6 +12,8 @@ from fundamentals.insight_service import (
     get_fundamental_insight,
 )
 from fundamentals.gold_insight_service import get_xauusd_fundamental_insight
+from fundamentals.gold_config import XAUUSD_ENGINE_INDICATOR_BASES
+from fundamentals.insight_cache import _reset_for_tests as reset_insight_cache
 from fundamentals.normalization.indicators import EURUSD_ENGINE_INDICATOR_BASES
 from fundamentals.repositories import observations as observation_repository
 from fundamentals.repositories.observations import (
@@ -39,11 +41,13 @@ NOW = datetime(2026, 8, 10, 15, 0, tzinfo=timezone.utc)
 
 class FundamentalInsightReliabilityTests(unittest.TestCase):
     def setUp(self):
+        reset_insight_cache()
         self.engine = create_engine("sqlite:///:memory:")
         Base.metadata.create_all(self.engine)
         self.sessions = sessionmaker(bind=self.engine)
 
     def tearDown(self):
+        reset_insight_cache()
         self.engine.dispose()
 
     def _seed_history(self, count=240):
@@ -396,6 +400,71 @@ class FundamentalInsightReliabilityTests(unittest.TestCase):
         self.assertEqual(response["drivers"]["inflation"]["status"], "STALE")
         self.assertEqual(response["drivers"]["employment"]["status"], "STALE")
         self.assertEqual(response["overall_bias"]["status"], "INSUFFICIENT_DATA")
+
+    def test_xauusd_filtered_load_excludes_unrelated_series_with_result_parity(self):
+        self._seed_production_scale_history(relevant_count=300, irrelevant_count=491)
+        with self.sessions() as session:
+            released = NOW - timedelta(days=2)
+            unrelated = EconomicEvent(
+                event_id="usd-unrelated-oil-rigs",
+                event_name="Baker Hughes US Oil Rig Count",
+                indicator="baker_hughes_us_oil_rig_count",
+                country="United States",
+                currency="USD",
+                impact="LOW",
+                release_time=released,
+                provider="fmp",
+                provider_event_id="usd-unrelated-oil-rigs",
+                data_status="RELEASED",
+                first_seen_at=released,
+                last_seen_at=released,
+            )
+            session.add(unrelated)
+            session.flush()
+            session.add(EconomicEventObservation(
+                observation_hash="e" * 64,
+                economic_event_id=unrelated.id,
+                actual="590",
+                forecast="588",
+                previous="585",
+                provider="fmp",
+                provider_timestamp=released,
+                fetched_at=released,
+                data_status="RELEASED",
+                raw_payload={"series": "oil-rigs"},
+            ))
+            session.commit()
+        legacy_observations = latest_released_observations(
+            ("USD",), now=NOW, session_factory=self.sessions
+        )
+        filtered_observations = latest_released_observations(
+            ("USD",), now=NOW, session_factory=self.sessions,
+            indicators=XAUUSD_ENGINE_INDICATOR_BASES,
+        )
+        filtered_indicators = {item["indicator"] for item in filtered_observations}
+        self.assertNotIn("baker_hughes_us_oil_rig_count", filtered_indicators)
+        self.assertLess(len(filtered_observations), len(legacy_observations))
+        ignored_observations = [
+            item for item in legacy_observations
+            if item["indicator"] == "baker_hughes_us_oil_rig_count"
+        ]
+        self.assertTrue(ignored_observations)
+        parity_baseline = filtered_observations + ignored_observations
+        with patch(
+            "fundamentals.gold_insight_service.provider_health",
+            return_value={"observation_count": len(parity_baseline), "providers": {}},
+        ):
+            legacy = get_xauusd_fundamental_insight(
+                now=NOW, observations=parity_baseline, next_event={}
+            )
+            filtered = get_xauusd_fundamental_insight(
+                now=NOW, observations=filtered_observations, next_event={}
+            )
+        for key in (
+            "overall_bias", "gold_support_score", "usd_macro_score", "drivers",
+            "top_reasons", "trading_guidance",
+        ):
+            self.assertEqual(filtered[key], legacy[key])
 
     def test_eurusd_xauusd_route_isolation(self):
         eur = {"symbol": "EURUSD"}

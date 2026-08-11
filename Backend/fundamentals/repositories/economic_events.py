@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 
 from db import SessionLocal
@@ -24,6 +25,9 @@ from models import (
     EconomicEventProviderLink,
     EconomicProviderFetch,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _json_safe(value):
@@ -299,6 +303,19 @@ def persist_calendar_batch(
                 completed_at=completed_at,
             )
             session.commit()
+            if int(result.get("observations_added") or 0) > 0:
+                # Import lazily so persistence remains independent of the API
+                # route while every successful observation change invalidates
+                # any completed read-only insight derived from older data.
+                try:
+                    from fundamentals.insight_cache import invalidate
+
+                    invalidate()
+                except Exception:
+                    # The committed ingestion remains authoritative. A cache
+                    # maintenance failure must not make the provider cycle look
+                    # uncommitted; the short TTL remains the safety fallback.
+                    LOGGER.exception("FUNDAMENTAL_INSIGHT_CACHE_INVALIDATION_FAILED")
             return result
         except Exception:
             session.rollback()

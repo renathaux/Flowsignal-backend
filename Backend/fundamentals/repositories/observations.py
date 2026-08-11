@@ -230,6 +230,7 @@ def latest_released_observations(
     lookback_days=365,
     session_factory=None,
     timing=None,
+    indicators=None,
 ):
     factory = session_factory or SessionLocal
     current = now or datetime.now(timezone.utc)
@@ -242,7 +243,7 @@ def latest_released_observations(
                 (time.perf_counter() - connection_started) * 1000, 2
             )
         query_started = time.perf_counter()
-        rows = (
+        query = (
             session.query(EconomicEvent, EconomicEventObservation)
             .join(
                 EconomicEventObservation,
@@ -253,7 +254,18 @@ def latest_released_observations(
                 EconomicEvent.release_time <= current,
                 EconomicEvent.release_time >= cutoff,
             )
-            .order_by(
+        )
+        if indicators:
+            bases = sorted({str(value) for value in indicators if value})
+            query = query.filter(or_(*[
+                or_(
+                    EconomicEvent.indicator == base,
+                    EconomicEvent.indicator.like(f"{base}_%"),
+                )
+                for base in bases
+            ]))
+        rows = (
+            query.order_by(
                 EconomicEvent.release_time.desc(),
                 EconomicEventObservation.fetched_at.desc(),
             )

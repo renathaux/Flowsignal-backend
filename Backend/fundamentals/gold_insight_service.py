@@ -3,7 +3,10 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from fundamentals.gold_config import GOLD_RELEVANT_EVENT_INDICATORS
+from fundamentals.gold_config import (
+    GOLD_RELEVANT_EVENT_INDICATORS,
+    XAUUSD_ENGINE_INDICATOR_BASES,
+)
 from fundamentals.gold_engine import calculate_xauusd_state
 from fundamentals.insight_service import _iso, _next_event_payload, _serialize_factor
 from fundamentals.repositories.observations import latest_released_observations, next_high_impact_event, provider_health
@@ -16,7 +19,10 @@ def get_xauusd_fundamental_insight(
     current = now or datetime.now(timezone.utc)
     if observations is None:
         observations = latest_released_observations(
-            ("USD",), now=current, session_factory=session_factory
+            ("USD",),
+            now=current,
+            session_factory=session_factory,
+            indicators=XAUUSD_ENGINE_INDICATOR_BASES,
         )
     if next_event is None:
         next_event = next_high_impact_event(
