@@ -2,7 +2,7 @@ import copy
 import os
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pandas as pd
@@ -11,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 
 from db import Base
 from models import StrategyCycleDiagnostic
+from routes.diagnostics import strategy_cycles
 from services import strategy_diagnostics_service as diagnostics
 
 
@@ -27,9 +28,10 @@ class StrategyDiagnosticsTests(unittest.TestCase):
         self.Session = sessionmaker(bind=self.engine)
         self.session_patch = patch.object(diagnostics, "SessionLocal", self.Session)
         self.session_patch.start()
-        diagnostics._last_cleanup_at = None
+        diagnostics._reset_runtime_state_for_tests()
 
     def tearDown(self):
+        diagnostics._reset_runtime_state_for_tests()
         self.session_patch.stop()
         self.engine.dispose()
         os.unlink(self.path)
@@ -114,6 +116,239 @@ class StrategyDiagnosticsTests(unittest.TestCase):
         self.assertEqual(rows[0].cycle_id, snapshot["cycle_id"])
         self.assertEqual(result["audit_diagnostics"]["cycle_id"], rows[0].cycle_id)
         self.assertEqual(rows[0].snapshot_json["final_decision"]["decision"], "WAIT")
+
+    def test_first_cycle_persists_and_identical_cycle_is_skipped(self):
+        first_at = datetime(2026, 8, 7, 15, 0, tzinfo=timezone.utc)
+        result = self.result()
+        first = diagnostics.persist_cycle_safely("EURUSD", result, now=first_at)
+        repeated = self.result()
+        second = diagnostics.persist_cycle_safely(
+            "EURUSD",
+            repeated,
+            now=first_at + timedelta(minutes=1),
+        )
+
+        with self.Session() as db:
+            rows = db.execute(select(StrategyCycleDiagnostic)).scalars().all()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(first["cycle_id"], second["cycle_id"])
+        self.assertEqual(
+            repeated["audit_diagnostics"]["cycle_id"],
+            first["cycle_id"],
+        )
+        self.assertEqual(first["persistence"]["reason"], "FIRST_SNAPSHOT")
+        self.assertEqual(
+            diagnostics._diagnostic_counters["diagnostics_skipped_unchanged"],
+            1,
+        )
+
+    def test_meaningful_state_change_persists_immediately(self):
+        first_at = datetime(2026, 8, 7, 15, 0, tzinfo=timezone.utc)
+        diagnostics.persist_cycle_safely("EURUSD", self.result(), now=first_at)
+        changed = self.result()
+        changed["strategy_stage_states"]["five_m_confirmation"] = "PASSED"
+        changed["confirmation_5m"] = {
+            "side": "BUY",
+            "close_confirmed": True,
+            "confirmation_close_time": "2026-08-07T14:20:00+00:00",
+            "reason": "PASSED",
+        }
+        snapshot = diagnostics.persist_cycle_safely(
+            "EURUSD",
+            changed,
+            now=first_at + timedelta(seconds=30),
+        )
+
+        with self.Session() as db:
+            rows = db.execute(
+                select(StrategyCycleDiagnostic).order_by(StrategyCycleDiagnostic.id)
+            ).scalars().all()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(snapshot["persistence"]["reason"], "STATE_CHANGE")
+
+    def test_timestamp_and_price_only_changes_do_not_persist(self):
+        first_at = datetime(2026, 8, 7, 15, 0, tzinfo=timezone.utc)
+        first = self.result()
+        diagnostics.persist_cycle_safely("EURUSD", first, now=first_at)
+        changed = self.result()
+        changed["trend_15m"]["close"] = 1.10604
+        changed["trend_15m"]["ema_fast"] = 1.10503
+        changed["entry_price"] = 1.10605
+        changed["source_debug_timestamp"] = "2026-08-07T15:01:00+00:00"
+        diagnostics.persist_cycle_safely(
+            "EURUSD",
+            changed,
+            now=first_at + timedelta(minutes=1),
+        )
+
+        with self.Session() as db:
+            count = len(db.execute(select(StrategyCycleDiagnostic)).scalars().all())
+        self.assertEqual(count, 1)
+
+    def test_heartbeat_persists_at_five_minutes_but_not_before(self):
+        first_at = datetime(2026, 8, 7, 15, 0, tzinfo=timezone.utc)
+        with patch.object(diagnostics, "HEARTBEAT_SECONDS", 300):
+            diagnostics.persist_cycle_safely("EURUSD", self.result(), now=first_at)
+            diagnostics.persist_cycle_safely(
+                "EURUSD", self.result(), now=first_at + timedelta(seconds=299)
+            )
+            heartbeat = diagnostics.persist_cycle_safely(
+                "EURUSD", self.result(), now=first_at + timedelta(seconds=300)
+            )
+
+        with self.Session() as db:
+            rows = db.execute(
+                select(StrategyCycleDiagnostic).order_by(StrategyCycleDiagnostic.id)
+            ).scalars().all()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(heartbeat["persistence"]["reason"], "HEARTBEAT")
+        self.assertEqual(
+            diagnostics._diagnostic_counters["persisted_heartbeat"],
+            1,
+        )
+
+    def test_symbols_have_independent_state_and_heartbeat(self):
+        first_at = datetime(2026, 8, 7, 15, 0, tzinfo=timezone.utc)
+        diagnostics.persist_cycle_safely("EURUSD", self.result(), now=first_at)
+        diagnostics.persist_cycle_safely("XAUUSD", self.result(), now=first_at)
+        changed_eurusd = self.result()
+        changed_eurusd["blocked_reason"] = "WAIT_CONSOLIDATION"
+        diagnostics.persist_cycle_safely(
+            "EURUSD", changed_eurusd, now=first_at + timedelta(minutes=1)
+        )
+        diagnostics.persist_cycle_safely(
+            "XAUUSD", self.result(), now=first_at + timedelta(minutes=1)
+        )
+
+        with self.Session() as db:
+            rows = db.execute(select(StrategyCycleDiagnostic)).scalars().all()
+        self.assertEqual(sum(row.symbol == "EURUSD" for row in rows), 2)
+        self.assertEqual(sum(row.symbol == "XAUUSD" for row in rows), 1)
+
+    def test_restart_reconstructs_latest_state_and_avoids_duplicate(self):
+        first_at = datetime(2026, 8, 7, 15, 0, tzinfo=timezone.utc)
+        first = diagnostics.persist_cycle_safely(
+            "EURUSD", self.result(), now=first_at
+        )
+        diagnostics._symbol_persistence_state.clear()
+        diagnostics._restart_loaded_symbols.clear()
+
+        restarted_result = self.result()
+        restored = diagnostics.persist_cycle_safely(
+            "EURUSD",
+            restarted_result,
+            now=first_at + timedelta(minutes=1),
+        )
+
+        with self.Session() as db:
+            rows = db.execute(select(StrategyCycleDiagnostic)).scalars().all()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(restored["cycle_id"], first["cycle_id"])
+        self.assertEqual(
+            restarted_result["audit_diagnostics"]["cycle_id"],
+            first["cycle_id"],
+        )
+
+    def test_fingerprint_covers_required_semantic_gates(self):
+        base = self.result()
+        baseline = diagnostics.meaningful_state_fingerprint(
+            diagnostics.build_snapshot("EURUSD", base)
+        )
+        variants = []
+
+        plan = self.result()
+        plan["plan_type"] = "BUY READY"
+        variants.append(plan)
+
+        signal = self.result()
+        signal["signal"] = "BUY"
+        signal["final_signal"] = "BUY"
+        variants.append(signal)
+
+        bos = self.result()
+        bos["strategy_stage_states"]["fifteen_m_bos"] = "FAILED"
+        bos["fifteen_m_swing_break"]["break_type"] = "CHOCH"
+        variants.append(bos)
+
+        ema = self.result()
+        ema["trend_15m"]["buy_allowed"] = False
+        ema["trend_15m"]["trend"] = "NEUTRAL"
+        variants.append(ema)
+
+        consolidation = self.result()
+        consolidation["consolidation"]["is_consolidation"] = True
+        consolidation["consolidation"]["reason"] = "WAIT_CONSOLIDATION"
+        variants.append(consolidation)
+
+        risk = self.result()
+        risk["strategy_stage_states"]["tp_rr"] = "BLOCKED"
+        variants.append(risk)
+
+        news = self.result()
+        news["news_trading"] = {
+            "mode": "BLOCK_ONLY",
+            "blocked": True,
+            "reason": "WAIT_NEWS_BLOCK",
+        }
+        variants.append(news)
+
+        execution = self.result()
+        execution["strategy_setup_complete"] = True
+        execution["strategy_stage_states"]["execution"] = "PASSED"
+        variants.append(execution)
+
+        position = self.result()
+        position["trade_already_running"] = True
+        variants.append(position)
+
+        setup = self.result()
+        setup["signal_setup_id"] = "setup-2"
+        variants.append(setup)
+
+        blocked = self.result()
+        blocked["blocked_reason"] = "WAIT_NEWS_BLOCK"
+        variants.append(blocked)
+
+        for variant in variants:
+            with self.subTest(variant=variant):
+                fingerprint = diagnostics.meaningful_state_fingerprint(
+                    diagnostics.build_snapshot("EURUSD", variant)
+                )
+                self.assertNotEqual(fingerprint, baseline)
+
+    def test_retention_cleanup_still_uses_configured_thirty_days(self):
+        self.assertEqual(diagnostics.RETENTION_DAYS, 30)
+        old_at = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
+        diagnostics.persist_cycle_safely("EURUSD", self.result(), now=old_at)
+        diagnostics.persist_cycle_safely(
+            "EURUSD",
+            self.result(),
+            now=old_at + timedelta(days=31),
+        )
+        with self.Session() as db:
+            rows = db.execute(select(StrategyCycleDiagnostic)).scalars().all()
+        self.assertEqual(len(rows), 1)
+        self.assertGreaterEqual(
+            rows[0].evaluation_timestamp.replace(tzinfo=timezone.utc),
+            old_at + timedelta(days=31),
+        )
+
+    def test_diagnostic_endpoint_contract_remains_compatible(self):
+        diagnostics.persist_cycle_safely("EURUSD", self.result())
+        response = strategy_cycles(
+            symbol="EURUSD",
+            start=None,
+            end=None,
+            decision="WAIT",
+            block_reason="WAIT_5M_CONFIRMATION",
+            limit=100,
+            offset=0,
+        )
+        self.assertEqual(response["count"], 1)
+        self.assertEqual(response["items"][0]["symbol"], "EURUSD")
+        self.assertEqual(response["limit"], 100)
+        self.assertEqual(response["offset"], 0)
+        self.assertTrue(response["read_only"])
 
     def test_decision_and_displayed_progress_are_from_same_cycle(self):
         result = self.result()
