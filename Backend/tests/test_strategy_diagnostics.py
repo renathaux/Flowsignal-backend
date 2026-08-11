@@ -3,14 +3,14 @@ import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from db import Base
-from models import StrategyCycleDiagnostic
+from models import AutoTradeStateAudit, StrategyCycleDiagnostic
 from routes.diagnostics import strategy_cycles
 from services import strategy_diagnostics_service as diagnostics
 
@@ -316,22 +316,109 @@ class StrategyDiagnosticsTests(unittest.TestCase):
                 )
                 self.assertNotEqual(fingerprint, baseline)
 
-    def test_retention_cleanup_still_uses_configured_thirty_days(self):
-        self.assertEqual(diagnostics.RETENTION_DAYS, 30)
-        old_at = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
-        diagnostics.persist_cycle_safely("EURUSD", self.result(), now=old_at)
-        diagnostics.persist_cycle_safely(
-            "EURUSD",
-            self.result(),
-            now=old_at + timedelta(days=31),
+    def test_default_retention_is_seven_days(self):
+        self.assertEqual(diagnostics.DEFAULT_RETENTION_DAYS, 7)
+        self.assertEqual(diagnostics._configured_retention_days({}), 7)
+
+    def test_retention_is_configurable_with_a_one_day_minimum(self):
+        setting = "STRATEGY_DIAGNOSTICS_RETENTION_DAYS"
+        self.assertEqual(
+            diagnostics._configured_retention_days({setting: "12"}),
+            12,
         )
+        self.assertEqual(
+            diagnostics._configured_retention_days({setting: "1"}),
+            1,
+        )
+        self.assertEqual(
+            diagnostics._configured_retention_days({setting: "0"}),
+            1,
+        )
+        self.assertEqual(
+            diagnostics._configured_retention_days({setting: "invalid"}),
+            7,
+        )
+
+    def test_retention_cleanup_preserves_newer_rows_and_deletes_older_rows(self):
+        now = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+        with patch.object(diagnostics, "RETENTION_DAYS", 7):
+            diagnostics.persist_cycle_safely(
+                "EURUSD",
+                self.result(),
+                now=now - timedelta(days=8),
+            )
+            diagnostics.persist_cycle_safely(
+                "EURUSD",
+                self.result(),
+                now=now - timedelta(days=6),
+            )
+            diagnostics.persist_cycle_safely(
+                "EURUSD",
+                self.result(),
+                now=now,
+            )
+
         with self.Session() as db:
-            rows = db.execute(select(StrategyCycleDiagnostic)).scalars().all()
-        self.assertEqual(len(rows), 1)
-        self.assertGreaterEqual(
-            rows[0].evaluation_timestamp.replace(tzinfo=timezone.utc),
-            old_at + timedelta(days=31),
+            timestamps = [
+                row.evaluation_timestamp.replace(tzinfo=timezone.utc)
+                for row in db.execute(
+                    select(StrategyCycleDiagnostic).order_by(
+                        StrategyCycleDiagnostic.evaluation_timestamp
+                    )
+                ).scalars().all()
+            ]
+        self.assertEqual(
+            timestamps,
+            [now - timedelta(days=6), now],
         )
+
+    def test_retention_cleanup_executes_at_most_hourly(self):
+        now = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+        db = MagicMock()
+        diagnostics._cleanup_if_due(db, now)
+        diagnostics._cleanup_if_due(db, now + timedelta(minutes=59))
+        self.assertEqual(db.execute.call_count, 1)
+        diagnostics._cleanup_if_due(db, now + timedelta(hours=1))
+        self.assertEqual(db.execute.call_count, 2)
+
+    def test_retention_cleanup_does_not_delete_trading_audit_history(self):
+        now = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+        old_at = now - timedelta(days=8)
+        with self.Session() as db:
+            db.add(AutoTradeStateAudit(
+                trading_mode="LIVE",
+                previous_enabled=False,
+                new_enabled=True,
+                updated_by="retention-test",
+                active_broker_account="demo-account",
+                broker_environment="demo",
+                timestamp=old_at,
+                request_source="test",
+                reason="unrelated trading audit",
+            ))
+            db.commit()
+
+        with patch.object(diagnostics, "RETENTION_DAYS", 7):
+            diagnostics.persist_cycle_safely(
+                "EURUSD",
+                self.result(),
+                now=old_at,
+            )
+            diagnostics.persist_cycle_safely(
+                "EURUSD",
+                self.result(),
+                now=now,
+            )
+
+        with self.Session() as db:
+            diagnostic_count = len(
+                db.execute(select(StrategyCycleDiagnostic)).scalars().all()
+            )
+            audit_count = len(
+                db.execute(select(AutoTradeStateAudit)).scalars().all()
+            )
+        self.assertEqual(diagnostic_count, 1)
+        self.assertEqual(audit_count, 1)
 
     def test_diagnostic_endpoint_contract_remains_compatible(self):
         diagnostics.persist_cycle_safely("EURUSD", self.result())

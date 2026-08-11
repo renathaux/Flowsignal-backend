@@ -22,7 +22,24 @@ from models import StrategyCycleDiagnostic
 
 logger = logging.getLogger(__name__)
 SESSION_ID = os.getenv("RENDER_INSTANCE_ID") or f"boot-{uuid.uuid4()}"
-RETENTION_DAYS = max(1, int(os.getenv("STRATEGY_DIAGNOSTICS_RETENTION_DAYS", "30")))
+DEFAULT_RETENTION_DAYS = 7
+MIN_RETENTION_DAYS = 1
+
+
+def _configured_retention_days(environment=None):
+    environment = os.environ if environment is None else environment
+    raw_value = environment.get(
+        "STRATEGY_DIAGNOSTICS_RETENTION_DAYS",
+        str(DEFAULT_RETENTION_DAYS),
+    )
+    try:
+        configured_days = int(raw_value)
+    except (TypeError, ValueError):
+        configured_days = DEFAULT_RETENTION_DAYS
+    return max(MIN_RETENTION_DAYS, configured_days)
+
+
+RETENTION_DAYS = _configured_retention_days()
 RETENTION_CLEANUP_INTERVAL_SECONDS = max(
     300,
     int(os.getenv("STRATEGY_DIAGNOSTICS_CLEANUP_INTERVAL_SECONDS", "3600")),
