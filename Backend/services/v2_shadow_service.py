@@ -59,6 +59,11 @@ def _number(value):
         return None
 
 
+def _mapping(value):
+    """Return diagnostic mappings while tolerating V1 status-string fields."""
+    return value if isinstance(value, dict) else {}
+
+
 def _json_safe(value):
     if value is None or isinstance(value, (str, int, bool)):
         return value
@@ -130,10 +135,10 @@ def build_context(symbol, result, data_5m, data_15m, now=None):
     now = _utc(now) or datetime.now(timezone.utc)
     closed_5m = _closed_frame(data_5m, 5, now)
     closed_15m = _closed_frame(data_15m, 15, now)
-    breakout = result.get("fifteen_m_swing_break") or {}
-    confirmation = result.get("confirmation_5m") or {}
-    consolidation = result.get("consolidation") or {}
-    trend = result.get("trend_15m") or {}
+    breakout = _mapping(result.get("fifteen_m_swing_break"))
+    confirmation = _mapping(result.get("confirmation_5m"))
+    consolidation = _mapping(result.get("consolidation"))
+    trend = _mapping(result.get("trend_15m"))
     signal = str(result.get("signal") or result.get("final_signal") or "WAIT").upper()
     direction = signal if signal in {"BUY", "SELL"} else str(breakout.get("side") or "").upper() or None
     atr = (

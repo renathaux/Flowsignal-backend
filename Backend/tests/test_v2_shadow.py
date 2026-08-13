@@ -244,6 +244,28 @@ class V2PersistenceTests(unittest.TestCase):
 
 
 class ShadowSafetyBoundaryTests(unittest.TestCase):
+    def test_v1_status_strings_are_safe_observer_inputs(self):
+        result = {
+            "symbol": "XAUUSD",
+            "signal": "WAIT",
+            "fifteen_m_swing_break": "NO",
+            "confirmation_5m": "NO",
+            "consolidation": "CLEAR",
+            "trend_15m": "NEUTRAL",
+        }
+        index_5m = pd.date_range("2026-06-01T11:00:00Z", periods=20, freq="5min")
+        index_15m = pd.date_range("2026-06-01T06:00:00Z", periods=20, freq="15min")
+        candles = lambda index: pd.DataFrame(
+            {"Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 100.5},
+            index=index,
+        )
+        projected = shadow.build_context(
+            "XAUUSD", result, candles(index_5m), candles(index_15m),
+            now=datetime(2026, 6, 1, 13, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(projected["v1_decision"], "WAIT")
+        self.assertIsNone(projected["bos_level"])
+
     def test_shadow_module_has_no_broker_or_execution_import(self):
         path = Path(shadow.__file__)
         tree = ast.parse(path.read_text(encoding="utf-8"))
