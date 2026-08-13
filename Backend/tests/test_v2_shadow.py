@@ -62,6 +62,20 @@ class V2DecisionTests(unittest.TestCase):
         self.assertEqual(reason, "NORMAL_ENTRY_WITHIN_EXTENSION_LIMIT")
         self.assertIsNotNone(trade)
 
+    def test_active_v1_trade_does_not_suppress_shadow_buy_or_sell_decision(self):
+        for signal in ("BUY", "SELL"):
+            ctx = context(extension=0.5, signal=signal)
+            ctx.update({
+                "v1_active_trade": True,
+                "active_trade_direction": "BUY",
+                "active_trade_id": "live-position-123",
+                "execution_allowed": False,
+                "execution_block_reason": "ACTIVE_TRADE_ALREADY_RUNNING",
+            })
+            decision, _, _, trade = shadow.decide_v2(ctx, {})
+            self.assertEqual(decision, f"{signal}_READY")
+            self.assertEqual(trade["direction"], signal)
+
     def test_extension_over_limit_waits(self):
         decision, reason, state, trade = shadow.decide_v2(context(extension=0.751), {})
         self.assertEqual(decision, "WAIT_EXTENDED")
@@ -229,6 +243,27 @@ class V2PersistenceTests(unittest.TestCase):
         shadow.evaluate_cycle_safely("XAUUSD", plan, frame5, frame15, now=now + timedelta(seconds=30))
         db = self.Session()
         self.assertEqual(db.query(StrategyShadowTrade).count(), 1)
+        db.close()
+
+    def test_active_v1_trade_metadata_does_not_stop_shadow_history_persistence(self):
+        now = datetime(2026, 8, 13, 16, 0, tzinfo=UTC)
+        frame5, frame15 = self.frames(now)
+        plan = self.ready_result(now)
+        plan.update({
+            "trade_already_running": True,
+            "active_trade_direction": "SELL",
+            "active_trade_id": "live-position-456",
+            "execution_allowed": False,
+            "execution_block_reason": "ACTIVE_TRADE_ALREADY_RUNNING",
+        })
+        result = shadow.evaluate_cycle_safely(
+            "XAUUSD", plan, frame5, frame15, now=now
+        )
+        self.assertEqual(result["v2_decision"], "BUY_READY")
+        db = self.Session()
+        evaluation = db.execute(select(StrategyShadowEvaluation)).scalar_one()
+        self.assertEqual(evaluation.v2_decision, "BUY_READY")
+        self.assertTrue(evaluation.diagnostics_json["shadow_only"])
         db.close()
 
     def test_symbol_metrics_never_mix(self):

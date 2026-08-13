@@ -605,15 +605,26 @@ class StrategyDiagnosticsTests(unittest.TestCase):
     def test_execution_outcome_updates_same_cycle_instead_of_creating_another(self):
         result = self.result()
         snapshot = diagnostics.persist_cycle_safely("EURUSD", result)
+        original_decision = snapshot["final_decision"]["decision"]
         self.assertTrue(diagnostics.update_execution_outcome_safely(
             snapshot["cycle_id"],
-            "BUY_EXECUTED",
+            "BLOCKED",
+            "ACTIVE_TRADE_ALREADY_RUNNING",
             details={"broker_position_id": "123"},
         ))
         with self.Session() as db:
             rows = db.execute(select(StrategyCycleDiagnostic)).scalars().all()
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].decision, "BUY_EXECUTED")
+        self.assertEqual(rows[0].decision, original_decision)
+        self.assertEqual(
+            rows[0].snapshot_json["final_decision"]["decision"],
+            original_decision,
+        )
+        self.assertFalse(rows[0].snapshot_json["execution_outcome"]["execution_allowed"])
+        self.assertEqual(
+            rows[0].snapshot_json["execution_outcome"]["execution_block_reason"],
+            "ACTIVE_TRADE_ALREADY_RUNNING",
+        )
         self.assertEqual(
             rows[0].snapshot_json["final_decision"]["execution_details"]["broker_position_id"],
             "123",

@@ -638,6 +638,12 @@ def build_snapshot(symbol, result, data_5m=None, data_15m=None, source_state=Non
         },
         "final_decision": {
             "decision": _decision(result),
+            "strategy_decision": (
+                str(result.get("final_signal") or result.get("signal") or "WAIT").upper()
+                if str(result.get("final_signal") or result.get("signal") or "WAIT").upper()
+                in {"BUY", "SELL"}
+                else "WAIT"
+            ),
             "reason": reason,
             "prevented_by": gates,
         },
@@ -826,7 +832,7 @@ def query_cycles(symbol=None, start=None, end=None, decision=None, block_reason=
 
 
 def update_execution_outcome_safely(cycle_id, decision, reason=None, details=None):
-    """Attach the later execution-gate outcome to the same coherent cycle."""
+    """Attach execution outcome without replacing the strategy decision."""
     if not cycle_id:
         return False
     try:
@@ -841,16 +847,27 @@ def update_execution_outcome_safely(cycle_id, decision, reason=None, details=Non
                 return False
             snapshot = dict(row.snapshot_json or {})
             final = dict(snapshot.get("final_decision") or {})
+            execution_decision = str(decision).upper()
+            execution_allowed = execution_decision.endswith("_EXECUTED")
+            execution_details = _json_safe(details or {})
+            execution_updated_at = datetime.now(timezone.utc).isoformat()
             final.update({
-                "decision": str(decision).upper(),
-                "reason": reason,
-                "execution_details": _json_safe(details or {}),
-                "execution_updated_at": datetime.now(timezone.utc).isoformat(),
+                "execution_status": execution_decision,
+                "execution_allowed": execution_allowed,
+                "execution_block_reason": None if execution_allowed else reason,
+                "execution_details": execution_details,
+                "execution_updated_at": execution_updated_at,
             })
             snapshot["final_decision"] = final
+            snapshot["execution_outcome"] = {
+                "strategy_decision": final.get("strategy_decision") or final.get("decision"),
+                "execution_status": execution_decision,
+                "execution_allowed": execution_allowed,
+                "execution_block_reason": None if execution_allowed else reason,
+                "details": execution_details,
+                "updated_at": execution_updated_at,
+            }
             row.snapshot_json = snapshot
-            row.decision = final["decision"]
-            row.block_reason = reason
             db.commit()
             return True
         except Exception:

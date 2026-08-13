@@ -826,6 +826,16 @@ def record_auto_execution_gate(
     event = {
         "symbol": str(symbol or "").upper(),
         "setup_id": setup_id,
+        "source": str(plan.get("execution_source") or "V1").upper(),
+        "strategy_decision": str(
+            plan.get("strategy_decision") or signal or "WAIT"
+        ).upper(),
+        "execution_allowed": str(result or "").upper() == "PASS",
+        "execution_block_reason": (
+            reason if str(result or "").upper() == "BLOCK" else None
+        ),
+        "active_trade_direction": plan.get("active_trade_direction"),
+        "active_trade_id": plan.get("active_trade_id"),
         "gate": str(gate or "UNKNOWN").upper(),
         "result": str(result or "UNKNOWN").upper(),
         "reason": reason,
@@ -839,7 +849,15 @@ def record_auto_execution_gate(
         event["gate"],
         event["result"],
         reason,
-        details=event["details"],
+        details={
+            **event["details"],
+            "source": event["source"],
+            "strategy_decision": event["strategy_decision"],
+            "execution_allowed": event["execution_allowed"],
+            "execution_block_reason": event["execution_block_reason"],
+            "active_trade_direction": event["active_trade_direction"],
+            "active_trade_id": event["active_trade_id"],
+        },
     )
     return event
 
@@ -1310,6 +1328,39 @@ def ensure_executed_snapshot_for_active_trade(trade, plan=None):
     return trade
 
 
+ACTIVE_TRADE_EXECUTION_BLOCK_REASON = "ACTIVE_TRADE_ALREADY_RUNNING"
+ACTIVE_TRADE_EXECUTION_STATUSES = {"RUNNING", "OPEN", "TP1 HIT", "CLOSING", "TP2 HIT"}
+
+
+def get_active_trade_execution_block(symbol):
+    """Return canonical execution-only block metadata for an open symbol trade."""
+    normalized_symbol = normalize_symbol(symbol)
+    active_trade = LIVE_ACTIVE_ORDERS.get(normalized_symbol)
+    if not isinstance(active_trade, dict):
+        return None
+    status = get_live_trade_status(active_trade)
+    if status not in ACTIVE_TRADE_EXECUTION_STATUSES:
+        return None
+    return {
+        "execution_allowed": False,
+        "execution_status": "BLOCKED",
+        "execution_block_reason": ACTIVE_TRADE_EXECUTION_BLOCK_REASON,
+        "active_trade_direction": str(
+            active_trade.get("side") or active_trade.get("action") or ""
+        ).upper() or None,
+        "active_trade_id": (
+            active_trade.get("trade_id")
+            or active_trade.get("broker_position_id")
+            or active_trade.get("position_id")
+            or active_trade.get("broker_order_id")
+            or active_trade.get("order_id")
+        ),
+        "active_trade_status": status,
+        "symbol": normalized_symbol,
+        "source": "V1",
+    }
+
+
 def apply_trade_signal_lifecycle(panel_data):
     if not isinstance(panel_data, dict):
         return panel_data
@@ -1337,10 +1388,20 @@ def apply_trade_signal_lifecycle(panel_data):
                 "trade_already_running": bool(plan.get("trade_already_running")),
                 "active_trade_side": plan.get("active_trade_side"),
                 "active_trade_status": plan.get("active_trade_status"),
+                "strategy_decision": plan.get("strategy_decision"),
+                "execution_allowed": plan.get("execution_allowed"),
+                "execution_status": plan.get("execution_status"),
+                "execution_block_reason": plan.get("execution_block_reason"),
+                "active_trade_direction": plan.get("active_trade_direction"),
+                "active_trade_id": plan.get("active_trade_id"),
+                "execution_source": plan.get("execution_source"),
             })
             plan[key] = debug
 
     def apply_active_trade_display(plan, active_trade, side, status):
+        strategy_signal = str(plan.get("signal") or "WAIT").upper()
+        if strategy_signal not in ["BUY", "SELL"]:
+            strategy_signal = "WAIT"
         current_setup_state = copy.deepcopy({
             key: value
             for key, value in plan.items()
@@ -1351,6 +1412,24 @@ def apply_trade_signal_lifecycle(panel_data):
             ]
         })
         plan["current_setup_state"] = current_setup_state
+        plan["strategy_decision"] = strategy_signal
+        plan["execution_source"] = "V1"
+        plan["active_trade_direction"] = side
+        plan["active_trade_id"] = (
+            active_trade.get("trade_id")
+            or active_trade.get("broker_position_id")
+            or active_trade.get("position_id")
+            or active_trade.get("broker_order_id")
+            or active_trade.get("order_id")
+        )
+        if strategy_signal in ["BUY", "SELL"]:
+            plan["execution_allowed"] = False
+            plan["execution_status"] = "BLOCKED"
+            plan["execution_block_reason"] = ACTIVE_TRADE_EXECUTION_BLOCK_REASON
+        else:
+            plan["execution_allowed"] = False
+            plan["execution_status"] = "NOT_APPLICABLE"
+            plan["execution_block_reason"] = None
         snapshot = active_trade.get("executed_trade_setup_snapshot")
         if executed_snapshot_matches_trade(snapshot, active_trade):
             plan["executed_trade_setup_snapshot"] = copy.deepcopy(snapshot)
@@ -1368,6 +1447,10 @@ def apply_trade_signal_lifecycle(panel_data):
             plan["smc_progress"] = 100
             plan["smc_status"] = "EXECUTED" if status == "OPEN" else "RUNNING"
             plan["next_trigger"] = None
+            plan["final_signal"] = strategy_signal
+            plan["signal_display_state"] = strategy_signal
+            plan["display_signal"] = strategy_signal
+            plan["history_signal"] = strategy_signal
             plan["strategy_debug"] = {
                 **(plan.get("strategy_debug") or {}),
                 "smc_direction": snapshot.get("direction") or side,
@@ -1379,9 +1462,13 @@ def apply_trade_signal_lifecycle(panel_data):
                 "five_m_confirmation": True,
                 "selected_swing_sl": snapshot.get("swing_sl") or snapshot.get("sl"),
                 "sl_valid": True,
-                "final_signal": snapshot.get("direction") or side,
+                "final_signal": strategy_signal,
+                "strategy_decision": strategy_signal,
+                "execution_allowed": plan.get("execution_allowed"),
+                "execution_block_reason": plan.get("execution_block_reason"),
             }
-            return snapshot.get("direction") or side
+            sync_plan_diagnostics(plan)
+            return strategy_signal
 
         original_signal = str(plan.get("signal") or "WAIT").upper()
         setup_still_confirmed = original_signal in ["BUY", "SELL"]
@@ -1400,9 +1487,8 @@ def apply_trade_signal_lifecycle(panel_data):
         plan["fresh_entry_available"] = False
         plan["trade_already_running"] = True
         plan["blocked_by"] = "active_trade_running"
-        plan["blocked_reason"] = (
-            f"{side} trade is already running. Waiting for a new 15m swing break."
-        )
+        if strategy_signal in ["BUY", "SELL"]:
+            plan["blocked_reason"] = ACTIVE_TRADE_EXECUTION_BLOCK_REASON
         plan["blocker_rule_name"] = "active_trade_running"
         plan["signal_text"] = (
             f"{strategy_signal} {'🟢' if strategy_signal == 'BUY' else '🔴'} (trade already running)"
@@ -1440,7 +1526,20 @@ def apply_trade_signal_lifecycle(panel_data):
             continue
 
         current_signal = str(plan.get("signal") or "WAIT").upper()
+        if current_signal not in ["BUY", "SELL"]:
+            current_signal = "WAIT"
         current_setup_id = get_signal_setup_id(plan, current_signal)
+        plan["strategy_decision"] = current_signal
+        plan.setdefault(
+            "execution_allowed",
+            None if current_signal in ["BUY", "SELL"] else False,
+        )
+        plan.setdefault(
+            "execution_status",
+            "PENDING" if current_signal in ["BUY", "SELL"] else "NOT_APPLICABLE",
+        )
+        plan.setdefault("execution_block_reason", None)
+        plan.setdefault("execution_source", "V1")
         plan.setdefault("fresh_entry_available", current_signal in ["BUY", "SELL"])
         plan.setdefault("trade_already_running", False)
         plan.setdefault("signal_display_state", current_signal)
@@ -1453,7 +1552,7 @@ def apply_trade_signal_lifecycle(panel_data):
                 or ""
             ).upper()
 
-            if trade_status in ["RUNNING", "OPEN", "TP1 HIT", "CLOSING", "TP2 HIT"]:
+            if trade_status in ACTIVE_TRADE_EXECUTION_STATUSES:
                 if not active_trade.get("signal_setup_id") and current_setup_id:
                     active_trade["signal_setup_id"] = current_setup_id
 
@@ -7195,6 +7294,67 @@ def run_ctrader_auto_trade_checks(panel_data):
         actionable_seen = True
         if symbol == "XAUUSD":
             print("AUTO TRADE XAUUSD ATTEMPT")
+
+        active_trade_block = get_active_trade_execution_block(symbol)
+        if active_trade_block:
+            active_side = active_trade_block.get("active_trade_direction") or "trade"
+            active_id = active_trade_block.get("active_trade_id")
+            block_details = {
+                **active_trade_block,
+                "strategy_decision": signal,
+                "order_sent": False,
+            }
+            plan.update({
+                "strategy_decision": signal,
+                "execution_allowed": False,
+                "execution_status": "BLOCKED",
+                "execution_block_reason": ACTIVE_TRADE_EXECUTION_BLOCK_REASON,
+                "active_trade_direction": active_side,
+                "active_trade_id": active_id,
+                "execution_source": "V1",
+            })
+            record_auto_execution_gate(
+                symbol,
+                plan,
+                "ACTIVE_POSITION",
+                "BLOCK",
+                ACTIVE_TRADE_EXECUTION_BLOCK_REASON,
+                block_details,
+            )
+            update_execution_outcome_safely(
+                (plan.get("audit_diagnostics") or {}).get("cycle_id"),
+                "BLOCKED",
+                ACTIVE_TRADE_EXECUTION_BLOCK_REASON,
+                {"gate": "active_position", **block_details},
+            )
+            set_auto_trade_status(
+                symbol=symbol,
+                signal=signal,
+                action=signal,
+                status="BLOCKED",
+                reason=ACTIVE_TRADE_EXECUTION_BLOCK_REASON,
+                details=block_details,
+            )
+            log_auto_trade_blocked_reason(
+                symbol=symbol,
+                signal=signal,
+                stage="active_position",
+                reason=ACTIVE_TRADE_EXECUTION_BLOCK_REASON,
+                details=block_details,
+            )
+            results.append({
+                "ok": False,
+                "symbol": symbol,
+                "signal": signal,
+                "strategy_decision": signal,
+                "execution_allowed": False,
+                "execution_status": "BLOCKED",
+                "execution_block_reason": ACTIVE_TRADE_EXECUTION_BLOCK_REASON,
+                "active_trade_direction": active_side,
+                "active_trade_id": active_id,
+                "reason": ACTIVE_TRADE_EXECUTION_BLOCK_REASON,
+            })
+            continue
 
         if not broker_connected:
             update_execution_outcome_safely(

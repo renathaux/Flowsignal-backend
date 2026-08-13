@@ -250,6 +250,79 @@ class ReadyExecutionHandoffTests(unittest.TestCase):
                 api.run_ctrader_auto_trade_checks(panel)
             self.assertEqual(execute.call_count, expected_calls)
 
+    def test_active_trade_blocks_new_buy_or_sell_without_suppressing_strategy_signal(self):
+        for signal in ("BUY", "SELL"):
+            api.LIVE_ACTIVE_ORDERS["EURUSD"] = {
+                "symbol": "EURUSD",
+                "side": "BUY",
+                "status": "RUNNING",
+                "broker_position_id": "position-123",
+            }
+            plan = ready_plan("EURUSD", signal)
+            panel = {
+                "EURUSD": plan,
+                "XAUUSD": {"symbol": "XAUUSD", "signal": "WAIT"},
+                "candles": {},
+            }
+            api.apply_trade_signal_lifecycle(panel)
+
+            self.assertEqual(panel["EURUSD"]["signal"], signal)
+            self.assertEqual(panel["EURUSD"]["strategy_decision"], signal)
+            self.assertFalse(panel["EURUSD"]["execution_allowed"])
+            self.assertEqual(
+                panel["EURUSD"]["execution_block_reason"],
+                "ACTIVE_TRADE_ALREADY_RUNNING",
+            )
+            self.assertEqual(panel["EURUSD"]["active_trade_direction"], "BUY")
+            self.assertEqual(panel["EURUSD"]["active_trade_id"], "position-123")
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(api, "refresh_auto_trade_state_from_persistence"))
+                stack.enter_context(patch.object(api, "sync_ctrader_account_state"))
+                stack.enter_context(patch.object(api, "evaluate_news_entry_state", return_value={"allow_news_entry": False, "allow_normal_entry": True}))
+                stack.enter_context(patch.object(api, "record_execution_gate_safely"))
+                stack.enter_context(patch.object(api, "update_execution_outcome_safely"))
+                execute = stack.enter_context(patch.object(api, "execute_live_order_core"))
+                results = api.run_ctrader_auto_trade_checks(panel)
+
+            execute.assert_not_called()
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]["strategy_decision"], signal)
+            self.assertFalse(results[0]["execution_allowed"])
+            self.assertEqual(
+                results[0]["execution_block_reason"],
+                "ACTIVE_TRADE_ALREADY_RUNNING",
+            )
+
+    def test_active_trade_with_no_valid_setup_remains_normal_wait(self):
+        api.LIVE_ACTIVE_ORDERS["EURUSD"] = {
+            "symbol": "EURUSD",
+            "side": "BUY",
+            "status": "RUNNING",
+            "broker_position_id": "position-123",
+        }
+        plan = ready_plan("EURUSD", "BUY")
+        plan["signal"] = "WAIT"
+        panel = {
+            "EURUSD": plan,
+            "XAUUSD": {"symbol": "XAUUSD", "signal": "WAIT"},
+            "candles": {},
+        }
+        api.apply_trade_signal_lifecycle(panel)
+        self.assertEqual(panel["EURUSD"]["signal"], "WAIT")
+        self.assertEqual(panel["EURUSD"]["strategy_decision"], "WAIT")
+        self.assertEqual(panel["EURUSD"]["execution_status"], "NOT_APPLICABLE")
+        self.assertIsNone(panel["EURUSD"]["execution_block_reason"])
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(api, "refresh_auto_trade_state_from_persistence"))
+            stack.enter_context(patch.object(api, "sync_ctrader_account_state"))
+            stack.enter_context(patch.object(api, "evaluate_news_entry_state", return_value={"allow_news_entry": False, "allow_normal_entry": True}))
+            execute = stack.enter_context(patch.object(api, "execute_live_order_core"))
+            results = api.run_ctrader_auto_trade_checks(panel)
+        execute.assert_not_called()
+        self.assertEqual(results, [])
+
     def test_august_10_0740_ready_setup_passes_full_stack_to_mocked_broker(self):
         plan = ready_plan()
         payload = {
