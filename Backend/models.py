@@ -130,6 +130,158 @@ class StrategyCycleDiagnostic(Base):
     )
 
 
+class StrategyShadowRuntime(Base):
+    """Restart-safe state for one non-executing strategy shadow."""
+
+    __tablename__ = "strategy_shadow_runtime"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(16), nullable=False)
+    strategy_version = Column(String(64), nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    state_json = Column(JSON, nullable=False, default=dict)
+
+    __table_args__ = (
+        Index(
+            "uq_strategy_shadow_runtime_symbol_version",
+            "symbol",
+            "strategy_version",
+            unique=True,
+        ),
+    )
+
+
+class StrategyShadowEvaluation(Base):
+    """Durable V1-versus-V2 decision for one closed-candle opportunity."""
+
+    __tablename__ = "strategy_shadow_evaluations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    evaluation_key = Column(String(64), nullable=False, unique=True, index=True)
+    evaluated_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    timeframe = Column(String(8), nullable=False, default="M5")
+    strategy_version = Column(String(64), nullable=False, index=True)
+    setup_fingerprint = Column(String(128), nullable=True, index=True)
+    direction = Column(String(8), nullable=True)
+    structure_type = Column(String(16), nullable=True)
+    bos_level = Column(Float, nullable=True)
+    bos_timestamp = Column(DateTime(timezone=True), nullable=True)
+    bos_buffer = Column(Float, nullable=True)
+    atr14 = Column(Float, nullable=True)
+    ema_state = Column(String(32), nullable=True)
+    consolidation_state = Column(String(32), nullable=True)
+    m5_confirmation_timestamp = Column(DateTime(timezone=True), nullable=True)
+    reference_price = Column(Float, nullable=True)
+    extension_atr = Column(Float, nullable=True)
+    v1_decision = Column(String(32), nullable=False, index=True)
+    v1_reason = Column(String(255), nullable=True)
+    v2_decision = Column(String(32), nullable=False, index=True)
+    v2_reason = Column(String(255), nullable=True, index=True)
+    hypothetical_entry = Column(Float, nullable=True)
+    hypothetical_sl = Column(Float, nullable=True)
+    hypothetical_tp1 = Column(Float, nullable=True)
+    hypothetical_tp2 = Column(Float, nullable=True)
+    hypothetical_rr = Column(Float, nullable=True)
+    hypothetical_risk_percent = Column(Float, nullable=True)
+    retest_timestamp = Column(DateTime(timezone=True), nullable=True)
+    continuation_timestamp = Column(DateTime(timezone=True), nullable=True)
+    setup_expiry = Column(DateTime(timezone=True), nullable=True)
+    related_previous_trade_id = Column(Integer, nullable=True)
+    post_sl_reset_state = Column(String(64), nullable=True)
+    diagnostics_json = Column(JSON, nullable=False, default=dict)
+    v1_order_id = Column(String(128), nullable=True)
+    v1_position_id = Column(String(128), nullable=True)
+    v1_outcome_json = Column(JSON, nullable=True)
+
+    __table_args__ = (
+        Index(
+            "ix_shadow_eval_symbol_time",
+            "symbol",
+            "evaluated_at",
+        ),
+        Index(
+            "ix_shadow_eval_comparison",
+            "symbol",
+            "v1_decision",
+            "v2_decision",
+        ),
+    )
+
+
+class StrategyShadowTrade(Base):
+    """Hypothetical trade lifecycle. This table has no broker relationship."""
+
+    __tablename__ = "strategy_shadow_trades"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    shadow_trade_id = Column(String(64), nullable=False, unique=True, index=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    strategy_version = Column(String(64), nullable=False, index=True)
+    setup_fingerprint = Column(String(128), nullable=False)
+    direction = Column(String(8), nullable=False)
+    entry_timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
+    entry = Column(Float, nullable=False)
+    sl = Column(Float, nullable=False)
+    tp1 = Column(Float, nullable=False)
+    tp2 = Column(Float, nullable=False)
+    protected_sl = Column(Float, nullable=False)
+    risk_percent = Column(Float, nullable=True)
+    rr = Column(Float, nullable=False)
+    status = Column(String(32), nullable=False, default="OPEN", index=True)
+    exit_timestamp = Column(DateTime(timezone=True), nullable=True)
+    exit_price = Column(Float, nullable=True)
+    r_result = Column(Float, nullable=True)
+    mae_r = Column(Float, nullable=False, default=0.0)
+    mfe_r = Column(Float, nullable=False, default=0.0)
+    tp1_reached = Column(Boolean, nullable=False, default=False)
+    tp2_reached = Column(Boolean, nullable=False, default=False)
+    sl_reached = Column(Boolean, nullable=False, default=False)
+    last_processed_m5 = Column(DateTime(timezone=True), nullable=True)
+    related_previous_trade_id = Column(Integer, nullable=True)
+    v1_evaluation_id = Column(Integer, nullable=True)
+    v1_order_id = Column(String(128), nullable=True)
+    v1_position_id = Column(String(128), nullable=True)
+    v1_outcome_json = Column(JSON, nullable=True)
+    diagnostics_json = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index(
+            "uq_shadow_trade_strategy_setup",
+            "strategy_version",
+            "setup_fingerprint",
+            unique=True,
+        ),
+        Index("ix_shadow_trade_symbol_status", "symbol", "status"),
+    )
+
+
+class ExecutionRiskAudit(Base):
+    """Append-only observability for application-generated risk changes."""
+
+    __tablename__ = "execution_risk_audits"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    event_type = Column(String(48), nullable=False, index=True)
+    source = Column(String(32), nullable=False)
+    broker_position_id = Column(String(128), nullable=True, index=True)
+    old_entry = Column(Float, nullable=True)
+    new_entry = Column(Float, nullable=True)
+    old_sl = Column(Float, nullable=True)
+    new_sl = Column(Float, nullable=True)
+    volume_units = Column(Float, nullable=True)
+    approved_risk_amount = Column(Float, nullable=True)
+    resulting_risk_amount = Column(Float, nullable=True)
+    approved_risk_percent = Column(Float, nullable=True)
+    resulting_risk_percent = Column(Float, nullable=True)
+    status = Column(String(48), nullable=False, index=True)
+    details_json = Column(JSON, nullable=False, default=dict)
+
 class EconomicEvent(Base):
     __tablename__ = "economic_events"
 

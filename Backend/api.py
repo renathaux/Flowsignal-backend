@@ -62,6 +62,7 @@ from routes.performance import (
 from routes.settings import router as settings_router
 from routes.trading import router as trading_router
 from routes.diagnostics import router as diagnostics_router
+from routes.shadow import router as shadow_router
 from services.news_service import (
     fetch_calendar_events,
     get_calendar_data_age_seconds,
@@ -100,6 +101,12 @@ from services.auto_trade_state_service import (
 from services.strategy_diagnostics_service import (
     record_execution_gate_safely,
     update_execution_outcome_safely,
+)
+from services.v2_shadow_service import link_v1_execution_safely
+from services.execution_risk_service import (
+    persist_execution_risk_audit_safely,
+    validate_pre_submit as validate_executable_risk,
+    validate_sl_amendment as validate_application_sl_amendment,
 )
 from db import database_status as get_database_status, engine as database_engine
 from paths import DATA_DIR
@@ -173,6 +180,7 @@ app.include_router(performance_router)
 app.include_router(ctrader_router)
 app.include_router(trading_router)
 app.include_router(diagnostics_router)
+app.include_router(shadow_router)
 
 @app.middleware("http")
 async def log_unhandled_api_errors(request: Request, call_next):
@@ -9036,6 +9044,48 @@ def modify_live_position_levels(payload: dict):
     if changed_level not in {"sl", "tp1", "tp2"}:
         return {"ok": False, "reason": "Unknown trade level"}
 
+    if changed_level == "sl":
+        old_sl = trade.get("current_sl") or trade.get("sl")
+        current_units = (
+            trade.get("volume_units")
+            or (trade.get("risk") or {}).get("volume_units")
+        )
+        allowed_risk_size = calculate_live_risk_size(symbol, entry, stop_loss)
+        sl_risk_check = validate_application_sl_amendment(
+            entry,
+            old_sl,
+            stop_loss,
+            current_units,
+            allowed_risk_size,
+        )
+        persist_execution_risk_audit_safely(
+            symbol=symbol,
+            event_type="APPLICATION_SL_AMENDMENT",
+            source="chart_levels",
+            broker_position_id=position_id,
+            old_entry=entry,
+            new_entry=entry,
+            old_sl=old_sl,
+            new_sl=stop_loss,
+            volume_units=current_units,
+            approved_risk_amount=(trade.get("risk") or {}).get("risk_amount"),
+            approved_risk_percent=(trade.get("risk") or {}).get("risk_percent"),
+            status=("PASS" if sl_risk_check.get("ok") else "RISK_EXCEEDED_AFTER_SL_CHANGE"),
+            details={
+                **sl_risk_check,
+                "application_generated": True,
+                "interference_with_direct_broker_action": False,
+            },
+        )
+        if not sl_risk_check.get("ok"):
+            print("RISK_EXCEEDED_AFTER_SL_CHANGE =", {
+                "symbol": symbol,
+                "position_id": position_id,
+                "old_sl": old_sl,
+                "new_sl": stop_loss,
+                "details": sl_risk_check,
+            })
+
     broker_result = {"ok": True, "local_only": changed_level == "tp1"}
 
     if changed_level in {"sl", "tp2"}:
@@ -10450,6 +10500,42 @@ def _execute_live_order_core_impl(payload: dict, source="manual", _inflight_guar
         "tp2": trade_payload.get("tp2"),
         "volume_units": trade_payload.get("volume_units"),
     }
+    try:
+        pre_submit_tick = (
+            ((get_live_prices() or {}).get("live_prices") or {}).get(symbol)
+            or {}
+        )
+    except Exception:
+        pre_submit_tick = {}
+    pre_submit_risk = validate_executable_risk(
+        symbol,
+        side,
+        trade_payload.get("entry"),
+        trade_payload.get("sl"),
+        trade_payload.get("tp2"),
+        trade_payload.get("volume_units"),
+        pre_submit_tick,
+        calculate_live_risk_size,
+        validate_live_trade_risk_reward,
+    )
+    persist_execution_risk_audit_safely(
+        symbol=symbol,
+        event_type="PRE_SUBMIT_EXECUTABLE_RISK",
+        source=source,
+        old_entry=trade_payload.get("entry"),
+        new_entry=pre_submit_risk.get("executable_entry"),
+        old_sl=trade_payload.get("sl"),
+        new_sl=trade_payload.get("sl"),
+        volume_units=trade_payload.get("volume_units"),
+        approved_risk_amount=risk_size.get("risk_amount"),
+        approved_risk_percent=risk_size.get("risk_percent"),
+        status="PASS" if pre_submit_risk.get("ok") else "RISK_VALIDATION_WARNING",
+        details={
+            **pre_submit_risk,
+            "behavior_changed": False,
+            "v1_submission_unchanged": True,
+        },
+    )
     result = place_market_order_with_inflight_cleanup(
         symbol,
         action=side,
@@ -10461,6 +10547,67 @@ def _execute_live_order_core_impl(payload: dict, source="manual", _inflight_guar
         volume_units=trade_payload.get("volume_units"),
         risk=trade_payload.get("risk"),
         mode=trade_payload["mode"]
+    )
+    # Observe the actual fill without changing, retrying, closing, resizing, or
+    # widening the V1 order.  Any risk drift is explicit and durable.
+    actual_fill = (
+        result.get("entry_price")
+        or result.get("entry")
+        or (result.get("position") or {}).get("entry_price")
+    )
+    post_fill_status = "FILL_NOT_AVAILABLE"
+    post_fill_details = {"broker_ok": bool(result.get("ok"))}
+    if result.get("ok") and actual_fill is not None:
+        filled_risk = calculate_live_risk_size(
+            symbol, actual_fill, trade_payload.get("sl")
+        )
+        filled_rr = validate_live_trade_risk_reward(
+            symbol,
+            side,
+            actual_fill,
+            trade_payload.get("sl"),
+            trade_payload.get("tp2"),
+        )
+        submitted_units = float(trade_payload.get("volume_units") or 0)
+        allowed_units = float(filled_risk.get("volume_units") or 0)
+        risk_exceeded = bool(
+            not filled_risk.get("ok")
+            or not filled_rr.get("ok")
+            or submitted_units > allowed_units + 1e-9
+        )
+        post_fill_status = (
+            "RISK_EXCEEDED_AFTER_FILL" if risk_exceeded else "PASS"
+        )
+        post_fill_details = {
+            "broker_ok": True,
+            "filled_risk": filled_risk,
+            "filled_rr": filled_rr,
+            "submitted_volume_units": submitted_units,
+            "allowed_volume_units": allowed_units,
+            "action": "FLAGGED_NO_AUTOMATIC_INTERVENTION" if risk_exceeded else "NONE_REQUIRED",
+        }
+    persist_execution_risk_audit_safely(
+        symbol=symbol,
+        event_type="POST_FILL_RISK",
+        source=source,
+        broker_position_id=result.get("position_id"),
+        old_entry=trade_payload.get("entry"),
+        new_entry=actual_fill,
+        old_sl=trade_payload.get("sl"),
+        new_sl=trade_payload.get("sl"),
+        volume_units=trade_payload.get("volume_units"),
+        approved_risk_amount=risk_size.get("risk_amount"),
+        approved_risk_percent=risk_size.get("risk_percent"),
+        status=post_fill_status,
+        details=post_fill_details,
+    )
+    # Observability-only association with the independently simulated V2
+    # decision. This never changes, retries, or interprets the broker result.
+    link_v1_execution_safely(
+        symbol,
+        trade_payload.get("signal_setup_id"),
+        result,
+        trade_payload,
     )
     ENGINE_RUNTIME_STATE["last_broker_response"] = {
         "symbol": symbol,

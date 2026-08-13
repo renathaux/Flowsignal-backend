@@ -25,6 +25,7 @@ from paths import DATA_DIR
 from services.settings_service import get_tp1_ratio_of_tp2
 from services.strategy_settings_service import get_configured_cooldown_seconds
 from services.strategy_diagnostics_service import persist_cycle_safely
+from services.v2_shadow_service import evaluate_cycle_safely as evaluate_v2_shadow_cycle_safely
 
 MARKET_DATA_SOURCES = ["ctrader"]
 MARKET_TIMEZONE = ZoneInfo("America/New_York")
@@ -10256,6 +10257,22 @@ def get_panel_data(force_refresh=False):
         data_5m=gold,
         data_15m=gold_htf,
         source_state=gold_source_state,
+    )
+
+    # Strategy V2 is an independent, persistence-backed observer.  This call
+    # has no broker, LIVE/PAPER, cooldown, or V1-memory path and cannot alter
+    # either result object.  Failures are contained inside the shadow service.
+    evaluate_v2_shadow_cycle_safely(
+        "EURUSD",
+        eurusd_result,
+        data_5m=eurusd,
+        data_15m=eurusd_htf,
+    )
+    evaluate_v2_shadow_cycle_safely(
+        "XAUUSD",
+        gold_result,
+        data_5m=gold,
+        data_15m=gold_htf,
     )
 
     if eurusd_source_state.get("available") and not eurusd.empty:
