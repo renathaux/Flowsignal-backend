@@ -33,8 +33,6 @@ LEGACY_SETTING_ALIASES = {
 }
 logger = logging.getLogger("flowsignal.strategy_settings")
 
-# Defaults mirror the currently deployed strategy. Only fields in
-# WIRED_EXECUTION_SETTINGS are consumed by execution.
 FIELD_DEFINITIONS = OrderedDict(
     (
         ("minimum_rr", {"default": 1.20, "type": "number", "min": 1.0, "max": 5.0, "step": 0.05, "unit": "R"}),
@@ -85,10 +83,7 @@ def validation_limits():
 
 def execution_defaults():
     current_defaults = defaults()
-    return {
-        key: current_defaults[key]
-        for key in WIRED_EXECUTION_SETTINGS
-    }
+    return {key: current_defaults[key] for key in WIRED_EXECUTION_SETTINGS}
 
 
 def _persisted_names(keys):
@@ -276,10 +271,11 @@ def get_cached_execution_settings(
     force_refresh=False,
     monotonic_now=None,
 ):
-    """Return the wired settings without querying PostgreSQL each cycle.
+    """Return wired settings for normal strategy evaluation.
 
-    A failed or malformed authoritative read returns the complete production
-    defaults, never a partially loaded or more permissive configuration.
+    Strategy evaluation may use the short-lived cache. LIVE RR validation does
+    not use this path; get_configured_rr_window() always performs an
+    authoritative database read and fails closed if that read cannot complete.
     """
     factory = session_factory or SessionLocal
     current_time = time.monotonic() if monotonic_now is None else float(monotonic_now)
@@ -293,8 +289,6 @@ def get_cached_execution_settings(
         ):
             return dict(cached["values"])
 
-    # Serialize cache misses with save/reset so a concurrent stale read cannot
-    # overwrite the cache value primed immediately after a successful commit.
     with _LOCK:
         with _CACHE_LOCK:
             cached = _EXECUTION_CACHE.get(cache_key)
@@ -328,8 +322,25 @@ def get_cached_execution_settings(
 
 
 def get_configured_rr_window(session_factory=None):
-    configured = get_cached_execution_settings(session_factory)
-    return float(configured["minimum_rr"]), float(configured["maximum_rr"])
+    """Return the authoritative RR window used by LIVE execution.
+
+    This deliberately bypasses the in-process cache. A LIVE order must never
+    be allowed because one worker still has an older Minimum RR value cached.
+    Database/read/validation failures are allowed to propagate so execution
+    fails closed instead of silently falling back to the looser 1.20 default.
+    """
+    factory = session_factory or SessionLocal
+    with _LOCK:
+        configured = _read_execution_settings(factory)
+        _prime_execution_settings_cache(configured, factory)
+    minimum_rr = float(configured["minimum_rr"])
+    maximum_rr = float(configured["maximum_rr"])
+    logger.info("LIVE_RR_AUTHORITATIVE_SETTINGS %s", {
+        "minimum_rr": minimum_rr,
+        "maximum_rr": maximum_rr,
+        "source": "runtime_setting",
+    })
+    return minimum_rr, maximum_rr
 
 
 def get_configured_cooldown_seconds(session_factory=None):
@@ -366,8 +377,6 @@ def get_strategy_settings(session_factory=None):
             if latest is None or row.updated_at > latest:
                 latest = row.updated_at
 
-    # Validate relationships as a unit. Corrupt/incompatible persisted values
-    # fall back safely to the deployed defaults rather than reaching execution.
     try:
         validate_settings(current, require_all=True)
     except StrategySettingsValidationError:
