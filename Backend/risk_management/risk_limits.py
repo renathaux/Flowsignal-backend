@@ -1,4 +1,4 @@
-def is_expected_loss_oversized(expected_loss_usd, max_risk_usd, tolerance_multiplier=1.0):
+def is_expected_loss_oversized(expected_loss_usd, max_risk_usd, tolerance_multiplier=1.10):
     try:
         expected = float(expected_loss_usd)
         maximum = float(max_risk_usd)
