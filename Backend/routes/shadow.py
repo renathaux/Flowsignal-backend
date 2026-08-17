@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Query
 
+from services.shadow_retention_service import cleanup_shadow_history_safely
 from services.v1_outcome_reconciliation_service import (
     get_v1_actual_metrics,
     reconcile_v1_outcomes_safely,
@@ -23,10 +24,12 @@ def _symbol(value):
 @router.get("/summary")
 def summary(symbol: str = "XAUUSD"):
     normalized = _symbol(symbol)
+    retention = cleanup_shadow_history_safely()
     reconciliation = reconcile_v1_outcomes_safely()
     payload = get_shadow_summary(normalized)
     payload["v1"].update(get_v1_actual_metrics(normalized))
     payload["v1"]["reconciliation"] = reconciliation
+    payload["retention"] = retention
     return payload
 
 
@@ -38,6 +41,7 @@ def history(
     offset: int = Query(default=0, ge=0),
 ):
     normalized = _symbol(symbol) if symbol else None
+    retention = cleanup_shadow_history_safely()
     reconciliation = reconcile_v1_outcomes_safely()
     items = get_shadow_history(normalized, decision, limit, offset)
     return {
@@ -47,6 +51,7 @@ def history(
         "offset": offset,
         "read_only": True,
         "warning": "SHADOW — DOES NOT PLACE ORDERS",
+        "retention": retention,
         "v1_actual": get_v1_actual_metrics(normalized),
         "v1_reconciliation": reconciliation,
     }
