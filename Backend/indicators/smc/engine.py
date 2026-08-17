@@ -1,19 +1,23 @@
-"""Closed-candle Smart Money Concepts structure analysis.
+"""FlowSignal SMC structure analysis.
 
-Safety boundary: this module is pure analysis. It has no broker, execution,
-LIVE/PAPER, risk, cooldown, or order-management imports.
+Structure logic adapted from "SMC Structures and FVG" © LudoGH68,
+licensed under MPL-2.0. Fair Value Gap (FVG) logic is intentionally excluded.
+
+Safety boundary: pure analysis only. No broker, execution, LIVE/PAPER,
+risk, cooldown, or order-management imports.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Literal
 
 import pandas as pd
 
 
 StructureBias = Literal["BULLISH", "BEARISH", "NEUTRAL"]
-EventType = Literal["BOS", "CHOCH"]
 SwingType = Literal["HIGH", "LOW"]
+LOOKBACK = 10
+FIB_LEVELS = (0.786, 0.705, 0.618, 0.5, 0.382)
 
 
 @dataclass(frozen=True)
@@ -26,27 +30,13 @@ class SwingPoint:
     price: float
 
 
-@dataclass(frozen=True)
-class StructureEvent:
-    event_type: EventType
-    direction: Literal["BULLISH", "BEARISH"]
-    timestamp: str
-    close: float
-    broken_swing_timestamp: str
-    broken_level: float
-    previous_bias: StructureBias
-    new_bias: StructureBias
-
-
 def _normalize_frame(frame: pd.DataFrame) -> pd.DataFrame:
     if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
         return pd.DataFrame(columns=["Open", "High", "Low", "Close"])
-
     required = {"Open", "High", "Low", "Close"}
     if not required.issubset(frame.columns):
         missing = ", ".join(sorted(required - set(frame.columns)))
         raise ValueError(f"SMC frame missing required columns: {missing}")
-
     data = frame.copy().sort_index()
     data = data.dropna(subset=["Open", "High", "Low", "Close"])
     data.index = pd.to_datetime(data.index, utc=True)
@@ -59,53 +49,88 @@ def detect_confirmed_swings(
     left_bars: int = 2,
     right_bars: int = 2,
 ) -> list[SwingPoint]:
-    """Return pivots only after enough candles exist to confirm them.
-
-    A swing at index i is not usable until i + right_bars, preventing
-    look-ahead/repainting in simulation and future strategy integration.
-    """
-    if left_bars < 1 or right_bars < 1:
-        raise ValueError("left_bars and right_bars must both be >= 1")
-
+    """Compatibility helper retained for tests/tools; not the BOS engine."""
     data = _normalize_frame(frame)
     if len(data) < left_bars + right_bars + 1:
         return []
-
     highs = data["High"].astype(float).tolist()
     lows = data["Low"].astype(float).tolist()
     timestamps = list(data.index)
     swings: list[SwingPoint] = []
-
     for index in range(left_bars, len(data) - right_bars):
         high = highs[index]
         low = lows[index]
-        left_highs = highs[index - left_bars:index]
-        right_highs = highs[index + 1:index + 1 + right_bars]
-        left_lows = lows[index - left_bars:index]
-        right_lows = lows[index + 1:index + 1 + right_bars]
+        left_highs = highs[index-left_bars:index]
+        right_highs = highs[index+1:index+1+right_bars]
+        left_lows = lows[index-left_bars:index]
+        right_lows = lows[index+1:index+1+right_bars]
         confirmed_index = index + right_bars
-
         if high > max(left_highs) and high >= max(right_highs):
             swings.append(SwingPoint(
-                swing_type="HIGH",
-                index=index,
-                confirmed_index=confirmed_index,
-                timestamp=timestamps[index].isoformat(),
-                confirmed_timestamp=timestamps[confirmed_index].isoformat(),
-                price=float(high),
+                "HIGH", index, confirmed_index,
+                timestamps[index].isoformat(), timestamps[confirmed_index].isoformat(), float(high)
             ))
-
         if low < min(left_lows) and low <= min(right_lows):
             swings.append(SwingPoint(
-                swing_type="LOW",
-                index=index,
-                confirmed_index=confirmed_index,
-                timestamp=timestamps[index].isoformat(),
-                confirmed_timestamp=timestamps[confirmed_index].isoformat(),
-                price=float(low),
+                "LOW", index, confirmed_index,
+                timestamps[index].isoformat(), timestamps[confirmed_index].isoformat(), float(low)
             ))
-
     return sorted(swings, key=lambda item: (item.confirmed_index, item.index, item.swing_type))
+
+
+def _highest_index(highs: list[float], end: int, lookback: int = LOOKBACK) -> int:
+    start = max(0, end - lookback + 1)
+    return max(range(start, end + 1), key=lambda idx: (highs[idx], idx))
+
+
+def _lowest_index(lows: list[float], end: int, lookback: int = LOOKBACK) -> int:
+    start = max(0, end - lookback + 1)
+    return min(range(start, end + 1), key=lambda idx: (lows[idx], -idx))
+
+
+def _structure_highest_index(highs: list[float], end: int, lookback: int = LOOKBACK) -> int:
+    start = max(0, end - lookback + 1)
+    fallback = _highest_index(highs, end, lookback)
+    chosen = None
+    for idx in range(end - 1, max(start, 1) - 1, -1):
+        if idx + 1 > end:
+            continue
+        if highs[idx] > highs[idx - 1] and highs[idx + 1] <= highs[idx] and idx >= fallback:
+            chosen = idx
+    return fallback if chosen is None else chosen
+
+
+def _structure_lowest_index(lows: list[float], end: int, lookback: int = LOOKBACK) -> int:
+    start = max(0, end - lookback + 1)
+    fallback = _lowest_index(lows, end, lookback)
+    chosen = None
+    for idx in range(end - 1, max(start, 1) - 1, -1):
+        if idx + 1 > end:
+            continue
+        if lows[idx] < lows[idx - 1] and lows[idx + 1] >= lows[idx] and idx >= fallback:
+            chosen = idx
+    return fallback if chosen is None else chosen
+
+
+def _fib_levels(direction, structure_high, structure_low, high_start, low_start, timestamps):
+    structure_range = abs(structure_high - structure_low)
+    if structure_range <= 0:
+        return []
+    output = []
+    for value in FIB_LEVELS:
+        if direction == 1:
+            price = structure_high - (structure_range - structure_range * value)
+            start = high_start
+        else:
+            price = structure_low + (structure_range - structure_range * value)
+            start = low_start
+        output.append({
+            "value": value,
+            "price": float(price),
+            "start_index": int(start),
+            "start_timestamp": timestamps[start].isoformat(),
+        })
+    return output
 
 
 def analyze_structure(
@@ -114,91 +139,170 @@ def analyze_structure(
     left_bars: int = 2,
     right_bars: int = 2,
 ) -> dict:
-    """Build non-repainting swing/BOS/CHoCH state from closed candles only."""
+    """Port of the TradingView structure state machine, using closed candles.
+
+    left_bars/right_bars are accepted for API compatibility but are not used by
+    this structure engine; the source algorithm uses a 10-bar structure lookback.
+    """
     data = _normalize_frame(frame)
-    swings = detect_confirmed_swings(
-        data,
-        left_bars=left_bars,
-        right_bars=right_bars,
-    )
     if data.empty:
         return {
             "bias": "NEUTRAL",
-            "last_swing_high": None,
-            "last_swing_low": None,
-            "swings": [],
             "events": [],
+            "current_structure": None,
+            "fib_levels": [],
+            "swings": [],
+            "config": {"lookback": LOOKBACK, "fvg": False},
         }
 
-    swings_by_confirmation: dict[int, list[SwingPoint]] = {}
-    for swing in swings:
-        swings_by_confirmation.setdefault(swing.confirmed_index, []).append(swing)
-
-    latest_high: SwingPoint | None = None
-    latest_low: SwingPoint | None = None
-    broken_high_key: tuple[str, float] | None = None
-    broken_low_key: tuple[str, float] | None = None
-    bias: StructureBias = "NEUTRAL"
-    events: list[StructureEvent] = []
-
+    opens = data["Open"].astype(float).tolist()
+    highs = data["High"].astype(float).tolist()
+    lows = data["Low"].astype(float).tolist()
     closes = data["Close"].astype(float).tolist()
     timestamps = list(data.index)
 
-    for index, close in enumerate(closes):
-        for swing in swings_by_confirmation.get(index, []):
-            if swing.swing_type == "HIGH":
-                latest_high = swing
-                broken_high_key = None
-            else:
-                latest_low = swing
-                broken_low_key = None
+    structure_high = highs[0]
+    structure_low = lows[0]
+    structure_high_start = 0
+    structure_low_start = 0
+    # Source mapping: 1=bearish structure, 2=bullish structure, 0=unset.
+    structure_direction = 0
+    events = []
 
-        if latest_high is not None:
-            high_key = (latest_high.timestamp, latest_high.price)
-            if close > latest_high.price and broken_high_key != high_key:
-                previous_bias = bias
-                event_type: EventType = "CHOCH" if bias == "BEARISH" else "BOS"
-                bias = "BULLISH"
-                events.append(StructureEvent(
-                    event_type=event_type,
-                    direction="BULLISH",
-                    timestamp=timestamps[index].isoformat(),
-                    close=float(close),
-                    broken_swing_timestamp=latest_high.timestamp,
-                    broken_level=latest_high.price,
-                    previous_bias=previous_bias,
-                    new_bias=bias,
-                ))
-                broken_high_key = high_key
+    for index in range(1, len(data)):
+        close = closes[index]
+        prev1 = closes[index - 1] if index >= 1 else None
+        prev2 = closes[index - 2] if index >= 2 else None
+        prev3 = closes[index - 3] if index >= 3 else None
 
-        if latest_low is not None:
-            low_key = (latest_low.timestamp, latest_low.price)
-            if close < latest_low.price and broken_low_key != low_key:
-                previous_bias = bias
-                event_type = "CHOCH" if bias == "BULLISH" else "BOS"
-                bias = "BEARISH"
-                events.append(StructureEvent(
-                    event_type=event_type,
-                    direction="BEARISH",
-                    timestamp=timestamps[index].isoformat(),
-                    close=float(close),
-                    broken_swing_timestamp=latest_low.timestamp,
-                    broken_level=latest_low.price,
-                    previous_bias=previous_bias,
-                    new_bias=bias,
-                ))
-                broken_low_key = low_key
+        enough_low = (
+            index >= 3
+            and index - 1 > structure_low_start
+            and index - 2 > structure_low_start
+            and index - 3 > structure_low_start
+        )
+        enough_high = (
+            index >= 3
+            and index - 1 > structure_high_start
+            and index - 2 > structure_high_start
+            and index - 3 > structure_high_start
+        )
+
+        low_broken = (
+            index >= 3
+            and close < structure_low
+            and prev1 >= structure_low and prev2 >= structure_low and prev3 >= structure_low
+            and enough_low
+        ) or (structure_direction == 2 and close < structure_low)
+
+        high_broken = (
+            index >= 3
+            and close > structure_high
+            and prev1 <= structure_high and prev2 <= structure_high and prev3 <= structure_high
+            and enough_high
+        ) or (structure_direction == 1 and close > structure_high)
+
+        if low_broken:
+            event_type = "BOS" if structure_direction == 1 else "CHOCH"
+            events.append({
+                "event_type": event_type,
+                "direction": "BEARISH",
+                "timestamp": timestamps[index].isoformat(),
+                "close": float(close),
+                "broken_swing_timestamp": timestamps[structure_low_start].isoformat(),
+                "broken_level": float(structure_low),
+                "structure_start_index": int(structure_low_start),
+                "break_index": int(index),
+                "previous_direction": int(structure_direction),
+                "new_direction": 1,
+            })
+            structure_direction = 1
+            structure_high_start = _structure_highest_index(highs, index, LOOKBACK)
+            structure_low_start = index
+            structure_high = highs[structure_high_start]
+            structure_low = lows[index]
+
+        elif high_broken:
+            event_type = "BOS" if structure_direction == 2 else "CHOCH"
+            events.append({
+                "event_type": event_type,
+                "direction": "BULLISH",
+                "timestamp": timestamps[index].isoformat(),
+                "close": float(close),
+                "broken_swing_timestamp": timestamps[structure_high_start].isoformat(),
+                "broken_level": float(structure_high),
+                "structure_start_index": int(structure_high_start),
+                "break_index": int(index),
+                "previous_direction": int(structure_direction),
+                "new_direction": 2,
+            })
+            structure_direction = 2
+            structure_high_start = index
+            structure_low_start = _structure_lowest_index(lows, index, LOOKBACK)
+            structure_high = highs[index]
+            structure_low = lows[structure_low_start]
+
+        else:
+            if highs[index] > structure_high and structure_direction in (0, 2):
+                can_update = not (
+                    index >= 3
+                    and index - 1 > structure_high_start
+                    and index - 2 > structure_high_start
+                    and index - 3 > structure_high_start
+                )
+                if can_update:
+                    structure_high = highs[index]
+                    structure_high_start = index
+            elif lows[index] < structure_low and structure_direction in (0, 1):
+                can_update = not (
+                    index >= 3
+                    and index - 1 > structure_low_start
+                    and index - 2 > structure_low_start
+                    and index - 3 > structure_low_start
+                )
+                if can_update:
+                    structure_low = lows[index]
+                    structure_low_start = index
+
+    bias: StructureBias = (
+        "BULLISH" if structure_direction == 2
+        else "BEARISH" if structure_direction == 1
+        else "NEUTRAL"
+    )
+    current_structure = {
+        "direction": int(structure_direction),
+        "bias": bias,
+        "high": float(structure_high),
+        "low": float(structure_low),
+        "high_start_index": int(structure_high_start),
+        "low_start_index": int(structure_low_start),
+        "high_start_timestamp": timestamps[structure_high_start].isoformat(),
+        "low_start_timestamp": timestamps[structure_low_start].isoformat(),
+        "end_timestamp": timestamps[-1].isoformat(),
+        "range": float(abs(structure_high - structure_low)),
+    }
 
     return {
         "bias": bias,
-        "last_swing_high": asdict(latest_high) if latest_high else None,
-        "last_swing_low": asdict(latest_low) if latest_low else None,
-        "swings": [asdict(item) for item in swings],
-        "events": [asdict(item) for item in events],
+        "events": events,
+        "current_structure": current_structure,
+        "fib_levels": _fib_levels(
+            structure_direction,
+            structure_high,
+            structure_low,
+            structure_high_start,
+            structure_low_start,
+            timestamps,
+        ),
+        "swings": [],
         "config": {
-            "left_bars": left_bars,
-            "right_bars": right_bars,
+            "lookback": LOOKBACK,
+            "break_with_candle_body": True,
+            "current_structure": True,
+            "fib_values": list(FIB_LEVELS),
+            "fvg": False,
             "closed_candles_only": True,
             "repainting": False,
+            "source_algorithm": "LudoGH68_SMC_Structures",
         },
     }
