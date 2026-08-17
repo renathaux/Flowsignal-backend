@@ -9,8 +9,60 @@ from strategies.xauusd_strategy import analyze_xauusd
 
 # Make the TradingView-style SMC structure engine authoritative for V1's
 # closed-15m BOS/CHoCH gate. Everything after that gate remains strict_trader:
-# EMA, consolidation, later 5m confirmation, SL/TP/RR, risk and execution.
+# EMA, later 5m confirmation, SL/TP/RR, risk and execution.
 _strict_trader.evaluate_15m_breakout = evaluate_smc_15m_breakout
+
+
+# Consolidation is observation-only now. Keep calculating the old detector for
+# diagnostics, but it is no longer allowed to block or invalidate a valid SMC
+# BOS/CHoCH setup.
+_original_classify_consolidation = _strict_trader.classify_consolidation
+
+
+def classify_consolidation_observation_only(data_15m, symbol):
+    result = _original_classify_consolidation(data_15m, symbol)
+    detected = bool(result.get("is_consolidation")) if isinstance(result, dict) else False
+    payload = dict(result or {})
+    payload.update({
+        "detected_is_consolidation": detected,
+        "is_consolidation": False,
+        "reason": None,
+        "filter_enabled": False,
+        "blocking": False,
+        "entry_gate_enabled": False,
+        "policy": "OBSERVATION_ONLY",
+    })
+    return payload
+
+
+_strict_trader.classify_consolidation = classify_consolidation_observation_only
+
+
+# Do not let a persisted setup that was blocked by the old consolidation gate
+# survive this policy change. Remove those watches so only a fresh SMC event can
+# become a setup after deployment.
+def _clear_legacy_consolidation_blocked_watches():
+    watches = getattr(_shared, "FIFTEEN_M_SWING_WATCH", None)
+    if not isinstance(watches, dict):
+        return
+
+    changed = False
+    for key, watch in list(watches.items()):
+        if not isinstance(watch, dict):
+            continue
+        if str(watch.get("status") or "").upper() != _strict_trader.BLOCKED_BREAKOUT_STATUS:
+            continue
+        watches.pop(key, None)
+        changed = True
+
+    if changed:
+        try:
+            _shared.save_fifteen_m_swing_watch()
+        except Exception:
+            pass
+
+
+_clear_legacy_consolidation_blocked_watches()
 get_strict_mtf_signal = _strict_trader.get_mtf_signal
 
 _original_get_mtf_signal = _shared.get_mtf_signal
@@ -26,5 +78,6 @@ _shared.analyze_eurusd = analyze_eurusd
 _shared.analyze_xauusd = analyze_xauusd
 _shared.get_strict_mtf_signal = get_strict_mtf_signal
 _shared.evaluate_smc_15m_breakout = evaluate_smc_15m_breakout
+_shared.classify_consolidation_observation_only = classify_consolidation_observation_only
 
 sys.modules[__name__] = _shared
