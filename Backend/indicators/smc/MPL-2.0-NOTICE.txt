@@ -1,0 +1,6 @@
+Portions of this SMC indicator logic are adapted from "SMC Structures and FVG" by LudoGH68.
+Original source: TradingView Pine Script v5, © LudoGH68.
+License: Mozilla Public License 2.0 (MPL-2.0).
+
+FlowSignal intentionally excludes the Fair Value Gap (FVG) portion requested by the user.
+The adapted files remain isolated under Backend/indicators/smc/.
