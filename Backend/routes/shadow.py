@@ -7,6 +7,12 @@ from services.v2_shadow_service import (
     get_shadow_history,
     get_shadow_summary,
 )
+from services.v2_risk_alignment import install_v2_risk_alignment
+
+
+# V2 remains shadow-only. This aligns its hypothetical risk plan with the same
+# configured minimum SL distance and RR window used by V1/live validation.
+install_v2_risk_alignment()
 
 
 router = APIRouter(prefix="/shadow/v2", tags=["strategy-v2-shadow"])
