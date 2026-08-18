@@ -32,84 +32,104 @@ def ctrader_health():
     }
 
 
+@router.get("/panel-data", include_in_schema=False)
 @router.get("/dashboard-feed", include_in_schema=False)
 def nonblocking_dashboard_feed(force: int = 0):
-    """Serve the browser dashboard from in-memory cache only.
+    """Serve browser dashboard reads from in-memory cache only.
 
-    This intentionally uses a different URL from /panel-data so the browser
-    cannot accidentally hit the heavyweight trading/diagnostic endpoint. The
-    trading engine continues refreshing PANEL_CACHE in its background thread.
+    /dashboard-feed is the current browser URL. /panel-data is retained as a
+    compatibility alias so older cached frontend builds cannot fall through to
+    the heavyweight legacy api.py handler during broker recovery.
 
     No strategy, signal, execution, risk, SL/TP, or Binary logic is changed.
     """
     import api
 
-    cached = api.PANEL_CACHE.get("data")
-    if not isinstance(cached, dict):
-        cached = api.default_panel()
-    data = copy.deepcopy(cached)
+    try:
+        cached = api.PANEL_CACHE.get("data")
+        if not isinstance(cached, dict):
+            cached = api.default_panel()
+        data = copy.deepcopy(cached)
 
-    now = time.time()
-    last_update = float(api.PANEL_CACHE.get("last_update") or 0)
-    age = max(now - last_update, 0) if last_update else 0
-    refresh_state = dict(api.PANEL_REFRESH_STATE or {})
-    live_meta = api.LIVE_PANEL_META_CACHE or {}
-    live_pl = dict(live_meta.get("live_pl_sync") or {})
+        now = time.time()
+        last_update = float(api.PANEL_CACHE.get("last_update") or 0)
+        age = max(now - last_update, 0) if last_update else 0
+        refresh_state = dict(api.PANEL_REFRESH_STATE or {})
+        live_meta = api.LIVE_PANEL_META_CACHE or {}
+        live_pl = dict(live_meta.get("live_pl_sync") or {})
 
-    for key in (
-        "weekly_realized_pl",
-        "daily_realized_pl",
-        "daily_total_pl",
-        "monthly_realized_pl",
-        "floating_live_pl",
-        "weekly_total_pl",
-    ):
-        data[key] = live_pl.get(key, data.get(key, 0))
+        for key in (
+            "weekly_realized_pl",
+            "daily_realized_pl",
+            "daily_total_pl",
+            "monthly_realized_pl",
+            "floating_live_pl",
+            "weekly_total_pl",
+        ):
+            data[key] = live_pl.get(key, data.get(key, 0))
 
-    paper_enabled = bool(getattr(api, "AUTO_TRADE_ENABLED", {}).get("enabled", False))
-    live_enabled = bool(getattr(api, "LIVE_AUTO_TRADE_ENABLED", {}).get("enabled", False))
-    live_account = copy.deepcopy(getattr(api, "LIVE_ACCOUNT_STATE", {}))
-    live_orders = copy.deepcopy(getattr(api, "LIVE_ACTIVE_ORDERS", {}))
-    live_positions = copy.deepcopy(live_meta.get("live_positions") or [])
+        def _enabled(value):
+            if isinstance(value, dict):
+                return bool(value.get("enabled", False))
+            return bool(value)
 
-    data["_meta"] = {
-        "source": "dashboard_feed_cache_only",
-        "cache_age_seconds": round(age, 1),
-        "stale_data": bool(refresh_state.get("last_error") or not last_update),
-        "last_successful_refresh": refresh_state.get("last_success"),
-        "refresh_seconds": getattr(api, "CACHE_SECONDS", 15),
-        "error": refresh_state.get("last_error"),
-        "brain_refresh": refresh_state,
-        "live_meta_last_update": live_meta.get("last_update"),
-        "live_meta_error": live_meta.get("last_error"),
-        "paper_auto_enabled": paper_enabled,
-        "live_auto_enabled": live_enabled,
-        "auto_trade_state": {
-            "paper_enabled": paper_enabled,
-            "live_enabled": live_enabled,
-            "source": "memory_cache",
-        },
-        "live_account": live_account,
-        "live_active_orders": live_orders,
-        "broker_open_positions_count": len(live_positions),
-        "live_trade_history": copy.deepcopy(live_meta.get("live_recent_history") or []),
-        "live_trade_stats": {
-            **copy.deepcopy(live_meta.get("live_trade_stats") or {}),
-            **live_pl,
-        },
-        "weekly_realized_pl": live_pl.get("weekly_realized_pl", 0),
-        "daily_realized_pl": live_pl.get("daily_realized_pl", 0),
-        "daily_total_pl": live_pl.get("daily_total_pl", 0),
-        "monthly_realized_pl": live_pl.get("monthly_realized_pl", 0),
-        "floating_live_pl": live_pl.get("floating_live_pl", 0),
-        "weekly_total_pl": live_pl.get("weekly_total_pl", 0),
-        "live_price_status": copy.deepcopy(live_meta.get("live_price_status") or {}),
-        "nonblocking_cache_only": True,
-        "force_requested": bool(force),
-    }
+        paper_enabled = _enabled(getattr(api, "AUTO_TRADE_ENABLED", False))
+        live_enabled = _enabled(getattr(api, "LIVE_AUTO_TRADE_ENABLED", False))
+        live_account = copy.deepcopy(getattr(api, "LIVE_ACCOUNT_STATE", {}) or {})
+        live_orders = copy.deepcopy(getattr(api, "LIVE_ACTIVE_ORDERS", {}) or {})
+        live_positions = copy.deepcopy(live_meta.get("live_positions") or [])
 
-    safe = getattr(api, "_json_safe_panel_value", None)
-    return safe(data) if callable(safe) else data
+        data["_meta"] = {
+            "source": "dashboard_feed_cache_only",
+            "cache_age_seconds": round(age, 1),
+            "stale_data": bool(refresh_state.get("last_error") or not last_update),
+            "last_successful_refresh": refresh_state.get("last_success"),
+            "refresh_seconds": getattr(api, "CACHE_SECONDS", 15),
+            "error": refresh_state.get("last_error"),
+            "brain_refresh": refresh_state,
+            "live_meta_last_update": live_meta.get("last_update"),
+            "live_meta_error": live_meta.get("last_error"),
+            "paper_auto_enabled": paper_enabled,
+            "live_auto_enabled": live_enabled,
+            "auto_trade_state": {
+                "paper_enabled": paper_enabled,
+                "live_enabled": live_enabled,
+                "source": "memory_cache",
+            },
+            "live_account": live_account,
+            "live_active_orders": live_orders,
+            "broker_open_positions_count": len(live_positions),
+            "live_trade_history": copy.deepcopy(live_meta.get("live_recent_history") or []),
+            "live_trade_stats": {
+                **copy.deepcopy(live_meta.get("live_trade_stats") or {}),
+                **live_pl,
+            },
+            "weekly_realized_pl": live_pl.get("weekly_realized_pl", 0),
+            "daily_realized_pl": live_pl.get("daily_realized_pl", 0),
+            "daily_total_pl": live_pl.get("daily_total_pl", 0),
+            "monthly_realized_pl": live_pl.get("monthly_realized_pl", 0),
+            "floating_live_pl": live_pl.get("floating_live_pl", 0),
+            "weekly_total_pl": live_pl.get("weekly_total_pl", 0),
+            "live_price_status": copy.deepcopy(live_meta.get("live_price_status") or {}),
+            "nonblocking_cache_only": True,
+            "legacy_panel_alias": True,
+            "force_requested": bool(force),
+        }
+
+        safe = getattr(api, "_json_safe_panel_value", None)
+        return safe(data) if callable(safe) else data
+    except Exception as exc:
+        # Dashboard reads must never take the API down. Trading continues in its
+        # background engine while the browser receives a safe WAIT snapshot.
+        fallback = api.default_panel()
+        fallback["_meta"] = {
+            "source": "dashboard_feed_failsafe",
+            "stale_data": True,
+            "error": f"cache read failed: {type(exc).__name__}",
+            "nonblocking_cache_only": True,
+            "legacy_panel_alias": True,
+        }
+        return fallback
 
 
 @router.get("/chart/live-ticks")
