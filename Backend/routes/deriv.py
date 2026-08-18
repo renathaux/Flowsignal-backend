@@ -8,6 +8,10 @@ from services.deriv_service import (
     exchange_authorization_code,
     public_config,
 )
+from services.deriv_demo_execution_service import (
+    execute_demo_signal,
+    execution_snapshot,
+)
 
 router = APIRouter(prefix="/deriv", tags=["deriv"])
 
@@ -19,6 +23,12 @@ class DerivExchangeRequest(BaseModel):
 
 class DerivConnectionRequest(BaseModel):
     connection_id: str
+
+
+class DerivDemoSignalRequest(BaseModel):
+    connection_id: str
+    signal: str
+    signal_id: str
 
 
 @router.get("/config")
@@ -51,12 +61,6 @@ def disconnect_deriv(request: DerivConnectionRequest):
 
 @router.post("/demo/guard")
 def verify_demo_guard(request: DerivConnectionRequest):
-    """Safety preflight used before any future Deriv purchase endpoint.
-
-    This deliberately does not place a contract. It proves that the currently
-    connected account is explicitly identified as demo before execution code is
-    allowed to be added/enabled.
-    """
     try:
         snapshot = assert_demo_connection(request.connection_id.strip())
     except RuntimeError as exc:
@@ -64,7 +68,31 @@ def verify_demo_guard(request: DerivConnectionRequest):
     return {
         "ok": True,
         "demo_only": True,
-        "execution_enabled": False,
-        "message": "Demo account verified. Contract purchase endpoint is not enabled yet.",
+        "execution_enabled": True,
+        "real_money_enabled": False,
+        "message": "Demo account verified. Binary execution is demo-only.",
         "demo_accounts": snapshot.get("demo_accounts", []),
     }
+
+
+@router.post("/demo/execute-signal")
+def execute_binary_demo_signal(request: DerivDemoSignalRequest):
+    """Execute one isolated EURUSD Rise/Fall contract on Deriv demo only."""
+    try:
+        return execute_demo_signal(
+            request.connection_id.strip(),
+            request.signal,
+            request.signal_id,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Deriv demo execution failed: {exc}") from exc
+
+
+@router.post("/demo/execution-status")
+def get_binary_demo_execution_status(request: DerivConnectionRequest):
+    try:
+        return execution_snapshot(request.connection_id.strip())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
