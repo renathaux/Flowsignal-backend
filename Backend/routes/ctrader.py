@@ -32,14 +32,13 @@ def ctrader_health():
     }
 
 
-@router.get("/panel-data", include_in_schema=False)
-def nonblocking_panel_data(force: int = 0):
-    """Serve the dashboard from in-memory cache only.
+@router.get("/dashboard-feed", include_in_schema=False)
+def nonblocking_dashboard_feed(force: int = 0):
+    """Serve the browser dashboard from in-memory cache only.
 
-    This route intentionally does not call api.panel_data(). The heavy endpoint
-    can perform broker/database/meta refresh work that may block during cTrader
-    recovery. The trading engine continues refreshing the authoritative cache in
-    its background thread; the browser only reads the latest confirmed snapshot.
+    This intentionally uses a different URL from /panel-data so the browser
+    cannot accidentally hit the heavyweight trading/diagnostic endpoint. The
+    trading engine continues refreshing PANEL_CACHE in its background thread.
 
     No strategy, signal, execution, risk, SL/TP, or Binary logic is changed.
     """
@@ -57,8 +56,6 @@ def nonblocking_panel_data(force: int = 0):
     live_meta = api.LIVE_PANEL_META_CACHE or {}
     live_pl = dict(live_meta.get("live_pl_sync") or {})
 
-    # Preserve the top-level P/L fields expected by the existing frontend, but
-    # read them only from the already-populated metadata cache.
     for key in (
         "weekly_realized_pl",
         "daily_realized_pl",
@@ -76,7 +73,7 @@ def nonblocking_panel_data(force: int = 0):
     live_positions = copy.deepcopy(live_meta.get("live_positions") or [])
 
     data["_meta"] = {
-        "source": "shared_cache_nonblocking",
+        "source": "dashboard_feed_cache_only",
         "cache_age_seconds": round(age, 1),
         "stale_data": bool(refresh_state.get("last_error") or not last_update),
         "last_successful_refresh": refresh_state.get("last_success"),
@@ -111,7 +108,6 @@ def nonblocking_panel_data(force: int = 0):
         "force_requested": bool(force),
     }
 
-    # Keep response serialization defensive, exactly like the original endpoint.
     safe = getattr(api, "_json_safe_panel_value", None)
     return safe(data) if callable(safe) else data
 
