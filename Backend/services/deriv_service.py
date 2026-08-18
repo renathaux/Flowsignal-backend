@@ -6,7 +6,9 @@ from typing import Any
 
 import requests
 
-DERIV_CLIENT_ID = os.getenv("DERIV_CLIENT_ID", "").strip()
+# OAuth client IDs are public identifiers, not secrets. Environment variables
+# still override this registered FlowSignal app ID when needed.
+DERIV_CLIENT_ID = os.getenv("DERIV_CLIENT_ID", "348ZidIsn7poIwqP8A0tg").strip()
 DERIV_REDIRECT_URI = os.getenv("DERIV_REDIRECT_URI", "https://flowsignalfx.com/deriv/callback").strip()
 DERIV_AUTH_URL = "https://auth.deriv.com/oauth2/auth"
 DERIV_TOKEN_URL = "https://auth.deriv.com/oauth2/token"
@@ -93,10 +95,9 @@ def fetch_options_accounts(access_token: str) -> list[dict[str, Any]]:
 
 
 def _is_demo_account(account: dict[str, Any]) -> bool:
-    # New Deriv account payloads may evolve. Only mark demo when the response
-    # explicitly says so; never infer a real account as safe for demo trading.
-    truthy_keys = ("is_demo", "is_virtual", "virtual", "demo")
-    for key in truthy_keys:
+    # Never infer an unknown account as demo. Execution remains blocked unless
+    # Deriv explicitly identifies the account as demo/virtual/practice.
+    for key in ("is_demo", "is_virtual", "virtual", "demo"):
         if account.get(key) is True or str(account.get(key) or "").lower() in {"true", "1", "yes"}:
             return True
     for key in ("account_type", "type", "environment", "category"):
