@@ -6,10 +6,11 @@ from typing import Any
 
 import requests
 
-# OAuth client IDs are public identifiers, not secrets. Environment variables
-# still override this registered FlowSignal app ID when needed.
-DERIV_CLIENT_ID = os.getenv("DERIV_CLIENT_ID", "348ZidIsn7poIwqP8A0tg").strip()
-DERIV_REDIRECT_URI = os.getenv("DERIV_REDIRECT_URI", "https://flowsignalfx.com/deriv/callback").strip()
+# Binary is an isolated mini-app inside FlowSignal. Use the exact OAuth client
+# registered for FlowSignal on developers.deriv.com so stale Render environment
+# variables cannot silently point this integration at an old/legacy client.
+DERIV_CLIENT_ID = "348ZidIsn7poIwqP8A0tg"
+DERIV_REDIRECT_URI = "https://flowsignalfx.com/deriv/callback"
 DERIV_AUTH_URL = "https://auth.deriv.com/oauth2/auth"
 DERIV_TOKEN_URL = "https://auth.deriv.com/oauth2/token"
 DERIV_API_BASE = "https://api.derivws.com"
@@ -30,18 +31,14 @@ def public_config() -> dict[str, Any]:
 
 
 def _headers(access_token: str) -> dict[str, str]:
-    headers = {
+    return {
         "Authorization": f"Bearer {access_token}",
+        "Deriv-App-ID": DERIV_CLIENT_ID,
         "Accept": "application/json",
     }
-    if DERIV_CLIENT_ID:
-        headers["Deriv-App-ID"] = DERIV_CLIENT_ID
-    return headers
 
 
 def exchange_authorization_code(code: str, code_verifier: str) -> dict[str, Any]:
-    if not DERIV_CLIENT_ID:
-        raise RuntimeError("DERIV_CLIENT_ID is not configured")
     response = requests.post(
         DERIV_TOKEN_URL,
         data={
@@ -55,7 +52,14 @@ def exchange_authorization_code(code: str, code_verifier: str) -> dict[str, Any]
         timeout=15,
     )
     if not response.ok:
-        raise RuntimeError(f"Deriv token exchange failed ({response.status_code})")
+        detail = ""
+        try:
+            body = response.json()
+            detail = str(body.get("error_description") or body.get("error") or "").strip()
+        except Exception:
+            detail = response.text[:200].strip()
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(f"Deriv token exchange failed ({response.status_code}){suffix}")
     payload = response.json()
     access_token = str(payload.get("access_token") or "").strip()
     if not access_token:
