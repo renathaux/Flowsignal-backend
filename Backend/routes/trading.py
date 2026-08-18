@@ -2,9 +2,11 @@ from fastapi import APIRouter
 
 from fundamentals.ingestion import start_fundamental_ingestion_scheduler
 from routes.fundamentals import router as fundamentals_router
+from routes.deriv import router as deriv_router
 
 router = APIRouter()
 router.include_router(fundamentals_router)
+router.include_router(deriv_router)
 
 
 @router.on_event("startup")
