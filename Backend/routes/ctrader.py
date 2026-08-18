@@ -1,10 +1,13 @@
 from datetime import datetime, timedelta, timezone
-import copy
 import time
 
 from fastapi import APIRouter, HTTPException, Query
 
 from services.ctrader_transport_guard import install_ctrader_transport_guard
+from services.trade_signal_lifecycle_guard import (
+    clone_panel_for_transport,
+    install_trade_signal_lifecycle_guard,
+)
 
 # Install before importing/using cTrader market-data functions. The guard only
 # bounds read/auth requests; broker order/amend/close payloads are untouched.
@@ -24,6 +27,13 @@ _ALLOWED_SYMBOLS = {"EURUSD", "XAUUSD"}
 _TIMEFRAME_MINUTES = {"5m": 5, "15m": 15, "1h": 60}
 
 
+@router.on_event("startup")
+def _install_trade_signal_lifecycle_guard():
+    # api.py is fully imported by startup time, so the lifecycle can be wrapped
+    # without a circular import during module initialization.
+    install_trade_signal_lifecycle_guard()
+
+
 @router.get("/health/ctrader")
 def ctrader_health():
     return {
@@ -37,11 +47,13 @@ def ctrader_health():
 def nonblocking_dashboard_feed(force: int = 0):
     """Serve browser dashboard reads from in-memory cache only.
 
-    /dashboard-feed is the current browser URL. /panel-data is retained as a
-    compatibility alias so older cached frontend builds cannot fall through to
-    the heavyweight legacy api.py handler during broker recovery.
+    Both URLs intentionally use this lightweight route so old cached browsers
+    cannot fall through to the heavyweight legacy handler. All cloning here is
+    bounded/cycle-safe, so a recursive diagnostic object can never turn the
+    dashboard into NO DATA.
 
-    No strategy, signal, execution, risk, SL/TP, or Binary logic is changed.
+    No strategy parameters, signal rules, broker execution, risk, SL/TP, or
+    Binary logic are changed.
     """
     import api
 
@@ -49,14 +61,20 @@ def nonblocking_dashboard_feed(force: int = 0):
         cached = api.PANEL_CACHE.get("data")
         if not isinstance(cached, dict):
             cached = api.default_panel()
-        data = copy.deepcopy(cached)
+        data = clone_panel_for_transport(cached)
+        if not isinstance(data, dict):
+            data = api.default_panel()
 
         now = time.time()
         last_update = float(api.PANEL_CACHE.get("last_update") or 0)
         age = max(now - last_update, 0) if last_update else 0
-        refresh_state = dict(api.PANEL_REFRESH_STATE or {})
+        refresh_state = clone_panel_for_transport(api.PANEL_REFRESH_STATE or {})
+        if not isinstance(refresh_state, dict):
+            refresh_state = {}
         live_meta = api.LIVE_PANEL_META_CACHE or {}
-        live_pl = dict(live_meta.get("live_pl_sync") or {})
+        live_pl = clone_panel_for_transport(live_meta.get("live_pl_sync") or {})
+        if not isinstance(live_pl, dict):
+            live_pl = {}
 
         for key in (
             "weekly_realized_pl",
@@ -75,12 +93,36 @@ def nonblocking_dashboard_feed(force: int = 0):
 
         paper_enabled = _enabled(getattr(api, "AUTO_TRADE_ENABLED", False))
         live_enabled = _enabled(getattr(api, "LIVE_AUTO_TRADE_ENABLED", False))
-        live_account = copy.deepcopy(getattr(api, "LIVE_ACCOUNT_STATE", {}) or {})
-        live_orders = copy.deepcopy(getattr(api, "LIVE_ACTIVE_ORDERS", {}) or {})
-        live_positions = copy.deepcopy(live_meta.get("live_positions") or [])
+        live_account = clone_panel_for_transport(
+            getattr(api, "LIVE_ACCOUNT_STATE", {}) or {}
+        )
+        live_orders = clone_panel_for_transport(
+            getattr(api, "LIVE_ACTIVE_ORDERS", {}) or {}
+        )
+        live_positions = clone_panel_for_transport(
+            live_meta.get("live_positions") or []
+        )
+        live_recent_history = clone_panel_for_transport(
+            live_meta.get("live_recent_history") or []
+        )
+        live_trade_stats = clone_panel_for_transport(
+            live_meta.get("live_trade_stats") or {}
+        )
+        live_price_status = clone_panel_for_transport(
+            live_meta.get("live_price_status") or {}
+        )
+
+        if not isinstance(live_positions, list):
+            live_positions = []
+        if not isinstance(live_recent_history, list):
+            live_recent_history = []
+        if not isinstance(live_trade_stats, dict):
+            live_trade_stats = {}
+        if not isinstance(live_price_status, dict):
+            live_price_status = {}
 
         data["_meta"] = {
-            "source": "dashboard_feed_cache_only",
+            "source": "dashboard_feed_cache_only_cycle_safe",
             "cache_age_seconds": round(age, 1),
             "stale_data": bool(refresh_state.get("last_error") or not last_update),
             "last_successful_refresh": refresh_state.get("last_success"),
@@ -96,12 +138,12 @@ def nonblocking_dashboard_feed(force: int = 0):
                 "live_enabled": live_enabled,
                 "source": "memory_cache",
             },
-            "live_account": live_account,
-            "live_active_orders": live_orders,
+            "live_account": live_account if isinstance(live_account, dict) else {},
+            "live_active_orders": live_orders if isinstance(live_orders, dict) else {},
             "broker_open_positions_count": len(live_positions),
-            "live_trade_history": copy.deepcopy(live_meta.get("live_recent_history") or []),
+            "live_trade_history": live_recent_history,
             "live_trade_stats": {
-                **copy.deepcopy(live_meta.get("live_trade_stats") or {}),
+                **live_trade_stats,
                 **live_pl,
             },
             "weekly_realized_pl": live_pl.get("weekly_realized_pl", 0),
@@ -110,8 +152,9 @@ def nonblocking_dashboard_feed(force: int = 0):
             "monthly_realized_pl": live_pl.get("monthly_realized_pl", 0),
             "floating_live_pl": live_pl.get("floating_live_pl", 0),
             "weekly_total_pl": live_pl.get("weekly_total_pl", 0),
-            "live_price_status": copy.deepcopy(live_meta.get("live_price_status") or {}),
+            "live_price_status": live_price_status,
             "nonblocking_cache_only": True,
+            "cycle_safe_transport": True,
             "legacy_panel_alias": True,
             "force_requested": bool(force),
         }
@@ -119,14 +162,13 @@ def nonblocking_dashboard_feed(force: int = 0):
         safe = getattr(api, "_json_safe_panel_value", None)
         return safe(data) if callable(safe) else data
     except Exception as exc:
-        # Dashboard reads must never take the API down. Trading continues in its
-        # background engine while the browser receives a safe WAIT snapshot.
         fallback = api.default_panel()
         fallback["_meta"] = {
             "source": "dashboard_feed_failsafe",
             "stale_data": True,
             "error": f"cache read failed: {type(exc).__name__}",
             "nonblocking_cache_only": True,
+            "cycle_safe_transport": True,
             "legacy_panel_alias": True,
         }
         return fallback
