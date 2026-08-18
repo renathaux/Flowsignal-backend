@@ -22,7 +22,9 @@ import websockets
 SYMBOL = "frxEURUSD"
 GRANULARITY_SECONDS = 300
 CANDLE_COUNT = 60
-PUBLIC_WS_URL = "wss://ws.binaryws.com/websockets/v3"
+# Current Deriv Options public market-data WebSocket. This replaces the legacy
+# ws.binaryws.com endpoint, which can reject the handshake with InvalidStatus.
+PUBLIC_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public"
 
 
 def _atr(candles: list[dict[str, float]], period: int = 10) -> float:
@@ -134,8 +136,6 @@ def _evaluate(candles: list[dict[str, float]]) -> dict[str, Any]:
     bullish_engulfing = _bullish_engulfing(previous, last)
     bearish_engulfing = _bearish_engulfing(previous, last)
 
-    # Micro structure only: prior 2 completed candles, deliberately independent
-    # of FlowSignal Forex BOS/CHOCH logic.
     micro_reference = closed[-4:-2]
     micro_high = max(c["high"] for c in micro_reference)
     micro_low = min(c["low"] for c in micro_reference)
@@ -151,14 +151,10 @@ def _evaluate(candles: list[dict[str, float]]) -> dict[str, Any]:
     body_atr = body_abs / atr_safe
     close_location = (last["close"] - last["low"]) / candle_range
 
-    # A continuation candle should actually displace price and finish near the
-    # attacking edge. This matters more for a one-candle expiry than long-term trend.
     strong_bull_close = body > 0 and body_ratio >= 0.55 and close_location >= 0.72
     strong_bear_close = body < 0 and body_ratio >= 0.55 and close_location <= 0.28
     displacement = body_atr >= 0.45 or range_atr >= 0.75
 
-    # Exhaustion guard: avoid joining after 3+ same-direction completed candles.
-    # We want the beginning of a burst, not its fourth/fifth candle.
     prior_dirs = [_direction(c) for c in closed[-5:-1]]
     consecutive_bulls = 0
     consecutive_bears = 0
@@ -175,8 +171,6 @@ def _evaluate(candles: list[dict[str, float]]) -> dict[str, Any]:
     bull_exhausted = consecutive_bulls >= 3
     bear_exhausted = consecutive_bears >= 3
 
-    # Require either an engulfing reversal/continuation impulse OR a genuine
-    # micro close-through. We no longer require both, because that can enter late.
     bull_trigger = strong_bull_close and displacement and (bullish_engulfing or micro_break_up)
     bear_trigger = strong_bear_close and displacement and (bearish_engulfing or micro_break_down)
 
