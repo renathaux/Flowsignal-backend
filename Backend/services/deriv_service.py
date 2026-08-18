@@ -11,7 +11,7 @@ import requests
 # cTrader/Forex settings or any legacy DERIV_* variables elsewhere.
 DERIV_CLIENT_ID = str(
     os.getenv("BINARY_DERIV_CLIENT_ID")
-    or "348ZidIsn7poIwqP8A0tg"
+    or "348ZidIsn7poIwqP8AOtg"
 ).strip()
 DERIV_REDIRECT_URI = str(
     os.getenv("BINARY_DERIV_REDIRECT_URI")
