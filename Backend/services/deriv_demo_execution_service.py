@@ -2,7 +2,7 @@
 
 This module has no imports from cTrader/Forex execution code. It accepts a
 FlowSignal observation (BUY/SELL) and, only after positively verifying a Deriv
-demo Options account, purchases a small 15-minute Rise/Fall contract.
+demo Options account, purchases a $10 five-minute Rise/Fall contract.
 
 Real-money Deriv execution is intentionally impossible here.
 """
@@ -28,8 +28,8 @@ from services.deriv_service import (
     assert_demo_connection,
 )
 
-DEFAULT_STAKE_USD = 1.0
-DEFAULT_DURATION_MINUTES = 15
+DEFAULT_STAKE_USD = 10.0
+DEFAULT_DURATION_MINUTES = 5
 UNDERLYING_SYMBOL = "frxEURUSD"
 
 _EXECUTION_LOCK = threading.RLock()
@@ -47,7 +47,6 @@ def _private_connection(connection_id: str) -> dict[str, Any]:
         accounts = list(record.get("accounts") or [])
     if not access_token:
         raise RuntimeError("Deriv access token unavailable")
-
     demo = next((item for item in accounts if isinstance(item, dict) and _is_demo_account(item)), None)
     if not demo:
         raise RuntimeError("No positively verified Deriv demo Options account is available")
@@ -71,8 +70,6 @@ def _otp_websocket_url(access_token: str, account_id: str) -> str:
     url = str((data or {}).get("url") or "").strip()
     if not url:
         raise RuntimeError("Deriv OTP response did not include a WebSocket URL")
-    # Hard safety boundary: never connect this execution service to the real
-    # trading websocket, even if Deriv unexpectedly returns one.
     if "/ws/demo" not in url:
         raise RuntimeError("Deriv execution blocked: OTP did not return a demo WebSocket")
     return url
@@ -95,12 +92,7 @@ async def _recv_for_req(ws, req_id: int, timeout: float = 12.0) -> dict[str, Any
             return message
 
 
-async def _purchase_demo_contract_async(
-    websocket_url: str,
-    side: str,
-    stake: float,
-    duration_minutes: int,
-) -> dict[str, Any]:
+async def _purchase_demo_contract_async(websocket_url: str, side: str, stake: float, duration_minutes: int) -> dict[str, Any]:
     contract_type = "CALL" if side == "BUY" else "PUT"
     async with websockets.connect(websocket_url, open_timeout=10, close_timeout=5) as ws:
         proposal_req_id = 101
@@ -124,13 +116,8 @@ async def _purchase_demo_contract_async(
             ask_price = float(proposal.get("ask_price") or stake)
         except (TypeError, ValueError):
             ask_price = stake
-
         buy_req_id = 102
-        await ws.send(json.dumps({
-            "buy": proposal_id,
-            "price": max(ask_price, stake),
-            "req_id": buy_req_id,
-        }))
+        await ws.send(json.dumps({"buy": proposal_id, "price": max(ask_price, stake), "req_id": buy_req_id}))
         buy_message = await _recv_for_req(ws, buy_req_id)
         buy = buy_message.get("buy") or {}
         contract_id = buy.get("contract_id")
@@ -155,14 +142,7 @@ async def _purchase_demo_contract_async(
         }
 
 
-def execute_demo_signal(
-    connection_id: str,
-    signal: str,
-    signal_id: str,
-    *,
-    stake: float = DEFAULT_STAKE_USD,
-    duration_minutes: int = DEFAULT_DURATION_MINUTES,
-) -> dict[str, Any]:
+def execute_demo_signal(connection_id: str, signal: str, signal_id: str, *, stake: float = DEFAULT_STAKE_USD, duration_minutes: int = DEFAULT_DURATION_MINUTES) -> dict[str, Any]:
     side = str(signal or "").strip().upper()
     normalized_signal_id = str(signal_id or "").strip()
     if side not in {"BUY", "SELL"}:
@@ -171,10 +151,10 @@ def execute_demo_signal(
         raise RuntimeError("Binary signal ID is required")
     stake = round(float(stake), 2)
     duration_minutes = int(duration_minutes)
-    if stake <= 0 or stake > 5:
-        raise RuntimeError("Binary demo stake must be between $0.01 and $5.00")
-    if duration_minutes != 15:
-        raise RuntimeError("Binary demo expiry is locked to 15 minutes")
+    if stake != DEFAULT_STAKE_USD:
+        raise RuntimeError("Binary demo stake is locked to $10.00")
+    if duration_minutes != DEFAULT_DURATION_MINUTES:
+        raise RuntimeError("Binary demo expiry is locked to 5 minutes")
 
     private = _private_connection(connection_id)
     with _EXECUTION_LOCK:
@@ -187,11 +167,8 @@ def execute_demo_signal(
                 "reason": "SIGNAL_ALREADY_EXECUTED",
                 "last_trade": _LAST_TRADE_BY_CONNECTION.get(connection_id),
             }
-
         ws_url = _otp_websocket_url(private["access_token"], private["account_id"])
-        result = asyncio.run(
-            _purchase_demo_contract_async(ws_url, side, stake, duration_minutes)
-        )
+        result = asyncio.run(_purchase_demo_contract_async(ws_url, side, stake, duration_minutes))
         result.update({
             "executed": True,
             "signal_id": normalized_signal_id,
