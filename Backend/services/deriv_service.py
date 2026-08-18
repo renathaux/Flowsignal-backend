@@ -6,11 +6,17 @@ from typing import Any
 
 import requests
 
-# Binary is an isolated mini-app inside FlowSignal. Use the exact OAuth client
-# registered for FlowSignal on developers.deriv.com so stale Render environment
-# variables cannot silently point this integration at an old/legacy client.
-DERIV_CLIENT_ID = "348ZidIsn7poIwqP8A0tg"
-DERIV_REDIRECT_URI = "https://flowsignalfx.com/deriv/callback"
+# Binary is an isolated mini-app inside FlowSignal. Use dedicated environment
+# keys so Deriv configuration can be changed/re-provisioned without touching
+# cTrader/Forex settings or any legacy DERIV_* variables elsewhere.
+DERIV_CLIENT_ID = str(
+    os.getenv("BINARY_DERIV_CLIENT_ID")
+    or "348ZidIsn7poIwqP8A0tg"
+).strip()
+DERIV_REDIRECT_URI = str(
+    os.getenv("BINARY_DERIV_REDIRECT_URI")
+    or "https://flowsignalfx.com/deriv/callback"
+).strip()
 DERIV_AUTH_URL = "https://auth.deriv.com/oauth2/auth"
 DERIV_TOKEN_URL = "https://auth.deriv.com/oauth2/token"
 DERIV_API_BASE = "https://api.derivws.com"
@@ -27,6 +33,11 @@ def public_config() -> dict[str, Any]:
         "authorization_url": DERIV_AUTH_URL,
         "scope": "trade",
         "demo_only": True,
+        "config_source": (
+            "BINARY_DERIV_CLIENT_ID"
+            if os.getenv("BINARY_DERIV_CLIENT_ID")
+            else "flowsignal_default"
+        ),
     }
 
 
