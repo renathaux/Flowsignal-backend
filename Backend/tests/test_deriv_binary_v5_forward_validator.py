@@ -1,4 +1,5 @@
 import ast
+import json
 import math
 import sqlite3
 import sys
@@ -15,6 +16,8 @@ from services.deriv_binary_v5_forward_validator import (
     FROZEN_THRESHOLDS,
     SPEC_SHA256,
     STRATEGY_VERSION,
+    RAW_TICK_RETENTION_DAYS,
+    cleanup_raw_ticks,
     evaluate_completed_candle,
     forward_report,
     initialize_database,
@@ -143,6 +146,110 @@ class FrozenV5Tests(unittest.TestCase):
             self.assertTrue(names.isdisjoint(forbidden_calls))
             self.assertNotIn('"buy"', source)
             self.assertNotIn('"proposal"', source)
+
+    def test_retention_prunes_only_expired_ordinary_ticks(self):
+        now = 20_000_000
+        cutoff = now - RAW_TICK_RETENTION_DAYS * 86400
+        record_tick({"epoch": cutoff - 1, "quote": 1.0}, self.db)
+        record_tick({"epoch": cutoff, "quote": 1.1}, self.db)
+        record_tick({"epoch": cutoff + 1, "quote": 1.2}, self.db)
+        result = cleanup_raw_ticks(self.db, now_epoch=now)
+        self.assertEqual(result["deleted"], 1)
+        with sqlite3.connect(str(self.db)) as connection:
+            epochs = [row[0] for row in connection.execute("SELECT epoch FROM ticks")]
+        self.assertEqual(epochs, [cutoff, cutoff + 1])
+
+    def test_qualifying_evidence_and_completed_features_are_permanent(self):
+        result = evaluate_completed_candle(candles(True), noisy_ticks(True), 4300)
+        record_observation(result, self.db)
+        now = 4300 + (RAW_TICK_RETENTION_DAYS + 1) * 86400
+        for tick in noisy_ticks(True):
+            record_tick(tick, self.db)
+        cleanup_raw_ticks(self.db, now_epoch=now)
+        with sqlite3.connect(str(self.db)) as connection:
+            observation = connection.execute(
+                "SELECT payload_json FROM observations WHERE observation_id=?",
+                (result["observation_id"],),
+            ).fetchone()
+            signal = connection.execute(
+                "SELECT entry_timestamp, settlement_timestamp, entry_price, status "
+                "FROM signals WHERE signal_id=?", (result["signal_id"],)
+            ).fetchone()
+            evidence = connection.execute(
+                "SELECT strategy_version, spec_sha256, decision_context_json, "
+                "final_60_second_ticks_json FROM signal_evidence WHERE signal_id=?",
+                (result["signal_id"],),
+            ).fetchone()
+        self.assertIsNotNone(observation)
+        self.assertEqual(signal, (4300, 4600, result["entry_price"], "PENDING"))
+        self.assertEqual(evidence[0], STRATEGY_VERSION)
+        self.assertEqual(evidence[1], EXPECTED_SPEC_SHA256)
+        context = json.loads(evidence[2])
+        self.assertEqual(len(context["previous_six_candles"]), 6)
+        self.assertIn("decision_candle", context)
+        self.assertGreaterEqual(len(json.loads(evidence[3])), 2)
+
+    def test_pending_signal_ticks_are_protected_and_settlement_survives(self):
+        result = evaluate_completed_candle(candles(True), noisy_ticks(True), 4300)
+        record_observation(result, self.db)
+        record_tick({"epoch": 4000, "quote": result["entry_price"]}, self.db)
+        record_tick({"epoch": 4600, "quote": result["entry_price"] - 0.0001}, self.db)
+        cleanup_raw_ticks(
+            self.db, now_epoch=4600 + (RAW_TICK_RETENTION_DAYS + 1) * 86400
+        )
+        with sqlite3.connect(str(self.db)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM ticks").fetchone()[0], 2)
+        self.assertEqual(settle_from_recorded_ticks(self.db, now_epoch=4600), 1)
+        cleanup_raw_ticks(
+            self.db, now_epoch=4600 + (RAW_TICK_RETENTION_DAYS + 1) * 86400
+        )
+        with sqlite3.connect(str(self.db)) as connection:
+            row = connection.execute(
+                "SELECT entry_timestamp, settlement_timestamp, entry_price, "
+                "settlement_price, settlement_quote_epoch, outcome, status FROM signals"
+            ).fetchone()
+        self.assertEqual(row[:3], (4300, 4600, result["entry_price"]))
+        self.assertEqual(row[4:], (4600, "WIN", "SETTLED"))
+
+    def test_cleanup_is_idempotent_restart_safe_and_keeps_deduplication(self):
+        now = 20_000_000
+        old = now - RAW_TICK_RETENTION_DAYS * 86400 - 1
+        record_tick({"epoch": old, "quote": 1.0}, self.db)
+        self.assertEqual(cleanup_raw_ticks(self.db, now_epoch=now)["deleted"], 1)
+        self.assertEqual(cleanup_raw_ticks(self.db, now_epoch=now)["deleted"], 0)
+        self.assertTrue(record_tick({"epoch": old, "quote": 1.0}, self.db))
+        self.assertFalse(record_tick({"epoch": old, "quote": 1.0}, self.db))
+        initialize_database(self.db, collection_start_timestamp=999999)
+        report = forward_report(self.db)
+        self.assertEqual(report["collection_start_timestamp"], 3900)
+        self.assertEqual(report["retention"]["period_days"], 60)
+        self.assertIn(report["retention"]["warning_state"], {
+            "OK", "WARNING", "ELEVATED", "CRITICAL"
+        })
+
+    def test_cleanup_does_not_change_v5_decision_or_frozen_identity(self):
+        before = evaluate_completed_candle(candles(False), noisy_ticks(False), 4300)
+        cleanup_raw_ticks(self.db, now_epoch=20_000_000)
+        after = evaluate_completed_candle(candles(False), noisy_ticks(False), 4300)
+        self.assertEqual(before, after)
+        self.assertEqual(STRATEGY_VERSION, "DERIV_BINARY_V5_NOISY_REVERSAL_FROZEN_1")
+        self.assertEqual(SPEC_SHA256, EXPECTED_SPEC_SHA256)
+
+    def test_report_exposes_retention_and_disk_monitoring(self):
+        report = forward_report(self.db)["retention"]
+        required = {
+            "period_days", "oldest_raw_tick_timestamp", "newest_raw_tick_timestamp",
+            "raw_tick_count", "last_cleanup_timestamp",
+            "raw_ticks_deleted_last_cleanup", "raw_ticks_deleted_total",
+            "database_size_bytes", "disk_total_bytes", "disk_used_bytes",
+            "disk_free_bytes", "disk_used_percent", "warning_state",
+            "warning_thresholds_percent",
+        }
+        self.assertTrue(required.issubset(report))
+        self.assertEqual(
+            report["warning_thresholds_percent"],
+            {"warning": 70, "elevated": 80, "critical": 90},
+        )
 
 
 if __name__ == "__main__":

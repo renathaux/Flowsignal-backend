@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import sqlite3
+import shutil
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -40,6 +41,9 @@ EXPECTED_SPEC_SHA256 = "fab52bb80f7f4dd9150adb2f90d7e090816915ff70e6b368518e7fb3
 
 DEFAULT_DB_PATH = DATA_DIR / "deriv_v5_forward_validation.sqlite3"
 PAYOUT_SCENARIOS = (0.70, 0.75, 0.80, 0.85, 0.90)
+RAW_TICK_RETENTION_DAYS = 60
+RAW_TICK_RETENTION_SECONDS = RAW_TICK_RETENTION_DAYS * 86400
+RETENTION_WARNING_THRESHOLDS = (70.0, 80.0, 90.0)
 
 
 @contextmanager
@@ -107,6 +111,15 @@ def initialize_database(
             );
             CREATE INDEX IF NOT EXISTS idx_v5_signals_status_time
             ON signals(status, settlement_timestamp);
+            CREATE TABLE IF NOT EXISTS signal_evidence (
+                signal_id TEXT PRIMARY KEY,
+                strategy_version TEXT NOT NULL,
+                spec_sha256 TEXT NOT NULL,
+                decision_context_json TEXT NOT NULL,
+                final_60_second_ticks_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                FOREIGN KEY(signal_id) REFERENCES signals(signal_id)
+            );
             """
         )
         started = int(collection_start_timestamp or time.time())
@@ -293,15 +306,38 @@ def evaluate_completed_candle(
         "previous_six_high": prior_high,
         "previous_six_low": prior_low,
         "directional_breakout": directional_breakout,
+        "net_displacement": body,
         "qualified": qualified,
         "predicted_direction": predicted_direction,
+        "_signal_evidence": {
+            "decision_candle": decision,
+            "previous_six_candles": previous_six,
+            "atr10": atr10,
+            "body_ratio": body_ratio,
+            "range_atr": range_atr,
+            "net_displacement": body,
+            "total_absolute_tick_path": path_length,
+            "path_efficiency": path_efficiency,
+            "nonzero_direction_reversals": reversals,
+            "final_60_second_net_move": final_move,
+            "final_60_second_move_atr": final_move_atr,
+            "candle_direction": candle_direction,
+            "predicted_direction": predicted_direction,
+            "previous_six_high": prior_high,
+            "previous_six_low": prior_low,
+            "directional_breakout": directional_breakout,
+            "final_60_second_ticks": final_ticks,
+        },
     }
 
 
 def record_observation(
     observation: dict[str, Any], db_path: str | Path = DEFAULT_DB_PATH
 ) -> dict[str, bool]:
-    payload = json.dumps(observation, sort_keys=True, separators=(",", ":"))
+    durable_observation = {
+        key: value for key, value in observation.items() if key != "_signal_evidence"
+    }
+    payload = json.dumps(durable_observation, sort_keys=True, separators=(",", ":"))
     now = time.time()
     with _connect(db_path) as connection:
         cursor = connection.execute(
@@ -333,6 +369,28 @@ def record_observation(
                 ),
             )
             signal_created = signal_cursor.rowcount == 1
+            evidence = observation.get("_signal_evidence")
+            if not isinstance(evidence, dict):
+                raise RuntimeError("Qualifying V5 signal is missing audit evidence")
+            final_ticks = evidence.get("final_60_second_ticks")
+            if not isinstance(final_ticks, list) or len(final_ticks) < 2:
+                raise RuntimeError("Qualifying V5 signal has incomplete final-window evidence")
+            decision_context = {
+                key: value for key, value in evidence.items()
+                if key != "final_60_second_ticks"
+            }
+            connection.execute(
+                """INSERT OR IGNORE INTO signal_evidence(
+                       signal_id, strategy_version, spec_sha256,
+                       decision_context_json, final_60_second_ticks_json, created_at
+                   ) VALUES(?, ?, ?, ?, ?, ?)""",
+                (
+                    observation["signal_id"], STRATEGY_VERSION, SPEC_SHA256,
+                    json.dumps(decision_context, sort_keys=True, separators=(",", ":")),
+                    json.dumps(final_ticks, sort_keys=True, separators=(",", ":")),
+                    now,
+                ),
+            )
     return {"observation_created": observation_created, "signal_created": signal_created}
 
 
@@ -380,6 +438,78 @@ def settle_from_recorded_ticks(
     return settled
 
 
+def cleanup_raw_ticks(
+    db_path: str | Path = DEFAULT_DB_PATH,
+    *,
+    now_epoch: int | None = None,
+) -> dict[str, Any]:
+    """Prune only expired, unprotected raw ticks in one restart-safe transaction."""
+    ceiling = int(now_epoch or time.time())
+    cutoff = ceiling - RAW_TICK_RETENTION_SECONDS
+    initialize_database(db_path)
+    with _connect(db_path) as connection:
+        before = connection.total_changes
+        connection.execute(
+            """DELETE FROM ticks
+               WHERE epoch < ?
+                 AND NOT EXISTS (
+                     SELECT 1 FROM signals AS pending
+                     WHERE pending.status='PENDING'
+                       AND ticks.epoch >= pending.entry_timestamp - ?
+                       AND ticks.epoch <= pending.settlement_timestamp + 5
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM signals AS incomplete
+                     LEFT JOIN signal_evidence AS evidence
+                       ON evidence.signal_id=incomplete.signal_id
+                     WHERE evidence.signal_id IS NULL
+                       AND ticks.epoch >= incomplete.entry_timestamp - ?
+                       AND ticks.epoch <= incomplete.settlement_timestamp + 5
+                 )""",
+            (cutoff, GRANULARITY_SECONDS, GRANULARITY_SECONDS),
+        )
+        deleted = connection.total_changes - before
+        previous = connection.execute(
+            "SELECT value FROM metadata WHERE key='raw_ticks_deleted_total'"
+        ).fetchone()
+        total = int(previous["value"]) if previous else 0
+        values = {
+            "last_retention_cleanup_timestamp": str(ceiling),
+            "raw_ticks_deleted_last_cleanup": str(deleted),
+            "raw_ticks_deleted_total": str(total + deleted),
+        }
+        connection.executemany(
+            """INSERT INTO metadata(key, value) VALUES(?, ?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            values.items(),
+        )
+    # PASSIVE checkpoint avoids waiting for readers and makes freed pages reusable.
+    with _connect(db_path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
+    return {"cutoff_timestamp": cutoff, "deleted": deleted, "total_deleted": total + deleted}
+
+
+def _disk_status(db_path: str | Path) -> dict[str, Any]:
+    path = Path(db_path)
+    usage = shutil.disk_usage(path.parent)
+    percent = 100.0 * usage.used / usage.total if usage.total else 0.0
+    warning = (
+        "CRITICAL" if percent >= RETENTION_WARNING_THRESHOLDS[2]
+        else "ELEVATED" if percent >= RETENTION_WARNING_THRESHOLDS[1]
+        else "WARNING" if percent >= RETENTION_WARNING_THRESHOLDS[0]
+        else "OK"
+    )
+    return {
+        "database_size_bytes": path.stat().st_size if path.exists() else 0,
+        "disk_total_bytes": usage.total,
+        "disk_used_bytes": usage.used,
+        "disk_free_bytes": usage.free,
+        "disk_used_percent": round(percent, 2),
+        "warning_state": warning,
+        "warning_thresholds_percent": {"warning": 70, "elevated": 80, "critical": 90},
+    }
+
+
 def _wilson_interval(wins: int, losses: int, z: float = 1.96) -> list[float] | None:
     total = wins + losses
     if not total:
@@ -425,6 +555,10 @@ def forward_report(db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, Any]:
         signals = connection.execute(
             "SELECT * FROM signals ORDER BY entry_timestamp, signal_id"
         ).fetchall()
+        tick_state = connection.execute(
+            "SELECT COUNT(*) AS count, MIN(epoch) AS oldest, MAX(epoch) AS newest FROM ticks"
+        ).fetchone()
+        metadata = dict(connection.execute("SELECT key, value FROM metadata").fetchall())
     settled = [row for row in signals if row["status"] == "SETTLED"]
     decisive = [row for row in settled if row["outcome"] in {"WIN", "LOSS"}]
     elapsed_days = max((time.time() - state["collection_start_timestamp"]) / 86400, 1 / 86400)
@@ -461,4 +595,17 @@ def forward_report(db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, Any]:
         "milestones": milestones,
         "economics": economics,
         "historical_results_combined": False,
+        "retention": {
+            "period_days": RAW_TICK_RETENTION_DAYS,
+            "oldest_raw_tick_timestamp": tick_state["oldest"],
+            "newest_raw_tick_timestamp": tick_state["newest"],
+            "raw_tick_count": tick_state["count"],
+            "last_cleanup_timestamp": int(metadata["last_retention_cleanup_timestamp"])
+                if metadata.get("last_retention_cleanup_timestamp") else None,
+            "raw_ticks_deleted_last_cleanup": int(
+                metadata.get("raw_ticks_deleted_last_cleanup", "0")
+            ),
+            "raw_ticks_deleted_total": int(metadata.get("raw_ticks_deleted_total", "0")),
+            **_disk_status(db_path),
+        },
     }

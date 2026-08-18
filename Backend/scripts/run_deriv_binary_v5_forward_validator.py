@@ -20,6 +20,7 @@ from services.deriv_binary_v5_forward_validator import (  # noqa: E402
     DEFAULT_DB_PATH,
     GRANULARITY_SECONDS,
     SYMBOL,
+    cleanup_raw_ticks,
     evaluate_completed_candle,
     forward_report,
     initialize_database,
@@ -120,6 +121,8 @@ async def catch_up(db_path: Path) -> None:
 
 async def run_forever(db_path: Path) -> None:
     await catch_up(db_path)
+    cleanup_raw_ticks(db_path)
+    next_cleanup = time.time() + 86400
     next_boundary = (int(time.time()) // GRANULARITY_SECONDS + 1) * GRANULARITY_SECONDS
     async with websockets.connect(PUBLIC_WS_URL, open_timeout=15, close_timeout=5) as ws:
         await ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1, "req_id": 9601}))
@@ -130,6 +133,10 @@ async def run_forever(db_path: Path) -> None:
                 continue
             record_tick(tick, db_path)
             settle_from_recorded_ticks(db_path, now_epoch=int(tick["epoch"]))
+            if time.time() >= next_cleanup:
+                result = cleanup_raw_ticks(db_path)
+                print(json.dumps({"event": "V5_RETENTION_CLEANUP", **result}), flush=True)
+                next_cleanup = time.time() + 86400
             while int(tick["epoch"]) >= next_boundary:
                 result = await process_boundary(next_boundary, db_path)
                 print(json.dumps({"event": "V5_BOUNDARY_RECORDED", **result}), flush=True)
