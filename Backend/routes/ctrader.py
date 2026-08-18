@@ -30,6 +30,31 @@ def ctrader_health():
     }
 
 
+@router.get("/panel-data", include_in_schema=False)
+def nonblocking_panel_data(force: int = 0):
+    """Return the dashboard cache immediately during broker recovery.
+
+    The original panel endpoint can wait up to 55 seconds for an invalid/cold
+    cache. Browser requests should not be held open that long. Normal dashboard
+    reads use a zero initial-wait timeout while the existing background refresh
+    continues. Explicit force=1 keeps the original synchronous diagnostic path.
+
+    No strategy, signal, broker execution, risk, SL/TP, or Binary behavior is
+    changed here; this is only an HTTP delivery guard for the dashboard cache.
+    """
+    import api
+
+    if int(force or 0) == 1:
+        return api.panel_data(force=1)
+
+    original_wait = api.PANEL_INITIAL_DATA_WAIT_SECONDS
+    try:
+        api.PANEL_INITIAL_DATA_WAIT_SECONDS = 0
+        return api.panel_data(force=0)
+    finally:
+        api.PANEL_INITIAL_DATA_WAIT_SECONDS = original_wait
+
+
 @router.get("/chart/live-ticks")
 def live_chart_ticks():
     """Latest cTrader spot snapshots for visual candle updates only."""
