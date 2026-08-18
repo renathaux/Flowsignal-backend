@@ -5,8 +5,9 @@ cTrader execution. It reads Deriv public EURUSD 5-minute candles and answers a
 single binary question: is the next 5-minute expiry more likely to finish above
 or below the entry price?
 
-Entry is intentionally price-action driven: bullish/bearish engulfing plus a
-small 5-minute break of structure (tiny BOS). EMA, SL, TP and RR are not used.
+Entry is intentionally price-action driven. It looks for the first/second strong
+5-minute displacement candle of a new micro move, confirmed by an engulfing or
+micro structure break. EMA, Forex SMC, SL, TP and RR are not used.
 """
 
 from __future__ import annotations
@@ -90,102 +91,139 @@ def _closed_candles(candles: list[dict[str, float]]) -> list[dict[str, float]]:
 
 
 def _bullish_engulfing(previous: dict[str, float], current: dict[str, float]) -> bool:
-    previous_bearish = previous["close"] < previous["open"]
-    current_bullish = current["close"] > current["open"]
-    if not previous_bearish or not current_bullish:
-        return False
-    previous_body_low = min(previous["open"], previous["close"])
-    previous_body_high = max(previous["open"], previous["close"])
-    current_body_low = min(current["open"], current["close"])
-    current_body_high = max(current["open"], current["close"])
-    return current_body_low <= previous_body_low and current_body_high >= previous_body_high
+    return (
+        previous["close"] < previous["open"]
+        and current["close"] > current["open"]
+        and min(current["open"], current["close"]) <= min(previous["open"], previous["close"])
+        and max(current["open"], current["close"]) >= max(previous["open"], previous["close"])
+    )
 
 
 def _bearish_engulfing(previous: dict[str, float], current: dict[str, float]) -> bool:
-    previous_bullish = previous["close"] > previous["open"]
-    current_bearish = current["close"] < current["open"]
-    if not previous_bullish or not current_bearish:
-        return False
-    previous_body_low = min(previous["open"], previous["close"])
-    previous_body_high = max(previous["open"], previous["close"])
-    current_body_low = min(current["open"], current["close"])
-    current_body_high = max(current["open"], current["close"])
-    return current_body_low <= previous_body_low and current_body_high >= previous_body_high
+    return (
+        previous["close"] > previous["open"]
+        and current["close"] < current["open"]
+        and min(current["open"], current["close"]) <= min(previous["open"], previous["close"])
+        and max(current["open"], current["close"]) >= max(previous["open"], previous["close"])
+    )
+
+
+def _direction(candle: dict[str, float]) -> int:
+    if candle["close"] > candle["open"]:
+        return 1
+    if candle["close"] < candle["open"]:
+        return -1
+    return 0
 
 
 def _evaluate(candles: list[dict[str, float]]) -> dict[str, Any]:
     closed = _closed_candles(candles)
-    if len(closed) < 12:
+    strategy_name = "DERIV_NATIVE_5M_V3_MICRO_MOMENTUM"
+    if len(closed) < 14:
         return {
-            "ok": True,
-            "strategy": "DERIV_NATIVE_5M_V2_PRICE_ACTION",
-            "symbol": SYMBOL,
-            "timeframe": "5m",
-            "expiry_minutes": 5,
-            "signal": "WAIT",
-            "confidence": 0,
-            "reason": "INSUFFICIENT_CLOSED_5M_DATA",
-            "signal_id": None,
+            "ok": True, "strategy": strategy_name, "symbol": SYMBOL,
+            "timeframe": "5m", "expiry_minutes": 5, "signal": "WAIT",
+            "confidence": 0, "reason": "INSUFFICIENT_CLOSED_5M_DATA", "signal_id": None,
         }
 
     last = closed[-1]
     previous = closed[-2]
     atr10 = _atr(closed, 10)
+    atr_safe = max(atr10, 1e-9)
 
     bullish_engulfing = _bullish_engulfing(previous, last)
     bearish_engulfing = _bearish_engulfing(previous, last)
 
-    # Tiny BOS: the engulfing candle must CLOSE through the nearest micro
-    # structure made by the prior two completed candles. A very small ATR
-    # buffer prevents equality/one-tick noise from counting as a break.
+    # Micro structure only: prior 2 completed candles, deliberately independent
+    # of FlowSignal Forex BOS/CHOCH logic.
     micro_reference = closed[-4:-2]
     micro_high = max(c["high"] for c in micro_reference)
     micro_low = min(c["low"] for c in micro_reference)
-    bos_buffer = max(atr10 * 0.03, 0.000005) if atr10 > 0 else 0.000005
-    tiny_bos_up = last["close"] > (micro_high + bos_buffer)
-    tiny_bos_down = last["close"] < (micro_low - bos_buffer)
+    bos_buffer = max(atr10 * 0.02, 0.000003) if atr10 > 0 else 0.000003
+    micro_break_up = last["close"] > micro_high + bos_buffer
+    micro_break_down = last["close"] < micro_low - bos_buffer
 
-    last_range = max(last["high"] - last["low"], 1e-9)
+    candle_range = max(last["high"] - last["low"], 1e-9)
     body = last["close"] - last["open"]
-    body_ratio = abs(body) / last_range
-    upper_wick = last["high"] - max(last["open"], last["close"])
-    lower_wick = min(last["open"], last["close"]) - last["low"]
-    momentum_1 = last["close"] - previous["close"]
-    momentum_3 = last["close"] - closed[-4]["close"]
-    momentum_3_atr = (momentum_3 / atr10) if atr10 > 0 else 0.0
+    body_abs = abs(body)
+    body_ratio = body_abs / candle_range
+    range_atr = candle_range / atr_safe
+    body_atr = body_abs / atr_safe
+    close_location = (last["close"] - last["low"]) / candle_range
+
+    # A continuation candle should actually displace price and finish near the
+    # attacking edge. This matters more for a one-candle expiry than long-term trend.
+    strong_bull_close = body > 0 and body_ratio >= 0.55 and close_location >= 0.72
+    strong_bear_close = body < 0 and body_ratio >= 0.55 and close_location <= 0.28
+    displacement = body_atr >= 0.45 or range_atr >= 0.75
+
+    # Exhaustion guard: avoid joining after 3+ same-direction completed candles.
+    # We want the beginning of a burst, not its fourth/fifth candle.
+    prior_dirs = [_direction(c) for c in closed[-5:-1]]
+    consecutive_bulls = 0
+    consecutive_bears = 0
+    for d in reversed(prior_dirs):
+        if d == 1:
+            consecutive_bulls += 1
+        else:
+            break
+    for d in reversed(prior_dirs):
+        if d == -1:
+            consecutive_bears += 1
+        else:
+            break
+    bull_exhausted = consecutive_bulls >= 3
+    bear_exhausted = consecutive_bears >= 3
+
+    # Require either an engulfing reversal/continuation impulse OR a genuine
+    # micro close-through. We no longer require both, because that can enter late.
+    bull_trigger = strong_bull_close and displacement and (bullish_engulfing or micro_break_up)
+    bear_trigger = strong_bear_close and displacement and (bearish_engulfing or micro_break_down)
 
     signal = "WAIT"
-    reason = "WAIT_FOR_ENGULFING_AND_TINY_BOS"
+    reason = "WAIT_FOR_EARLY_MICRO_MOMENTUM"
     confidence = 0
 
-    if bullish_engulfing and tiny_bos_up:
+    if bull_trigger and not bull_exhausted:
         signal = "RISE"
-        reason = "BULLISH_ENGULFING+TINY_BOS_UP"
-        confidence = 70
-        if body_ratio >= 0.60:
+        reason = "EARLY_BULL_DISPLACEMENT"
+        confidence = 68
+        if bullish_engulfing:
             confidence += 7
-        if momentum_1 > 0 and momentum_3_atr >= 0.25:
-            confidence += 6
-        if lower_wick > upper_wick:
+        if micro_break_up:
+            confidence += 8
+        if bullish_engulfing and micro_break_up:
             confidence += 4
-    elif bearish_engulfing and tiny_bos_down:
+        if body_ratio >= 0.70:
+            confidence += 4
+        if close_location >= 0.85:
+            confidence += 3
+    elif bear_trigger and not bear_exhausted:
         signal = "FALL"
-        reason = "BEARISH_ENGULFING+TINY_BOS_DOWN"
-        confidence = 70
-        if body_ratio >= 0.60:
+        reason = "EARLY_BEAR_DISPLACEMENT"
+        confidence = 68
+        if bearish_engulfing:
             confidence += 7
-        if momentum_1 < 0 and momentum_3_atr <= -0.25:
-            confidence += 6
-        if upper_wick > lower_wick:
+        if micro_break_down:
+            confidence += 8
+        if bearish_engulfing and micro_break_down:
             confidence += 4
+        if body_ratio >= 0.70:
+            confidence += 4
+        if close_location <= 0.15:
+            confidence += 3
+    elif bull_trigger and bull_exhausted:
+        reason = "BULL_MOVE_EXHAUSTION_GUARD"
+    elif bear_trigger and bear_exhausted:
+        reason = "BEAR_MOVE_EXHAUSTION_GUARD"
 
-    confidence = min(confidence, 90)
+    confidence = min(confidence, 92)
     candle_epoch = int(last["epoch"])
     signal_id = f"{SYMBOL}:{candle_epoch}:{signal}" if signal != "WAIT" else None
 
     return {
         "ok": True,
-        "strategy": "DERIV_NATIVE_5M_V2_PRICE_ACTION",
+        "strategy": strategy_name,
         "symbol": SYMBOL,
         "timeframe": "5m",
         "expiry_minutes": 5,
@@ -198,8 +236,15 @@ def _evaluate(candles: list[dict[str, float]]) -> dict[str, Any]:
         "setup": {
             "bullish_engulfing": bullish_engulfing,
             "bearish_engulfing": bearish_engulfing,
-            "tiny_bos_up": tiny_bos_up,
-            "tiny_bos_down": tiny_bos_down,
+            "micro_break_up": micro_break_up,
+            "micro_break_down": micro_break_down,
+            "strong_bull_close": strong_bull_close,
+            "strong_bear_close": strong_bear_close,
+            "displacement": displacement,
+            "bull_exhausted": bull_exhausted,
+            "bear_exhausted": bear_exhausted,
+            "prior_consecutive_bulls": consecutive_bulls,
+            "prior_consecutive_bears": consecutive_bears,
             "micro_high": round(micro_high, 6),
             "micro_low": round(micro_low, 6),
             "bos_buffer": round(bos_buffer, 6),
@@ -207,8 +252,9 @@ def _evaluate(candles: list[dict[str, float]]) -> dict[str, Any]:
         "metrics": {
             "atr10": round(atr10, 6),
             "body_ratio": round(body_ratio, 3),
-            "momentum_1": round(momentum_1, 6),
-            "momentum_3_atr": round(momentum_3_atr, 3),
+            "body_atr": round(body_atr, 3),
+            "range_atr": round(range_atr, 3),
+            "close_location": round(close_location, 3),
         },
     }
 
@@ -220,7 +266,7 @@ def binary_signal_snapshot() -> dict[str, Any]:
     except Exception as exc:
         return {
             "ok": False,
-            "strategy": "DERIV_NATIVE_5M_V2_PRICE_ACTION",
+            "strategy": "DERIV_NATIVE_5M_V3_MICRO_MOMENTUM",
             "symbol": SYMBOL,
             "timeframe": "5m",
             "expiry_minutes": 5,
