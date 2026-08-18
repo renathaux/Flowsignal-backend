@@ -1,8 +1,8 @@
 """Runtime guard for FlowSignal's trade-signal lifecycle.
 
-The lifecycle normally runs unchanged.  If a panel plan contains a circular or
+The lifecycle normally runs unchanged. If a panel plan contains a circular or
 pathologically deep diagnostic object, Python's deepcopy can raise
-RecursionError.  That display/diagnostic failure must never take the market-data
+RecursionError. That display/diagnostic failure must never take the market-data
 engine offline or bypass execution safety.
 """
 
@@ -52,16 +52,18 @@ def _acyclic_clone(value: Any, *, depth: int = 0, seen: set[int] | None = None) 
         finally:
             seen.discard(identity)
 
-    # Strategy plans are expected to be serializable.  Preserve useful scalar
-    # representations for uncommon values without asking deepcopy to traverse
-    # arbitrary object graphs.
     try:
-        return value.isoformat()  # datetime / pandas timestamp style values
+        return value.isoformat()
     except Exception:
         try:
             return str(value)
         except Exception:
             return None
+
+
+def clone_panel_for_transport(value: Any) -> Any:
+    """Cycle-safe clone for browser transport/cache reads."""
+    return _acyclic_clone(value)
 
 
 def _sanitize_symbol_plans(panel_data: Any) -> bool:
@@ -76,8 +78,6 @@ def _sanitize_symbol_plans(panel_data: Any) -> bool:
 
         sanitized = _acyclic_clone(plan)
         if isinstance(sanitized, dict):
-            # Replace in place so callers holding the panel object keep the same
-            # root reference while circular nested state is removed.
             plan.clear()
             plan.update(sanitized)
             changed = True
@@ -148,9 +148,7 @@ def install_trade_signal_lifecycle_guard() -> bool:
             _sanitize_symbol_plans(panel_data)
             try:
                 recovered = original(panel_data)
-                print("TRADE_SIGNAL_LIFECYCLE_RECURSION_RECOVERED =", {
-                    "ok": True,
-                })
+                print("TRADE_SIGNAL_LIFECYCLE_RECURSION_RECOVERED =", {"ok": True})
                 return recovered
             except RecursionError as second_error:
                 print("TRADE_SIGNAL_LIFECYCLE_RECURSION_FAIL_CLOSED =", {
