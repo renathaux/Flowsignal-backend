@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from services.deriv_service import (
@@ -13,8 +13,22 @@ from services.deriv_demo_execution_service import (
     execution_snapshot,
 )
 from services.deriv_binary_strategy_service import binary_signal_snapshot
+from services.deriv_v5_demo_relay_service import receive_signal
 
 router = APIRouter(prefix="/deriv", tags=["deriv"])
+
+
+@router.post("/v5/demo/relay")
+async def receive_v5_demo_relay(request: Request):
+    body = await request.body()
+    try:
+        return receive_signal(
+            body,
+            request.headers.get("X-FlowSignal-Relay-Timestamp", ""),
+            request.headers.get("X-FlowSignal-Relay-Signature", ""),
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 class DerivExchangeRequest(BaseModel):

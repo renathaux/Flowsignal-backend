@@ -28,6 +28,7 @@ from services.deriv_binary_v5_forward_validator import (  # noqa: E402
     record_tick,
     settle_from_recorded_ticks,
 )
+from services.deriv_v5_signal_relay import deliver_pending_relays  # noqa: E402
 
 PUBLIC_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public"
 
@@ -121,8 +122,10 @@ async def catch_up(db_path: Path) -> None:
 
 async def run_forever(db_path: Path) -> None:
     await catch_up(db_path)
+    await asyncio.to_thread(deliver_pending_relays, db_path)
     cleanup_raw_ticks(db_path)
     next_cleanup = time.time() + 86400
+    next_relay_retry = time.time() + 10
     next_boundary = (int(time.time()) // GRANULARITY_SECONDS + 1) * GRANULARITY_SECONDS
     async with websockets.connect(PUBLIC_WS_URL, open_timeout=15, close_timeout=5) as ws:
         await ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1, "req_id": 9601}))
@@ -133,6 +136,12 @@ async def run_forever(db_path: Path) -> None:
                 continue
             record_tick(tick, db_path)
             settle_from_recorded_ticks(db_path, now_epoch=int(tick["epoch"]))
+            if time.time() >= next_relay_retry:
+                try:
+                    await asyncio.to_thread(deliver_pending_relays, db_path)
+                except Exception as exc:
+                    print(json.dumps({"event": "V5_RELAY_ERROR", "error": str(exc)[:300]}), flush=True)
+                next_relay_retry = time.time() + 10
             if time.time() >= next_cleanup:
                 result = cleanup_raw_ticks(db_path)
                 print(json.dumps({"event": "V5_RETENTION_CLEANUP", **result}), flush=True)
@@ -161,4 +170,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

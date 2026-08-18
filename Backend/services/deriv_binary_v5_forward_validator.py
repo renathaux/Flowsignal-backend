@@ -120,6 +120,18 @@ def initialize_database(
                 created_at REAL NOT NULL,
                 FOREIGN KEY(signal_id) REFERENCES signals(signal_id)
             );
+            CREATE TABLE IF NOT EXISTS relay_outbox (
+                signal_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL,
+                last_error TEXT,
+                created_at REAL NOT NULL,
+                delivered_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_v5_relay_due
+            ON relay_outbox(status, next_attempt_at);
             """
         )
         started = int(collection_start_timestamp or time.time())
@@ -388,6 +400,30 @@ def record_observation(
                     observation["signal_id"], STRATEGY_VERSION, SPEC_SHA256,
                     json.dumps(decision_context, sort_keys=True, separators=(",", ":")),
                     json.dumps(final_ticks, sort_keys=True, separators=(",", ":")),
+                    now,
+                ),
+            )
+            relay_payload = {
+                "strategy_version": STRATEGY_VERSION,
+                "rule_hash": SPEC_SHA256,
+                "signal_id": observation["signal_id"],
+                "direction": observation["predicted_direction"],
+                "symbol": SYMBOL,
+                "decision_timestamp": int(observation["decision_candle_epoch"]),
+                "entry_timestamp": int(observation["entry_timestamp"]),
+                "entry_quote": float(observation["entry_price"]),
+                "entry_quote_epoch": int(observation["entry_quote_epoch"]),
+                "settlement_target_timestamp": int(observation["settlement_timestamp"]),
+            }
+            connection.execute(
+                """INSERT OR IGNORE INTO relay_outbox(
+                       signal_id, payload_json, status, attempts,
+                       next_attempt_at, created_at
+                   ) VALUES(?, ?, 'PENDING', 0, ?, ?)""",
+                (
+                    observation["signal_id"],
+                    json.dumps(relay_payload, sort_keys=True, separators=(",", ":")),
+                    now,
                     now,
                 ),
             )
