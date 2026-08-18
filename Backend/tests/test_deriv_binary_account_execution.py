@@ -19,6 +19,7 @@ from services.deriv_binary_execution_service import (
     DURATION, DURATION_UNIT, SYMBOL, account_settings, account_type,
     binary_accounts, binary_executions, execute_relayed_signal,
     execute_signal_candidates,
+    genuine_signal_validation, latest_relay_signal,
     save_account_settings, select_account, sync_accounts,
 )
 from services.deriv_v5_demo_relay_service import RULE_HASH, STRATEGY_VERSION, receive_signal
@@ -28,7 +29,7 @@ class AccountAwareBinaryExecutionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.engine = create_engine(f"sqlite:///{Path(self.temp.name) / 'binary.sqlite3'}")
-        self.signal_id = "GENUINE-V5-SIGNAL-1"
+        self.signal_id = f"{STRATEGY_VERSION}:{SYMBOL}:1000:RISE"
         body = json.dumps({
             "strategy_version": STRATEGY_VERSION, "rule_hash": RULE_HASH,
             "signal_id": self.signal_id, "direction": "RISE", "symbol": SYMBOL,
@@ -63,6 +64,18 @@ class AccountAwareBinaryExecutionTests(unittest.TestCase):
         save_account_settings(user, account["account_id"], enabled=enabled, stake=stake, engine=self.engine)
         private = {"access_token":"token","account":account,"account_id":account["account_id"]}
         return private
+
+    def insert_inbox(self, signal_id, *, strategy=STRATEGY_VERSION, rule_hash=RULE_HASH,
+                     symbol=SYMBOL, direction="RISE", entry_timestamp=2000, decision_timestamp=2000):
+        with self.engine.begin() as c:
+            c.exec_driver_sql(
+                """INSERT INTO deriv_v5_relay_signals(
+                   signal_id,strategy_version,rule_hash,direction,symbol,decision_timestamp,
+                   entry_timestamp,entry_quote,entry_quote_epoch,settlement_target_timestamp,
+                   payload_json,received_at,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (signal_id,strategy,rule_hash,direction,symbol,decision_timestamp,entry_timestamp,
+                 1.2,entry_timestamp,entry_timestamp+300,"{}",float(decision_timestamp),"RECEIVED"),
+            )
 
     def run_signal(self, private, user="u1", broker=None):
         broker = broker or (lambda *_: self.broker_result())
@@ -112,8 +125,10 @@ class AccountAwareBinaryExecutionTests(unittest.TestCase):
         self.assertEqual((seen["direction"],row["contract_type"],row["symbol"],row["duration"],row["duration_unit"]),("RISE","CALL",SYMBOL,5,"m"))
 
     def test_fall_maps_to_put_without_recalculation(self):
+        fall_id=f"{STRATEGY_VERSION}:{SYMBOL}:1000:FALL"
         with self.engine.begin() as c:
-            c.exec_driver_sql("UPDATE deriv_v5_relay_signals SET direction='FALL'")
+            c.exec_driver_sql("UPDATE deriv_v5_relay_signals SET direction='FALL', signal_id=?",(fall_id,))
+        self.signal_id=fall_id
         private=self.prepare(); self.run_signal(private,broker=lambda *_:self.broker_result("LOSS"))
         with self.engine.begin() as c: row=c.execute(select(binary_executions)).mappings().one()
         self.assertEqual((row["direction"],row["contract_type"],row["outcome"]),("FALL","PUT","LOSS"))
@@ -159,6 +174,43 @@ class AccountAwareBinaryExecutionTests(unittest.TestCase):
         calls={n.func.id for n in ast.walk(tree) if isinstance(n,ast.Call) and isinstance(n.func,ast.Name)}
         self.assertFalse(any("ctrader" in m.lower() or "forex" in m.lower() for m in modules))
         self.assertNotIn("place_market_order",calls)
+
+    def test_genuine_frozen_worker_signal_is_executable(self):
+        with self.engine.begin() as c:
+            row=c.exec_driver_sql("SELECT * FROM deriv_v5_relay_signals WHERE signal_id=?",(self.signal_id,)).mappings().one()
+        self.assertTrue(genuine_signal_validation(row)["valid"])
+
+    def test_all_non_genuine_identity_variants_are_blocked_before_broker(self):
+        invalid = [
+            ("TEST-V5-RELAY-20260818-A", STRATEGY_VERSION, RULE_HASH, SYMBOL, "RISE", 2000),
+            ("arbitrary-malformed-id", STRATEGY_VERSION, RULE_HASH, SYMBOL, "RISE", 2001),
+            (f"WRONG:{SYMBOL}:2002:RISE", "WRONG", RULE_HASH, SYMBOL, "RISE", 2002),
+            (f"{STRATEGY_VERSION}:{SYMBOL}:2003:RISE", STRATEGY_VERSION, "0"*64, SYMBOL, "RISE", 2003),
+            (f"{STRATEGY_VERSION}:R_100:2004:RISE", STRATEGY_VERSION, RULE_HASH, "R_100", "RISE", 2004),
+            (f"{STRATEGY_VERSION}:{SYMBOL}:2005:FALL", STRATEGY_VERSION, RULE_HASH, SYMBOL, "RISE", 2005),
+            (f"{STRATEGY_VERSION}:{SYMBOL}:invalid:RISE", STRATEGY_VERSION, RULE_HASH, SYMBOL, "RISE", 2006),
+            (f"{STRATEGY_VERSION}:{SYMBOL}:9999:RISE", STRATEGY_VERSION, RULE_HASH, SYMBOL, "RISE", 2007),
+        ]
+        broker_calls=[]
+        for signal_id,strategy,rule_hash,symbol,direction,entry in invalid:
+            with self.subTest(signal_id=signal_id):
+                self.insert_inbox(signal_id,strategy=strategy,rule_hash=rule_hash,symbol=symbol,direction=direction,entry_timestamp=entry,decision_timestamp=entry)
+                result=execute_relayed_signal("u","connection",signal_id,engine=self.engine,broker=lambda *_:broker_calls.append(1))
+                self.assertEqual(result["reason"],"NON_EXECUTABLE_V5_SIGNAL")
+        self.assertEqual(broker_calls,[])
+
+    def test_actionable_signal_retrieval_skips_newer_test_row(self):
+        self.insert_inbox("TEST-V5-RELAY-NEWEST",entry_timestamp=9999,decision_timestamp=9999)
+        actionable=latest_relay_signal(engine=self.engine)
+        self.assertEqual(actionable["signal_id"],self.signal_id)
+
+    def test_binary_auto_dispatch_cannot_reach_broker_for_test_row(self):
+        private=self.prepare(); calls=[]
+        self.insert_inbox("TEST-V5-RELAY-AUTO",entry_timestamp=3000,decision_timestamp=3000)
+        with patch("services.deriv_binary_execution_service.private_selected_account",return_value=private):
+            result=execute_signal_candidates("TEST-V5-RELAY-AUTO",engine=self.engine,broker=lambda *_:calls.append(1))
+        self.assertEqual(result[0]["reason"],"NON_EXECUTABLE_V5_SIGNAL")
+        self.assertEqual(calls,[])
 
 
 if __name__ == "__main__": unittest.main()

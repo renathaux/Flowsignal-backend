@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from typing import Any, Callable
 
@@ -28,6 +29,9 @@ DURATION = 5
 DURATION_UNIT = "m"
 DEFAULT_STAKE = 1.0
 REAL_EXECUTION_FLAG = "BINARY_REAL_EXECUTION_ENABLED"
+GENUINE_SIGNAL_ID = re.compile(
+    rf"^{re.escape(STRATEGY_VERSION)}:{re.escape(SYMBOL)}:(?P<timestamp>[1-9][0-9]*):(?P<direction>RISE|FALL)$"
+)
 
 metadata = MetaData()
 binary_accounts = Table(
@@ -86,6 +90,40 @@ def _engine(engine: Engine | None) -> Engine:
     chosen = engine or default_engine
     metadata.create_all(chosen)
     return chosen
+
+
+def genuine_signal_validation(signal: dict[str, Any]) -> dict[str, Any]:
+    """Positively identify a signal created by the frozen V5 worker.
+
+    Inbox persistence is deliberately broader than execution eligibility so
+    synthetic transport tests remain auditable without becoming actionable.
+    """
+    if signal.get("strategy_version") != STRATEGY_VERSION:
+        return {"valid": False, "reason": "V5_STRATEGY_VERSION_MISMATCH"}
+    if signal.get("rule_hash") != RULE_HASH:
+        return {"valid": False, "reason": "V5_RULE_HASH_MISMATCH"}
+    if signal.get("symbol") != SYMBOL:
+        return {"valid": False, "reason": "V5_SYMBOL_MISMATCH"}
+    direction = str(signal.get("direction") or "")
+    if direction not in {"RISE", "FALL"}:
+        return {"valid": False, "reason": "V5_DIRECTION_INVALID"}
+    match = GENUINE_SIGNAL_ID.fullmatch(str(signal.get("signal_id") or ""))
+    if not match:
+        return {"valid": False, "reason": "V5_SIGNAL_ID_INVALID"}
+    if match.group("direction") != direction:
+        return {"valid": False, "reason": "V5_SIGNAL_ID_DIRECTION_MISMATCH"}
+    try:
+        timestamp = int(match.group("timestamp"))
+        entry_timestamp = int(signal.get("entry_timestamp"))
+    except (TypeError, ValueError):
+        return {"valid": False, "reason": "V5_SIGNAL_TIMESTAMP_INVALID"}
+    if timestamp <= 0 or timestamp != entry_timestamp:
+        return {"valid": False, "reason": "V5_SIGNAL_TIMESTAMP_INVALID"}
+    return {"valid": True, "timestamp": timestamp, "direction": direction}
+
+
+def is_genuine_signal(signal: dict[str, Any]) -> bool:
+    return bool(genuine_signal_validation(signal)["valid"])
 
 
 def account_type(account: dict[str, Any]) -> str:
@@ -179,7 +217,8 @@ def save_account_settings(user_id: str, deriv_account_id: str, *, enabled: bool,
 def latest_relay_signal(*, engine: Engine | None = None) -> dict[str, Any]:
     chosen = _engine(engine)
     with chosen.begin() as connection:
-        row = connection.execute(select(relay_signals).order_by(relay_signals.c.decision_timestamp.desc()).limit(1)).mappings().first()
+        rows = connection.execute(select(relay_signals).order_by(relay_signals.c.decision_timestamp.desc())).mappings().all()
+    row = next((candidate for candidate in rows if is_genuine_signal(candidate)), None)
     if not row:
         return {"ok": True, "signal": "WAIT", "reason": "NO_RELAYED_V5_SIGNAL", "strategy_version": STRATEGY_VERSION, "rule_hash": RULE_HASH}
     return {"ok": True, "signal": row["direction"], "signal_id": row["signal_id"], "symbol": row["symbol"],
@@ -247,15 +286,20 @@ def deriv_broker(account_context: dict[str, Any], direction: str, stake: float, 
 
 def execute_relayed_signal(user_id: str, connection_id: str, signal_id: str, *, engine: Engine | None = None,
                            broker: Callable[[dict[str, Any], str, float, str], dict[str, Any]] = deriv_broker) -> dict[str, Any]:
-    chosen = _engine(engine); private = private_selected_account(connection_id, user_id)
+    chosen = _engine(engine)
+    with chosen.begin() as connection:
+        signal = connection.execute(select(relay_signals).where(relay_signals.c.signal_id == signal_id)).mappings().first()
+        if not signal: return {"ok":False,"reason":"AUTHORITATIVE_V5_SIGNAL_REQUIRED","broker_action":False}
+        validation = genuine_signal_validation(signal)
+        if not validation["valid"]:
+            return {"ok":False,"reason":"NON_EXECUTABLE_V5_SIGNAL","validation_reason":validation["reason"],"broker_action":False}
+    private = private_selected_account(connection_id, user_id)
     aid = private["account_id"]
     with chosen.begin() as connection:
         acct = connection.execute(select(binary_accounts).where((binary_accounts.c.user_id == user_id) &
             (binary_accounts.c.deriv_account_id == aid) & (binary_accounts.c.selected.is_(True)) &
             (binary_accounts.c.auth_state == "CONNECTED"))).mappings().first()
-        signal = connection.execute(select(relay_signals).where(relay_signals.c.signal_id == signal_id)).mappings().first()
         if not acct: return {"ok":False,"reason":"DERIV_ACCOUNT_IDENTITY_UNCERTAIN","broker_action":False}
-        if not signal: return {"ok":False,"reason":"AUTHORITATIVE_V5_SIGNAL_REQUIRED","broker_action":False}
         if not acct["binary_auto_enabled"]: return {"ok":False,"reason":"BINARY_AUTO_OFF","broker_action":False}
         if acct["account_type"] == "REAL" and not _real_enabled(): return {"ok":False,"reason":"REAL_BINARY_EXECUTION_DISABLED","broker_action":False}
         direction=signal["direction"]; contract_type="CALL" if direction=="RISE" else "PUT"; now=time.time()
@@ -287,6 +331,9 @@ def execute_signal_candidates(signal_id: str, *, engine: Engine | None = None,
     """
     chosen = _engine(engine)
     with chosen.begin() as connection:
+        signal = connection.execute(select(relay_signals).where(relay_signals.c.signal_id == signal_id)).mappings().first()
+        if not signal or not is_genuine_signal(signal):
+            return [{"ok": False, "reason": "NON_EXECUTABLE_V5_SIGNAL", "broker_action": False}]
         rows = connection.execute(select(binary_accounts).where(
             binary_accounts.c.selected.is_(True) & binary_accounts.c.binary_auto_enabled.is_(True) &
             (binary_accounts.c.auth_state == "CONNECTED")
