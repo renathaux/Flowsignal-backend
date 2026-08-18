@@ -2,6 +2,12 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Query
 
+from services.ctrader_transport_guard import install_ctrader_transport_guard
+
+# Install before importing/using cTrader market-data functions. The guard only
+# bounds read/auth requests; broker order/amend/close payloads are untouched.
+install_ctrader_transport_guard()
+
 from ctrader_connector import (
     get_ctrader_market_data,
     get_live_prices,
