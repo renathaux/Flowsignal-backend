@@ -1,7 +1,7 @@
 """Authenticated inbox for authoritative frozen-V5 signal relays.
 
-Receiving a signal never purchases a contract. Execution remains a separate,
-demo-account-only action gated by the persisted Binary Demo Auto setting.
+Receiving a signal never purchases a contract. Account-aware execution is a
+separate service gated by persisted per-user/account Binary Auto settings.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import os
 import time
 from typing import Any
 
-from sqlalchemy import Boolean, Column, Float, Integer, MetaData, String, Table, Text, UniqueConstraint, select
+from sqlalchemy import Column, Float, Integer, MetaData, String, Table, Text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
@@ -41,24 +41,6 @@ relay_signals = Table(
     Column("payload_json", Text, nullable=False),
     Column("received_at", Float, nullable=False),
     Column("status", String(32), nullable=False, default="RECEIVED"),
-)
-demo_settings = Table(
-    "deriv_binary_demo_settings", metadata,
-    Column("user_id", String(255), primary_key=True),
-    Column("enabled", Boolean, nullable=False, default=False),
-    Column("stake", Float, nullable=False, default=1.0),
-    Column("updated_at", Float, nullable=False),
-)
-executions = Table(
-    "deriv_v5_demo_executions", metadata,
-    Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("user_id", String(255), nullable=False),
-    Column("account_id", String(255), nullable=False),
-    Column("strategy_version", String(100), nullable=False),
-    Column("signal_id", String(255), nullable=False),
-    Column("status", String(32), nullable=False),
-    Column("created_at", Float, nullable=False),
-    UniqueConstraint("user_id", "account_id", "strategy_version", "signal_id", name="uq_deriv_v5_demo_execution"),
 )
 
 
@@ -107,32 +89,3 @@ def receive_signal(
     except IntegrityError:
         return {"ok": True, "duplicate": True, "signal_id": payload["signal_id"], "broker_action": False}
     return {"ok": True, "duplicate": False, "signal_id": payload["signal_id"], "broker_action": False}
-
-
-def binary_demo_auto(user_id: str, *, engine: Engine | None = None) -> dict[str, Any]:
-    chosen = _engine(engine)
-    with chosen.begin() as connection:
-        row = connection.execute(select(demo_settings).where(demo_settings.c.user_id == user_id)).mappings().first()
-    return {"user_id": user_id, "enabled": bool(row["enabled"]) if row else False, "stake": float(row["stake"]) if row else 1.0, "demo_only": True}
-
-
-def reserve_execution(user_id: str, account_id: str, signal_id: str, *, engine: Engine | None = None) -> dict[str, Any]:
-    chosen = _engine(engine)
-    setting = binary_demo_auto(user_id, engine=chosen)
-    if not setting["enabled"]:
-        return {"ok": False, "reason": "BINARY_DEMO_AUTO_OFF", "broker_action": False}
-    with chosen.begin() as connection:
-        signal = connection.execute(select(relay_signals).where(relay_signals.c.signal_id == signal_id)).mappings().first()
-        if not signal:
-            return {"ok": False, "reason": "AUTHORITATIVE_V5_SIGNAL_REQUIRED", "broker_action": False}
-        savepoint = connection.begin_nested()
-        try:
-            connection.execute(executions.insert().values(
-                user_id=user_id, account_id=account_id, strategy_version=STRATEGY_VERSION,
-                signal_id=signal_id, status="RESERVED", created_at=time.time(),
-            ))
-            savepoint.commit()
-        except IntegrityError:
-            savepoint.rollback()
-            return {"ok": False, "reason": "SIGNAL_ALREADY_EXECUTED", "broker_action": False}
-    return {"ok": True, "reserved": True, "broker_action": False}

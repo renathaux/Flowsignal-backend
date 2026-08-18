@@ -32,7 +32,8 @@ def public_config() -> dict[str, Any]:
         "redirect_uri": DERIV_REDIRECT_URI,
         "authorization_url": DERIV_AUTH_URL,
         "scope": "trade",
-        "demo_only": True,
+        "account_aware": True,
+        "real_execution_enabled": str(os.getenv("BINARY_REAL_EXECUTION_ENABLED", "false")).lower() in {"1", "true", "yes", "on"},
         "config_source": (
             "BINARY_DERIV_CLIENT_ID"
             if os.getenv("BINARY_DERIV_CLIENT_ID")
@@ -49,7 +50,9 @@ def _headers(access_token: str) -> dict[str, str]:
     }
 
 
-def exchange_authorization_code(code: str, code_verifier: str) -> dict[str, Any]:
+def exchange_authorization_code(code: str, code_verifier: str, *, user_id: str, selected_account_id: str | None = None) -> dict[str, Any]:
+    if not str(user_id or "").strip():
+        raise RuntimeError("FlowSignal user ID is required")
     response = requests.post(
         DERIV_TOKEN_URL,
         data={
@@ -86,7 +89,14 @@ def exchange_authorization_code(code: str, code_verifier: str) -> dict[str, Any]
             "created_at": now,
             "expires_at": now + max(60, expires_in),
             "accounts": accounts,
+            "user_id": str(user_id).strip(),
+            "selected_account_id": selected_account_id,
         }
+    from services.deriv_binary_execution_service import sync_accounts
+    normalized = sync_accounts(str(user_id).strip(), connection_id, accounts, selected_account_id=selected_account_id)
+    if not selected_account_id and len(normalized) == 1:
+        with _LOCK:
+            _CONNECTIONS[connection_id]["selected_account_id"] = normalized[0]["account_id"]
     return connection_snapshot(connection_id)
 
 
@@ -129,6 +139,11 @@ def _public_account(account: dict[str, Any]) -> dict[str, Any]:
     )
     result = {key: account.get(key) for key in safe_keys if key in account}
     result["demo_verified"] = _is_demo_account(account)
+    try:
+        from services.deriv_binary_execution_service import account_type
+        result["account_type_normalized"] = account_type(account)
+    except RuntimeError:
+        result["account_type_normalized"] = "UNKNOWN"
     return result
 
 
@@ -136,17 +151,19 @@ def connection_snapshot(connection_id: str) -> dict[str, Any]:
     with _LOCK:
         record = _CONNECTIONS.get(connection_id)
         if not record:
-            return {"connected": False, "demo_only": True}
+            return {"connected": False, "account_aware": True}
         if float(record.get("expires_at") or 0) <= time.time():
             _CONNECTIONS.pop(connection_id, None)
-            return {"connected": False, "expired": True, "demo_only": True}
+            return {"connected": False, "expired": True, "account_aware": True}
         accounts = list(record.get("accounts") or [])
     public_accounts = [_public_account(item) for item in accounts]
     demos = [item for item in public_accounts if item.get("demo_verified")]
     return {
         "connected": True,
         "connection_id": connection_id,
-        "demo_only": True,
+        "account_aware": True,
+        "user_id": record.get("user_id"),
+        "selected_account_id": record.get("selected_account_id"),
         "accounts": public_accounts,
         "demo_accounts": demos,
         "demo_account_verified": bool(demos),
@@ -157,6 +174,41 @@ def connection_snapshot(connection_id: str) -> dict[str, Any]:
 def disconnect(connection_id: str) -> None:
     with _LOCK:
         _CONNECTIONS.pop(connection_id, None)
+    from services.deriv_binary_execution_service import disconnect_accounts
+    disconnect_accounts(connection_id)
+
+
+def set_selected_account(connection_id: str, user_id: str, account_id: str) -> dict[str, Any]:
+    with _LOCK:
+        record = _CONNECTIONS.get(connection_id)
+        if not record or record.get("user_id") != user_id:
+            raise RuntimeError("DERIV_CONNECTION_USER_MISMATCH")
+        accounts = list(record.get("accounts") or [])
+        ids = {str(a.get("account_id") or a.get("id") or a.get("loginid") or "").strip() for a in accounts}
+        if account_id not in ids:
+            raise RuntimeError("DERIV_SELECTED_ACCOUNT_NOT_AUTHORIZED")
+        record["selected_account_id"] = account_id
+    from services.deriv_binary_execution_service import select_account
+    select_account(user_id, connection_id, account_id)
+    return connection_snapshot(connection_id)
+
+
+def private_selected_account(connection_id: str, user_id: str) -> dict[str, Any]:
+    snapshot = connection_snapshot(connection_id)
+    if not snapshot.get("connected"):
+        raise RuntimeError("DERIV_NOT_CONNECTED")
+    with _LOCK:
+        record = _CONNECTIONS.get(connection_id)
+        if not record or record.get("user_id") != user_id:
+            raise RuntimeError("DERIV_CONNECTION_USER_MISMATCH")
+        selected = str(record.get("selected_account_id") or "").strip()
+        if not selected:
+            raise RuntimeError("DERIV_ACCOUNT_SELECTION_REQUIRED")
+        account = next((a for a in record.get("accounts") or [] if str(a.get("account_id") or a.get("id") or a.get("loginid") or "").strip() == selected), None)
+        token = str(record.get("access_token") or "").strip()
+    if not account or not token:
+        raise RuntimeError("DERIV_ACCOUNT_IDENTITY_UNCERTAIN")
+    return {"access_token": token, "account": account, "account_id": selected}
 
 
 def assert_demo_connection(connection_id: str) -> dict[str, Any]:

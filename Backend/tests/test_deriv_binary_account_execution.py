@@ -1,0 +1,164 @@
+import ast
+import hashlib
+import hmac
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from sqlalchemy import create_engine, func, select
+
+BACKEND = Path(__file__).resolve().parents[1]
+if str(BACKEND) not in sys.path:
+    sys.path.insert(0, str(BACKEND))
+
+from services.deriv_binary_execution_service import (
+    DURATION, DURATION_UNIT, SYMBOL, account_settings, account_type,
+    binary_accounts, binary_executions, execute_relayed_signal,
+    execute_signal_candidates,
+    save_account_settings, select_account, sync_accounts,
+)
+from services.deriv_v5_demo_relay_service import RULE_HASH, STRATEGY_VERSION, receive_signal
+
+
+class AccountAwareBinaryExecutionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.engine = create_engine(f"sqlite:///{Path(self.temp.name) / 'binary.sqlite3'}")
+        self.signal_id = "GENUINE-V5-SIGNAL-1"
+        body = json.dumps({
+            "strategy_version": STRATEGY_VERSION, "rule_hash": RULE_HASH,
+            "signal_id": self.signal_id, "direction": "RISE", "symbol": SYMBOL,
+            "decision_timestamp": 1000, "entry_timestamp": 1000,
+            "entry_quote": 1.1, "entry_quote_epoch": 1000,
+            "settlement_target_timestamp": 1300,
+        }, separators=(",", ":")).encode()
+        sig = hmac.new(b"secret", b"1000." + body, hashlib.sha256).hexdigest()
+        receive_signal(body, "1000", sig, secret="secret", now=1000, engine=self.engine)
+
+    def tearDown(self):
+        self.engine.dispose(); self.temp.cleanup()
+
+    @staticmethod
+    def demo(aid="VIRTUAL123", currency="USD"):
+        return {"account_id": aid, "account_type": "virtual", "currency": currency, "balance": 10000}
+
+    @staticmethod
+    def real(aid="CR123", currency="USD"):
+        return {"account_id": aid, "account_type": "real", "currency": currency, "balance": 500}
+
+    @staticmethod
+    def broker_result(outcome="WIN"):
+        return {"proposal_id":"p1","contract_id":"c1","transaction_id":"t1","buy_price":1.0,
+            "potential_payout":1.8,"purchase_timestamp":1100,"expiry_timestamp":1400,"broker_status":"WON" if outcome=="WIN" else "LOST",
+            "outcome":outcome,"profit_loss":0.8 if outcome=="WIN" else -1.0,"settlement_payout":1.8 if outcome=="WIN" else 0,
+            "settlement_timestamp":1400,"settlement_price":1.101,"raw":{"status":outcome.lower()}}
+
+    def prepare(self, user="u1", account=None, enabled=True, stake=2.5):
+        account = account or self.demo()
+        sync_accounts(user, "conn", [account], engine=self.engine)
+        save_account_settings(user, account["account_id"], enabled=enabled, stake=stake, engine=self.engine)
+        private = {"access_token":"token","account":account,"account_id":account["account_id"]}
+        return private
+
+    def run_signal(self, private, user="u1", broker=None):
+        broker = broker or (lambda *_: self.broker_result())
+        with patch("services.deriv_binary_execution_service.private_selected_account", return_value=private):
+            return execute_relayed_signal(user, "conn", self.signal_id, engine=self.engine, broker=broker)
+
+    def test_demo_and_real_are_authoritatively_recognized(self):
+        self.assertEqual(account_type(self.demo()), "DEMO")
+        self.assertEqual(account_type(self.real()), "REAL")
+        with self.assertRaisesRegex(RuntimeError, "TYPE_UNCERTAIN"):
+            account_type({"account_id":"x", "currency":"USD"})
+
+    def test_account_selection_never_falls_back(self):
+        sync_accounts("u1", "conn", [self.demo("V1"), self.real("R1")], selected_account_id="V1", engine=self.engine)
+        select_account("u1", "conn", "R1", engine=self.engine)
+        self.assertTrue(account_settings("u1", "R1", engine=self.engine)["selected"])
+        self.assertFalse(account_settings("u1", "V1", engine=self.engine)["selected"])
+        with self.assertRaisesRegex(RuntimeError, "NOT_AUTHORIZED"):
+            select_account("u1", "conn", "missing", engine=self.engine)
+
+    def test_settings_are_per_user_and_account(self):
+        sync_accounts("u1", "c1", [self.demo("V1"), self.real("R1")], selected_account_id="V1", engine=self.engine)
+        sync_accounts("u2", "c2", [self.demo("V2")], engine=self.engine)
+        save_account_settings("u1", "V1", enabled=True, stake=3, engine=self.engine)
+        save_account_settings("u1", "R1", enabled=False, stake=8, engine=self.engine)
+        save_account_settings("u2", "V2", enabled=True, stake=5, engine=self.engine)
+        self.assertEqual(account_settings("u1", "V1", engine=self.engine)["binary_stake"], 3)
+        self.assertEqual(account_settings("u1", "R1", engine=self.engine)["binary_stake"], 8)
+        self.assertEqual(account_settings("u2", "V2", engine=self.engine)["binary_stake"], 5)
+
+    def test_binary_auto_off_blocks_before_broker(self):
+        private=self.prepare(enabled=False); calls=[]
+        result=self.run_signal(private, broker=lambda *_: calls.append(1))
+        self.assertEqual(result["reason"], "BINARY_AUTO_OFF"); self.assertEqual(calls, [])
+
+    def test_real_reaches_policy_and_is_blocked_by_default_flag(self):
+        private=self.prepare(account=self.real(), enabled=True); calls=[]
+        with patch.dict(os.environ, {"BINARY_REAL_EXECUTION_ENABLED":"false"}):
+            result=self.run_signal(private, broker=lambda *_: calls.append(1))
+        self.assertEqual(result["reason"], "REAL_BINARY_EXECUTION_DISABLED"); self.assertEqual(calls, [])
+
+    def test_demo_executes_authoritative_rise_as_call_for_exactly_five_minutes(self):
+        private=self.prepare(); seen={}
+        def broker(_account,direction,stake,currency): seen.update(direction=direction,stake=stake,currency=currency); return self.broker_result()
+        self.assertTrue(self.run_signal(private,broker=broker)["executed"])
+        with self.engine.begin() as c: row=c.execute(select(binary_executions)).mappings().one()
+        self.assertEqual((seen["direction"],row["contract_type"],row["symbol"],row["duration"],row["duration_unit"]),("RISE","CALL",SYMBOL,5,"m"))
+
+    def test_fall_maps_to_put_without_recalculation(self):
+        with self.engine.begin() as c:
+            c.exec_driver_sql("UPDATE deriv_v5_relay_signals SET direction='FALL'")
+        private=self.prepare(); self.run_signal(private,broker=lambda *_:self.broker_result("LOSS"))
+        with self.engine.begin() as c: row=c.execute(select(binary_executions)).mappings().one()
+        self.assertEqual((row["direction"],row["contract_type"],row["outcome"]),("FALL","PUT","LOSS"))
+
+    def test_lifecycle_persists_proposal_contract_and_win(self):
+        private=self.prepare(); self.run_signal(private)
+        with self.engine.begin() as c: row=c.execute(select(binary_executions)).mappings().one()
+        self.assertEqual((row["proposal_id"],row["contract_id"],row["outcome"],row["profit_loss"]),("p1","c1","WIN",0.8))
+        self.assertEqual((row["strategy_version"],row["rule_hash"]),(STRATEGY_VERSION,RULE_HASH))
+
+    def test_same_signal_is_independent_across_accounts_but_duplicate_safe(self):
+        first=self.prepare("u1",self.demo("V1")); self.run_signal(first,"u1")
+        second=self.prepare("u2",self.demo("V2")); self.run_signal(second,"u2")
+        duplicate=self.run_signal(first,"u1")
+        self.assertEqual(duplicate["reason"],"SIGNAL_ALREADY_EXECUTED")
+        with self.engine.begin() as c: self.assertEqual(c.execute(select(func.count()).select_from(binary_executions)).scalar_one(),2)
+
+    def test_restart_safe_reserved_row_blocks_second_purchase(self):
+        private=self.prepare(); calls=[]
+        def failed(*_): calls.append(1); raise RuntimeError("transport uncertain")
+        with self.assertRaises(RuntimeError): self.run_signal(private,broker=failed)
+        self.assertEqual(self.run_signal(private,broker=lambda *_:calls.append(2))["reason"],"SIGNAL_ALREADY_EXECUTED")
+        self.assertEqual(calls,[1])
+
+    def test_candidate_dispatch_uses_each_selected_auto_account(self):
+        first=self.prepare("u1",self.demo("V1")); self.prepare("u2",self.demo("V2")); calls=[]
+        def selected(_connection,user):
+            aid="V1" if user=="u1" else "V2"; return {"access_token":"t","account":self.demo(aid),"account_id":aid}
+        with patch("services.deriv_binary_execution_service.private_selected_account",side_effect=selected):
+            results=execute_signal_candidates(self.signal_id,engine=self.engine,broker=lambda context,*_: calls.append(context["account_id"]) or self.broker_result())
+        self.assertEqual(sorted(calls),["V1","V2"]); self.assertTrue(all(r["ok"] for r in results))
+
+    def test_invalid_stake_and_currency_are_blocked(self):
+        sync_accounts("u1","c",[self.demo()],engine=self.engine)
+        with self.assertRaisesRegex(RuntimeError,"STAKE_INVALID"): save_account_settings("u1","VIRTUAL123",enabled=True,stake=0,engine=self.engine)
+        with self.assertRaisesRegex(RuntimeError,"CURRENCY_UNCERTAIN"): sync_accounts("u2","c",[{"account_id":"V2","account_type":"demo"}],engine=self.engine)
+
+    def test_service_has_no_forex_or_ctrader_dependency(self):
+        source=(BACKEND/"services"/"deriv_binary_execution_service.py").read_text()
+        tree=ast.parse(source)
+        modules={n.module for n in ast.walk(tree) if isinstance(n,ast.ImportFrom) and n.module}
+        modules.update(a.name for n in ast.walk(tree) if isinstance(n,ast.Import) for a in n.names)
+        calls={n.func.id for n in ast.walk(tree) if isinstance(n,ast.Call) and isinstance(n.func,ast.Name)}
+        self.assertFalse(any("ctrader" in m.lower() or "forex" in m.lower() for m in modules))
+        self.assertNotIn("place_market_order",calls)
+
+
+if __name__ == "__main__": unittest.main()

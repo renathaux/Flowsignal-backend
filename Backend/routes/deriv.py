@@ -1,16 +1,20 @@
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from pydantic import BaseModel
 
 from services.deriv_service import (
-    assert_demo_connection,
     connection_snapshot,
     disconnect,
     exchange_authorization_code,
     public_config,
+    set_selected_account,
 )
-from services.deriv_demo_execution_service import (
-    execute_demo_signal,
-    execution_snapshot,
+from services.deriv_binary_execution_service import (
+    account_settings,
+    execute_relayed_signal,
+    execute_signal_candidates,
+    execution_snapshot as account_execution_snapshot,
+    latest_relay_signal,
+    save_account_settings,
 )
 from services.deriv_binary_strategy_service import binary_signal_snapshot
 from services.deriv_v5_demo_relay_service import receive_signal
@@ -19,14 +23,16 @@ router = APIRouter(prefix="/deriv", tags=["deriv"])
 
 
 @router.post("/v5/demo/relay")
-async def receive_v5_demo_relay(request: Request):
+async def receive_v5_demo_relay(request: Request, background_tasks: BackgroundTasks):
     body = await request.body()
     try:
-        return receive_signal(
+        result = receive_signal(
             body,
             request.headers.get("X-FlowSignal-Relay-Timestamp", ""),
             request.headers.get("X-FlowSignal-Relay-Signature", ""),
         )
+        background_tasks.add_task(execute_signal_candidates, result["signal_id"])
+        return result
     except RuntimeError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
@@ -34,15 +40,30 @@ async def receive_v5_demo_relay(request: Request):
 class DerivExchangeRequest(BaseModel):
     code: str
     code_verifier: str
+    user_id: str
+    selected_account_id: str | None = None
 
 
 class DerivConnectionRequest(BaseModel):
     connection_id: str
 
 
-class DerivDemoSignalRequest(BaseModel):
+class DerivAccountSelectionRequest(BaseModel):
     connection_id: str
-    signal: str
+    user_id: str
+    deriv_account_id: str
+
+
+class BinaryAccountSettingsRequest(BaseModel):
+    user_id: str
+    deriv_account_id: str
+    enabled: bool
+    stake: float
+
+
+class BinaryV5ExecutionRequest(BaseModel):
+    connection_id: str
+    user_id: str
     signal_id: str
 
 
@@ -57,6 +78,12 @@ def get_deriv_binary_signal():
     return binary_signal_snapshot()
 
 
+@router.get("/binary/v5/signal")
+def get_authoritative_v5_signal():
+    """Latest persisted authenticated V5 relay; no strategy recomputation."""
+    return latest_relay_signal()
+
+
 @router.post("/oauth/exchange")
 def exchange_deriv_code(request: DerivExchangeRequest):
     code = request.code.strip()
@@ -64,7 +91,7 @@ def exchange_deriv_code(request: DerivExchangeRequest):
     if not code or len(verifier) < 43:
         raise HTTPException(status_code=400, detail="Invalid OAuth code or PKCE verifier")
     try:
-        return exchange_authorization_code(code, verifier)
+        return exchange_authorization_code(code, verifier, user_id=request.user_id.strip(), selected_account_id=request.selected_account_id)
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -80,40 +107,43 @@ def disconnect_deriv(request: DerivConnectionRequest):
     return {"ok": True, "connected": False, "demo_only": True}
 
 
-@router.post("/demo/guard")
-def verify_demo_guard(request: DerivConnectionRequest):
+@router.post("/account/select")
+def select_deriv_account(request: DerivAccountSelectionRequest):
     try:
-        snapshot = assert_demo_connection(request.connection_id.strip())
+        return set_selected_account(request.connection_id.strip(), request.user_id.strip(), request.deriv_account_id.strip())
     except RuntimeError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
-    return {
-        "ok": True,
-        "demo_only": True,
-        "execution_enabled": True,
-        "real_money_enabled": False,
-        "message": "Demo account verified. Binary execution is demo-only.",
-        "demo_accounts": snapshot.get("demo_accounts", []),
-    }
 
 
-@router.post("/demo/execute-signal")
-def execute_binary_demo_signal(request: DerivDemoSignalRequest):
-    """Execute one isolated EURUSD Rise/Fall contract on Deriv demo only."""
+@router.post("/binary/account-settings")
+def update_binary_account_settings(request: BinaryAccountSettingsRequest):
     try:
-        return execute_demo_signal(
-            request.connection_id.strip(),
-            request.signal,
-            request.signal_id,
-        )
+        return save_account_settings(request.user_id.strip(), request.deriv_account_id.strip(), enabled=request.enabled, stake=request.stake)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/binary/account-settings/{user_id}/{deriv_account_id}")
+def get_binary_account_settings(user_id: str, deriv_account_id: str):
+    try:
+        return account_settings(user_id.strip(), deriv_account_id.strip())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/binary/v5/execute")
+def execute_authoritative_v5(request: BinaryV5ExecutionRequest):
+    try:
+        return execute_relayed_signal(request.user_id.strip(), request.connection_id.strip(), request.signal_id.strip())
     except RuntimeError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Deriv demo execution failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"Deriv Binary execution failed: {exc}") from exc
 
 
-@router.post("/demo/execution-status")
-def get_binary_demo_execution_status(request: DerivConnectionRequest):
+@router.get("/binary/execution-status/{user_id}/{deriv_account_id}")
+def get_account_execution_status(user_id: str, deriv_account_id: str):
     try:
-        return execution_snapshot(request.connection_id.strip())
+        return account_execution_snapshot(user_id.strip(), deriv_account_id.strip())
     except RuntimeError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=str(exc)) from exc

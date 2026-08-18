@@ -20,11 +20,7 @@ from services.deriv_binary_v5_forward_validator import (
     initialize_database,
     record_observation,
 )
-from services.deriv_v5_demo_relay_service import (
-    demo_settings,
-    receive_signal,
-    reserve_execution,
-)
+from services.deriv_v5_demo_relay_service import receive_signal
 from services.deriv_v5_signal_relay import deliver_pending_relays, sign_relay_payload
 
 
@@ -127,19 +123,15 @@ class V5RelayTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "V5_RELAY_SIGNATURE_EXPIRED"):
             receive_signal(body, str(timestamp), signature, secret="secret", now=6000, engine=self.engine)
 
-    def test_demo_auto_default_off_and_execution_key_is_per_user_account(self):
+    def test_receiver_only_persists_inbox_and_never_execution_state(self):
         record_observation(self.observation, self.research_db)
         body = self._queued_body(); timestamp = 5000
         receive_signal(body, str(timestamp), sign_relay_payload(body, timestamp, "secret"),
                        secret="secret", now=timestamp, engine=self.engine)
-        signal_id = self.observation["signal_id"]
-        self.assertEqual(reserve_execution("u1", "demo-a", signal_id, engine=self.engine)["reason"], "BINARY_DEMO_AUTO_OFF")
         with self.engine.begin() as connection:
-            connection.execute(demo_settings.insert().values(user_id="u1", enabled=True, stake=1.0, updated_at=1.0))
-            connection.execute(demo_settings.insert().values(user_id="u2", enabled=True, stake=1.0, updated_at=1.0))
-        self.assertTrue(reserve_execution("u1", "demo-a", signal_id, engine=self.engine)["reserved"])
-        self.assertEqual(reserve_execution("u1", "demo-a", signal_id, engine=self.engine)["reason"], "SIGNAL_ALREADY_EXECUTED")
-        self.assertTrue(reserve_execution("u2", "demo-b", signal_id, engine=self.engine)["reserved"])
+            tables = {row[0] for row in connection.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertIn("deriv_v5_relay_signals", tables)
+            self.assertNotIn("deriv_binary_executions", tables)
 
     def test_authoritative_payload_preserves_v5_identity_and_direction(self):
         record_observation(self.observation, self.research_db)
