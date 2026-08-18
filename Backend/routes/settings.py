@@ -1,9 +1,11 @@
 from fastapi import APIRouter, HTTPException
 
+from routes.deriv import router as deriv_router
 from services.risk_service import get_risk_settings, update_risk_settings
 from services.settings_service import load_feature_flags, save_feature_flags
 
 router = APIRouter()
+router.include_router(deriv_router)
 
 
 @router.get("/settings/risk")
