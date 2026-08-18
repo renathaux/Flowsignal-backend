@@ -5,14 +5,14 @@ cTrader execution. It reads Deriv public EURUSD 5-minute candles and answers a
 single binary question: is the next 5-minute expiry more likely to finish above
 or below the entry price?
 
-Outputs: RISE, FALL, or WAIT. No SL/TP/RR concepts are used here.
+Entry is intentionally price-action driven: bullish/bearish engulfing plus a
+small 5-minute break of structure (tiny BOS). EMA, SL, TP and RR are not used.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import math
 import time
 from typing import Any
 
@@ -22,33 +22,6 @@ SYMBOL = "frxEURUSD"
 GRANULARITY_SECONDS = 300
 CANDLE_COUNT = 60
 PUBLIC_WS_URL = "wss://ws.binaryws.com/websockets/v3"
-
-
-def _ema(values: list[float], period: int) -> float:
-    if not values:
-        return 0.0
-    alpha = 2.0 / (period + 1.0)
-    ema = values[0]
-    for value in values[1:]:
-        ema = (value * alpha) + (ema * (1.0 - alpha))
-    return ema
-
-
-def _rsi(values: list[float], period: int = 7) -> float:
-    if len(values) < period + 1:
-        return 50.0
-    gains: list[float] = []
-    losses: list[float] = []
-    for previous, current in zip(values[-(period + 1):-1], values[-period:]):
-        change = current - previous
-        gains.append(max(change, 0.0))
-        losses.append(max(-change, 0.0))
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-    if avg_loss <= 0:
-        return 100.0 if avg_gain > 0 else 50.0
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
 
 
 def _atr(candles: list[dict[str, float]], period: int = 10) -> float:
@@ -116,12 +89,36 @@ def _closed_candles(candles: list[dict[str, float]]) -> list[dict[str, float]]:
     return [candle for candle in candles if int(candle["epoch"]) < current_bucket]
 
 
+def _bullish_engulfing(previous: dict[str, float], current: dict[str, float]) -> bool:
+    previous_bearish = previous["close"] < previous["open"]
+    current_bullish = current["close"] > current["open"]
+    if not previous_bearish or not current_bullish:
+        return False
+    previous_body_low = min(previous["open"], previous["close"])
+    previous_body_high = max(previous["open"], previous["close"])
+    current_body_low = min(current["open"], current["close"])
+    current_body_high = max(current["open"], current["close"])
+    return current_body_low <= previous_body_low and current_body_high >= previous_body_high
+
+
+def _bearish_engulfing(previous: dict[str, float], current: dict[str, float]) -> bool:
+    previous_bullish = previous["close"] > previous["open"]
+    current_bearish = current["close"] < current["open"]
+    if not previous_bullish or not current_bearish:
+        return False
+    previous_body_low = min(previous["open"], previous["close"])
+    previous_body_high = max(previous["open"], previous["close"])
+    current_body_low = min(current["open"], current["close"])
+    current_body_high = max(current["open"], current["close"])
+    return current_body_low <= previous_body_low and current_body_high >= previous_body_high
+
+
 def _evaluate(candles: list[dict[str, float]]) -> dict[str, Any]:
     closed = _closed_candles(candles)
-    if len(closed) < 20:
+    if len(closed) < 12:
         return {
             "ok": True,
-            "strategy": "DERIV_NATIVE_5M_V1",
+            "strategy": "DERIV_NATIVE_5M_V2_PRICE_ACTION",
             "symbol": SYMBOL,
             "timeframe": "5m",
             "expiry_minutes": 5,
@@ -131,106 +128,64 @@ def _evaluate(candles: list[dict[str, float]]) -> dict[str, Any]:
             "signal_id": None,
         }
 
-    closes = [c["close"] for c in closed]
     last = closed[-1]
     previous = closed[-2]
-    ema_fast = _ema(closes[-20:], 5)
-    ema_slow = _ema(closes[-30:], 12)
-    rsi7 = _rsi(closes, 7)
     atr10 = _atr(closed, 10)
+
+    bullish_engulfing = _bullish_engulfing(previous, last)
+    bearish_engulfing = _bearish_engulfing(previous, last)
+
+    # Tiny BOS: the engulfing candle must CLOSE through the nearest micro
+    # structure made by the prior two completed candles. A very small ATR
+    # buffer prevents equality/one-tick noise from counting as a break.
+    micro_reference = closed[-4:-2]
+    micro_high = max(c["high"] for c in micro_reference)
+    micro_low = min(c["low"] for c in micro_reference)
+    bos_buffer = max(atr10 * 0.03, 0.000005) if atr10 > 0 else 0.000005
+    tiny_bos_up = last["close"] > (micro_high + bos_buffer)
+    tiny_bos_down = last["close"] < (micro_low - bos_buffer)
 
     last_range = max(last["high"] - last["low"], 1e-9)
     body = last["close"] - last["open"]
     body_ratio = abs(body) / last_range
     upper_wick = last["high"] - max(last["open"], last["close"])
     lower_wick = min(last["open"], last["close"]) - last["low"]
-
     momentum_1 = last["close"] - previous["close"]
     momentum_3 = last["close"] - closed[-4]["close"]
-    normalized_momentum = (momentum_3 / atr10) if atr10 > 0 else 0.0
-
-    recent_high = max(c["high"] for c in closed[-6:-1])
-    recent_low = min(c["low"] for c in closed[-6:-1])
-    breakout_up = last["close"] > recent_high
-    breakout_down = last["close"] < recent_low
-
-    rise_score = 0.0
-    fall_score = 0.0
-    reasons: list[str] = []
-
-    if ema_fast > ema_slow:
-        rise_score += 2.0
-        reasons.append("FAST_EMA_ABOVE_SLOW")
-    elif ema_fast < ema_slow:
-        fall_score += 2.0
-        reasons.append("FAST_EMA_BELOW_SLOW")
-
-    if momentum_1 > 0:
-        rise_score += 1.0
-    elif momentum_1 < 0:
-        fall_score += 1.0
-
-    if normalized_momentum >= 0.35:
-        rise_score += 1.5
-        reasons.append("POSITIVE_3BAR_MOMENTUM")
-    elif normalized_momentum <= -0.35:
-        fall_score += 1.5
-        reasons.append("NEGATIVE_3BAR_MOMENTUM")
-
-    if body > 0 and body_ratio >= 0.55:
-        rise_score += 1.25
-        reasons.append("STRONG_BULLISH_CLOSE")
-    elif body < 0 and body_ratio >= 0.55:
-        fall_score += 1.25
-        reasons.append("STRONG_BEARISH_CLOSE")
-
-    if breakout_up:
-        rise_score += 1.5
-        reasons.append("5M_RANGE_BREAK_UP")
-    elif breakout_down:
-        fall_score += 1.5
-        reasons.append("5M_RANGE_BREAK_DOWN")
-
-    if lower_wick > abs(body) * 1.25 and last["close"] > last["open"]:
-        rise_score += 0.75
-        reasons.append("LOWER_WICK_REJECTION")
-    if upper_wick > abs(body) * 1.25 and last["close"] < last["open"]:
-        fall_score += 0.75
-        reasons.append("UPPER_WICK_REJECTION")
-
-    if 52 <= rsi7 <= 72:
-        rise_score += 0.75
-    elif 28 <= rsi7 <= 48:
-        fall_score += 0.75
-    elif rsi7 > 78:
-        rise_score -= 0.75
-    elif rsi7 < 22:
-        fall_score -= 0.75
-
-    dominant = max(rise_score, fall_score)
-    opposing = min(rise_score, fall_score)
-    edge = dominant - opposing
+    momentum_3_atr = (momentum_3 / atr10) if atr10 > 0 else 0.0
 
     signal = "WAIT"
-    if rise_score >= 4.25 and edge >= 1.75:
-        signal = "RISE"
-    elif fall_score >= 4.25 and edge >= 1.75:
-        signal = "FALL"
-
+    reason = "WAIT_FOR_ENGULFING_AND_TINY_BOS"
     confidence = 0
-    if signal != "WAIT":
-        confidence = int(round(min(92.0, max(55.0, 55.0 + dominant * 5.0 + edge * 2.5))))
 
-    reason = "NO_CLEAR_5M_BINARY_EDGE"
-    if signal != "WAIT":
-        reason = ",".join(reasons[-5:]) or "5M_BINARY_EDGE"
+    if bullish_engulfing and tiny_bos_up:
+        signal = "RISE"
+        reason = "BULLISH_ENGULFING+TINY_BOS_UP"
+        confidence = 70
+        if body_ratio >= 0.60:
+            confidence += 7
+        if momentum_1 > 0 and momentum_3_atr >= 0.25:
+            confidence += 6
+        if lower_wick > upper_wick:
+            confidence += 4
+    elif bearish_engulfing and tiny_bos_down:
+        signal = "FALL"
+        reason = "BEARISH_ENGULFING+TINY_BOS_DOWN"
+        confidence = 70
+        if body_ratio >= 0.60:
+            confidence += 7
+        if momentum_1 < 0 and momentum_3_atr <= -0.25:
+            confidence += 6
+        if upper_wick > lower_wick:
+            confidence += 4
 
+    confidence = min(confidence, 90)
     candle_epoch = int(last["epoch"])
     signal_id = f"{SYMBOL}:{candle_epoch}:{signal}" if signal != "WAIT" else None
 
     return {
         "ok": True,
-        "strategy": "DERIV_NATIVE_5M_V1",
+        "strategy": "DERIV_NATIVE_5M_V2_PRICE_ACTION",
         "symbol": SYMBOL,
         "timeframe": "5m",
         "expiry_minutes": 5,
@@ -240,15 +195,20 @@ def _evaluate(candles: list[dict[str, float]]) -> dict[str, Any]:
         "signal_id": signal_id,
         "candle_epoch": candle_epoch,
         "entry_reference": last["close"],
+        "setup": {
+            "bullish_engulfing": bullish_engulfing,
+            "bearish_engulfing": bearish_engulfing,
+            "tiny_bos_up": tiny_bos_up,
+            "tiny_bos_down": tiny_bos_down,
+            "micro_high": round(micro_high, 6),
+            "micro_low": round(micro_low, 6),
+            "bos_buffer": round(bos_buffer, 6),
+        },
         "metrics": {
-            "ema5": round(ema_fast, 6),
-            "ema12": round(ema_slow, 6),
-            "rsi7": round(rsi7, 2),
             "atr10": round(atr10, 6),
             "body_ratio": round(body_ratio, 3),
-            "momentum_3_atr": round(normalized_momentum, 3),
-            "rise_score": round(rise_score, 2),
-            "fall_score": round(fall_score, 2),
+            "momentum_1": round(momentum_1, 6),
+            "momentum_3_atr": round(momentum_3_atr, 3),
         },
     }
 
@@ -260,7 +220,7 @@ def binary_signal_snapshot() -> dict[str, Any]:
     except Exception as exc:
         return {
             "ok": False,
-            "strategy": "DERIV_NATIVE_5M_V1",
+            "strategy": "DERIV_NATIVE_5M_V2_PRICE_ACTION",
             "symbol": SYMBOL,
             "timeframe": "5m",
             "expiry_minutes": 5,
