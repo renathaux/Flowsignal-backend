@@ -12,6 +12,7 @@ from services.deriv_demo_execution_service import (
     execute_demo_signal,
     execution_snapshot,
 )
+from services.deriv_binary_strategy_service import binary_signal_snapshot
 
 router = APIRouter(prefix="/deriv", tags=["deriv"])
 
@@ -34,6 +35,12 @@ class DerivDemoSignalRequest(BaseModel):
 @router.get("/config")
 def get_deriv_config():
     return public_config()
+
+
+@router.get("/binary/signal")
+def get_deriv_binary_signal():
+    """Return the isolated Deriv-native 5m RISE/FALL/WAIT decision."""
+    return binary_signal_snapshot()
 
 
 @router.post("/oauth/exchange")
