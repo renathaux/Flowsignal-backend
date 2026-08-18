@@ -46,7 +46,6 @@ async def _fetch_candles_async() -> list[dict[str, float]]:
             "count": CANDLE_COUNT,
             "style": "candles",
             "granularity": GRANULARITY_SECONDS,
-            "subscribe": 0,
             "req_id": 501,
         }))
         deadline = time.monotonic() + 12.0
@@ -59,8 +58,6 @@ async def _fetch_candles_async() -> list[dict[str, float]]:
             if not isinstance(payload, dict):
                 continue
 
-            # Current Deriv API errors use an `errors` array; retain legacy
-            # `error` handling too so failures surface with the real message.
             errors = payload.get("errors")
             if isinstance(errors, list) and errors:
                 first = errors[0] if isinstance(errors[0], dict) else {}
@@ -69,9 +66,6 @@ async def _fetch_candles_async() -> list[dict[str, float]]:
                 error = payload.get("error") or {}
                 raise RuntimeError(str(error.get("message") or error.get("code") or "Deriv candle error"))
 
-            # New Deriv responses do not guarantee request echo metadata. Do
-            # not discard a valid candle response merely because req_id is
-            # absent; identify the response by its candle payload/msg_type.
             rows = payload.get("candles")
             if rows is None and payload.get("msg_type") not in ("candles", "history"):
                 continue
