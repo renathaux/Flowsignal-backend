@@ -4,16 +4,15 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from services.user_auth_service import (
-    SESSION_COOKIE,
     authenticate,
     clear_session_cookie,
     create_session,
     current_user,
     current_user_with_csrf,
     public_user,
+    request_session_token,
     revoke_session,
     session_snapshot,
-    set_session_cookie,
     signup,
 )
 
@@ -35,8 +34,14 @@ def create_account(payload: SignupRequest, response: Response):
     try:
         user = signup(payload.email, payload.password)
         token, csrf, expires = create_session(user["id"])
-        set_session_cookie(response, token)
-        return {"ok": True, "user": user, "csrf_token": csrf, "expires_at": expires}
+        clear_session_cookie(response)
+        return {
+            "ok": True,
+            "user": user,
+            "session_token": token,
+            "csrf_token": csrf,
+            "expires_at": expires,
+        }
     except RuntimeError as exc:
         code = str(exc)
         status = 409 if code == "EMAIL_ALREADY_REGISTERED" else 400
@@ -48,15 +53,22 @@ def login(payload: LoginRequest, response: Response):
     try:
         row = authenticate(payload.email, payload.password)
         token, csrf, expires = create_session(str(row["id"]))
-        set_session_cookie(response, token)
-        return {"ok": True, "user": public_user(row), "csrf_token": csrf, "expires_at": expires}
+        clear_session_cookie(response)
+        return {
+            "ok": True,
+            "user": public_user(row),
+            "session_token": token,
+            "csrf_token": csrf,
+            "expires_at": expires,
+        }
     except RuntimeError as exc:
         raise HTTPException(status_code=401, detail="INVALID_EMAIL_OR_PASSWORD") from exc
 
 
 @router.get("/session")
 def session(request: Request):
-    snapshot = session_snapshot(request.cookies.get(SESSION_COOKIE, ""))
+    token, _source = request_session_token(request)
+    snapshot = session_snapshot(token)
     if not snapshot:
         return {"ok": True, "authenticated": False}
     user, csrf = snapshot
@@ -71,8 +83,10 @@ def session(request: Request):
 @router.post("/logout")
 def logout(request: Request, response: Response):
     current_user_with_csrf(request)
-    revoke_session(request.cookies.get(SESSION_COOKIE, ""))
-    clear_session_cookie(response)
+    token, source = request_session_token(request)
+    revoke_session(token)
+    if source == "cookie":
+        clear_session_cookie(response)
     return {"ok": True, "authenticated": False}
 
 
