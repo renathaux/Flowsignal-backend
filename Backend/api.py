@@ -116,6 +116,7 @@ from risk_management.account_balance import (
 )
 from risk_management.broker_protection import (
     build_live_protection_audit as risk_build_live_protection_audit,
+    classify_stop_loss_change as risk_classify_stop_loss_change,
     live_prices_match as risk_live_prices_match,
 )
 from risk_management.position_sizing import (
@@ -8222,6 +8223,43 @@ def sync_live_positions(panel_data=None):
                     or not live_prices_match(symbol, broker_synced_tp2, saved_tp2)
                 )
             )
+
+            broker_sl_change = risk_classify_stop_loss_change(
+                symbol,
+                side,
+                broker_synced_sl,
+                saved_sl,
+                normalize_symbol=normalize_symbol,
+            )
+            broker_manual_sl_adopted = broker_sl_change == "MORE_PROTECTIVE"
+
+            if broker_manual_sl_adopted:
+                adopted_sl = float(broker_synced_sl)
+                saved_sl = adopted_sl
+                synced_sl = adopted_sl
+                levels_modified_at = time.time()
+                user_modified_levels = {
+                    **user_modified_levels,
+                    "sl": adopted_sl,
+                }
+                if isinstance(current_order, dict):
+                    current_order["sl"] = adopted_sl
+                    current_order["current_sl"] = adopted_sl
+                    current_order["user_modified_levels"] = copy.deepcopy(
+                        user_modified_levels
+                    )
+                    current_order["levels_modified_at"] = levels_modified_at
+                    current_order["manual_broker_sl_adopted"] = True
+                    current_order["manual_broker_sl_adopted_at"] = levels_modified_at
+                    persist_live_trade_state(current_order)
+                print("LIVE_MANUAL_BROKER_SL_ADOPTED =", {
+                    "symbol": symbol,
+                    "side": side,
+                    "position_id": position_id,
+                    "broker_sl": adopted_sl,
+                    "reason": "manual broker SL reduces risk",
+                })
+
             broker_sl_missing_or_mismatch = (
                 saved_sl is not None
                 and (
@@ -8539,6 +8577,15 @@ def sync_live_positions(panel_data=None):
                 ),
                 "levels_modified_at": levels_modified_at,
                 "user_modified_levels": user_modified_levels,
+                "manual_broker_sl_adopted": bool(
+                    broker_manual_sl_adopted
+                    or (current_order or {}).get("manual_broker_sl_adopted")
+                ),
+                "manual_broker_sl_adopted_at": (
+                    levels_modified_at
+                    if broker_manual_sl_adopted
+                    else (current_order or {}).get("manual_broker_sl_adopted_at")
+                ),
                 "raw": position.get("raw", position),
             }
             ensure_executed_snapshot_for_active_trade(mirrored_order, signal_plan)
