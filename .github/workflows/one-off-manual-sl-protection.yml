@@ -1,0 +1,84 @@
+name: One-off manual SL protection patch
+
+on:
+  push:
+    branches:
+      - codex/manual-sl-protection
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply surgical SL patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          broker_path = Path('Backend/risk_management/broker_protection.py')
+          api_path = Path('Backend/api.py')
+          test_path = Path('Backend/tests/test_manual_broker_sl_protection.py')
+          workflow_path = Path('.github/workflows/one-off-manual-sl-protection.yml')
+
+          broker = broker_path.read_text()
+          marker = 'def build_live_protection_audit(\n'
+          helper = '''def classify_stop_loss_change(\n    symbol,\n    side,\n    broker_sl,\n    saved_sl,\n    *,\n    normalize_symbol,\n):\n    \"\"\"Classify a broker SL relative to FlowSignal's last protected SL.\n\n    A manual broker move is considered MORE_PROTECTIVE only when it reduces\n    downside risk: higher for BUY, lower for SELL. Missing/invalid values are\n    never accepted as manual protection.\n    \"\"\"\n    if broker_sl in [None, \"\"]:\n        return \"MISSING\"\n    if saved_sl in [None, \"\"]:\n        return \"NO_BASELINE\"\n\n    try:\n        broker_value = float(broker_sl)\n        saved_value = float(saved_sl)\n    except (TypeError, ValueError):\n        return \"INVALID\"\n\n    normalized_symbol = normalize_symbol(symbol)\n    tolerance = 0.005 if normalized_symbol == \"XAUUSD\" else 0.000005\n    difference = broker_value - saved_value\n\n    if abs(difference) <= tolerance:\n        return \"MATCH\"\n\n    normalized_side = str(side or \"\").strip().upper()\n    if normalized_side in {\"BUY\", \"LONG\", \"1\"}:\n        return \"MORE_PROTECTIVE\" if difference > tolerance else \"LESS_PROTECTIVE\"\n    if normalized_side in {\"SELL\", \"SHORT\", \"2\"}:\n        return \"MORE_PROTECTIVE\" if difference < -tolerance else \"LESS_PROTECTIVE\"\n    return \"INVALID_SIDE\"\n\n\n'''
+          if 'def classify_stop_loss_change(' not in broker:
+              if marker not in broker:
+                  raise SystemExit('broker helper insertion marker not found')
+              broker = broker.replace(marker, helper + marker, 1)
+          broker_path.write_text(broker)
+
+          api = api_path.read_text()
+          old_import = '''from risk_management.broker_protection import (\n    build_live_protection_audit as risk_build_live_protection_audit,\n    live_prices_match as risk_live_prices_match,\n)'''
+          new_import = '''from risk_management.broker_protection import (\n    build_live_protection_audit as risk_build_live_protection_audit,\n    classify_stop_loss_change as risk_classify_stop_loss_change,\n    live_prices_match as risk_live_prices_match,\n)'''
+          if new_import not in api:
+              if api.count(old_import) != 1:
+                  raise SystemExit(f'expected one broker protection import, got {api.count(old_import)}')
+              api = api.replace(old_import, new_import, 1)
+
+          old_block = '''            broker_tp_repair_result = None\n            broker_tp_missing_or_mismatch = (\n                saved_tp2 is not None\n                and (\n                    broker_synced_tp2 is None\n                    or not live_prices_match(symbol, broker_synced_tp2, saved_tp2)\n                )\n            )\n            broker_sl_missing_or_mismatch = (\n                saved_sl is not None\n                and (\n                    broker_synced_sl is None\n                    or not live_prices_match(symbol, broker_synced_sl, saved_sl)\n                )\n            )\n            broker_sl_repair_result = None\n'''
+          new_block = '''            broker_tp_repair_result = None\n            broker_tp_missing_or_mismatch = (\n                saved_tp2 is not None\n                and (\n                    broker_synced_tp2 is None\n                    or not live_prices_match(symbol, broker_synced_tp2, saved_tp2)\n                )\n            )\n\n            broker_sl_change = risk_classify_stop_loss_change(\n                symbol,\n                side,\n                broker_synced_sl,\n                saved_sl,\n                normalize_symbol=normalize_symbol,\n            )\n            broker_manual_sl_adopted = broker_sl_change == \"MORE_PROTECTIVE\"\n\n            if broker_manual_sl_adopted:\n                adopted_sl = float(broker_synced_sl)\n                saved_sl = adopted_sl\n                synced_sl = adopted_sl\n                levels_modified_at = time.time()\n                user_modified_levels = {\n                    **user_modified_levels,\n                    \"sl\": adopted_sl,\n                }\n                if isinstance(current_order, dict):\n                    current_order[\"sl\"] = adopted_sl\n                    current_order[\"current_sl\"] = adopted_sl\n                    current_order[\"user_modified_levels\"] = copy.deepcopy(\n                        user_modified_levels\n                    )\n                    current_order[\"levels_modified_at\"] = levels_modified_at\n                    current_order[\"manual_broker_sl_adopted\"] = True\n                    current_order[\"manual_broker_sl_adopted_at\"] = (\n                        levels_modified_at\n                    )\n                    persist_live_trade_state(current_order)\n                print(\"LIVE_MANUAL_BROKER_SL_ADOPTED =\", {\n                    \"symbol\": symbol,\n                    \"side\": side,\n                    \"position_id\": position_id,\n                    \"previous_saved_sl\": (\n                        (current_order or {}).get(\"original_sl\")\n                        or planned_sl\n                    ),\n                    \"broker_sl\": adopted_sl,\n                    \"reason\": \"manual broker SL reduces risk\",\n                })\n\n            broker_sl_missing_or_mismatch = (\n                saved_sl is not None\n                and (\n                    broker_synced_sl is None\n                    or not live_prices_match(symbol, broker_synced_sl, saved_sl)\n                )\n            )\n            broker_sl_repair_result = None\n'''
+          if new_block not in api:
+              if api.count(old_block) != 1:
+                  raise SystemExit(f'expected one SL repair block, got {api.count(old_block)}')
+              api = api.replace(old_block, new_block, 1)
+
+          # Add the adopted state to mirrored broker rows so it survives subsequent syncs.
+          old_mirror = '''                \"levels_modified_at\": levels_modified_at,\n                \"user_modified_levels\": user_modified_levels,\n                \"raw\": position.get(\"raw\", position),\n'''
+          new_mirror = '''                \"levels_modified_at\": levels_modified_at,\n                \"user_modified_levels\": user_modified_levels,\n                \"manual_broker_sl_adopted\": bool(\n                    broker_manual_sl_adopted\n                    or (current_order or {}).get(\"manual_broker_sl_adopted\")\n                ),\n                \"manual_broker_sl_adopted_at\": (\n                    levels_modified_at\n                    if broker_manual_sl_adopted\n                    else (current_order or {}).get(\"manual_broker_sl_adopted_at\")\n                ),\n                \"raw\": position.get(\"raw\", position),\n'''
+          if new_mirror not in api:
+              if api.count(old_mirror) != 1:
+                  raise SystemExit(f'expected one mirrored level block, got {api.count(old_mirror)}')
+              api = api.replace(old_mirror, new_mirror, 1)
+          api_path.write_text(api)
+
+          test_path.write_text('''from risk_management.broker_protection import classify_stop_loss_change\n\n\ndef normalize_symbol(value):\n    return str(value or \"\").upper()\n\n\ndef classify(symbol, side, broker_sl, saved_sl):\n    return classify_stop_loss_change(\n        symbol, side, broker_sl, saved_sl, normalize_symbol=normalize_symbol\n    )\n\n\ndef test_buy_tighter_manual_sl_is_more_protective():\n    assert classify(\"EURUSD\", \"BUY\", 1.10100, 1.10000) == \"MORE_PROTECTIVE\"\n\n\ndef test_buy_wider_manual_sl_is_less_protective():\n    assert classify(\"EURUSD\", \"BUY\", 1.09900, 1.10000) == \"LESS_PROTECTIVE\"\n\n\ndef test_sell_tighter_manual_sl_is_more_protective():\n    assert classify(\"EURUSD\", \"SELL\", 1.09900, 1.10000) == \"MORE_PROTECTIVE\"\n\n\ndef test_sell_wider_manual_sl_is_less_protective():\n    assert classify(\"EURUSD\", \"SELL\", 1.10100, 1.10000) == \"LESS_PROTECTIVE\"\n\n\ndef test_missing_sl_is_never_adopted():\n    assert classify(\"EURUSD\", \"BUY\", None, 1.10000) == \"MISSING\"\n\n\ndef test_small_price_noise_counts_as_match():\n    assert classify(\"EURUSD\", \"BUY\", 1.100003, 1.100000) == \"MATCH\"\n\n\ndef test_gold_tolerance_avoids_false_manual_change():\n    assert classify(\"XAUUSD\", \"SELL\", 4350.003, 4350.000) == \"MATCH\"\n''')
+
+          # The one-off workflow must not remain in production history after it does its job.
+          workflow_path.unlink()
+          PY
+
+      - name: Verify patch
+        shell: bash
+        run: |
+          python -m py_compile Backend/risk_management/broker_protection.py Backend/api.py
+          cd Backend
+          python -m pytest -q tests/test_manual_broker_sl_protection.py
+
+      - name: Commit verified patch
+        shell: bash
+        run: |
+          git config user.name "FlowSignal Safety Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add Backend/api.py Backend/risk_management/broker_protection.py Backend/tests/test_manual_broker_sl_protection.py .github/workflows/one-off-manual-sl-protection.yml
+          git commit -m "Respect safer manual cTrader stop-loss moves"
+          git push origin HEAD:codex/manual-sl-protection
