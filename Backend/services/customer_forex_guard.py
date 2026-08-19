@@ -7,6 +7,11 @@ from fastapi.responses import JSONResponse
 # These are owner/global trading-state endpoints. Customer Forex remains
 # signal/read-only. The existing owner login token is preserved as authority.
 EXACT_PATHS = {
+    "/market-data-source",
+    "/paper-auto-toggle",
+    "/live-auto-toggle",
+    "/execute-trade",
+    "/execute-live-order",
     "/connect-ctrader",
     "/refresh-ctrader-accounts",
     "/set-active-ctrader-account",
@@ -14,8 +19,6 @@ EXACT_PATHS = {
     "/disconnect-ctrader",
     "/close-live-trade",
     "/modify-live-position-levels",
-    "/live-auto-toggle",
-    "/execute-trade",
     "/ctrader/disconnect",
     "/ctrader/accounts/refresh",
     "/ctrader/accounts/active",
@@ -24,6 +27,7 @@ EXACT_PATHS = {
 }
 PREFIX_PATHS = (
     "/settings/",
+    "/strategy/settings",
 )
 
 
