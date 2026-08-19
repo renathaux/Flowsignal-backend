@@ -13,11 +13,11 @@ from services.deriv_binary_execution_service import (
     account_settings,
     execute_relayed_signal,
     execute_signal_candidates,
-    execution_history,
     execution_snapshot as account_execution_snapshot,
     latest_relay_signal,
     save_account_settings,
 )
+from services.deriv_binary_history_service import execution_history
 from services.deriv_binary_strategy_service import binary_signal_snapshot
 from services.deriv_v5_demo_relay_service import receive_signal
 from services.user_auth_service import current_user, current_user_with_csrf
