@@ -73,6 +73,7 @@ jobs:
         shell: bash
         run: |
           python -m py_compile Backend/risk_management/broker_protection.py Backend/api.py
+          python -m pip install -q pytest
           cd Backend
           python -m pytest -q tests/test_manual_broker_sl_protection.py
 
