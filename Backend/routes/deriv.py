@@ -74,13 +74,11 @@ def get_deriv_config():
 
 @router.get("/binary/signal")
 def get_deriv_binary_signal():
-    """Return the isolated Deriv-native 5m RISE/FALL/WAIT decision."""
     return binary_signal_snapshot()
 
 
 @router.get("/binary/v5/signal")
 def get_authoritative_v5_signal():
-    """Latest persisted authenticated V5 relay; no strategy recomputation."""
     return latest_relay_signal()
 
 
