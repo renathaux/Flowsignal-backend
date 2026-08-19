@@ -6,6 +6,46 @@ def live_prices_match(symbol, left, right, *, normalize_symbol):
         return False
 
 
+def classify_stop_loss_change(
+    symbol,
+    side,
+    broker_sl,
+    saved_sl,
+    *,
+    normalize_symbol,
+):
+    """Classify a broker SL relative to FlowSignal's last protected SL.
+
+    A manual broker move is considered MORE_PROTECTIVE only when it reduces
+    downside risk: higher for BUY, lower for SELL. Missing/invalid values are
+    never accepted as manual protection.
+    """
+    if broker_sl in [None, ""]:
+        return "MISSING"
+    if saved_sl in [None, ""]:
+        return "NO_BASELINE"
+
+    try:
+        broker_value = float(broker_sl)
+        saved_value = float(saved_sl)
+    except (TypeError, ValueError):
+        return "INVALID"
+
+    normalized_symbol = normalize_symbol(symbol)
+    tolerance = 0.005 if normalized_symbol == "XAUUSD" else 0.000005
+    difference = broker_value - saved_value
+
+    if abs(difference) <= tolerance:
+        return "MATCH"
+
+    normalized_side = str(side or "").strip().upper()
+    if normalized_side in {"BUY", "LONG", "1"}:
+        return "MORE_PROTECTIVE" if difference > tolerance else "LESS_PROTECTIVE"
+    if normalized_side in {"SELL", "SHORT", "2"}:
+        return "MORE_PROTECTIVE" if difference < -tolerance else "LESS_PROTECTIVE"
+    return "INVALID_SIDE"
+
+
 def build_live_protection_audit(
     symbol,
     side,
