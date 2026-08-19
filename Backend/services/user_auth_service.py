@@ -18,6 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from db import engine as default_engine
 
 SESSION_COOKIE = "flowsignal_session"
+USER_AUTH_SCHEME = "FlowSignalUser"
 SESSION_SECONDS = int(os.getenv("FLOWSIGNAL_SESSION_SECONDS", str(60 * 60 * 24 * 7)))
 PBKDF2_ITERATIONS = max(600_000, int(os.getenv("FLOWSIGNAL_PBKDF2_ITERATIONS", "600000")))
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -168,6 +169,19 @@ def clear_session_cookie(response: Response) -> None:
     response.delete_cookie(SESSION_COOKIE, path="/", secure=True, httponly=True, samesite="none")
 
 
+def request_session_token(request: Request) -> tuple[str, str]:
+    authorization = str(request.headers.get("Authorization", "")).strip()
+    prefix = f"{USER_AUTH_SCHEME} "
+    if authorization.startswith(prefix):
+        token = authorization[len(prefix):].strip()
+        if token:
+            return token, "header"
+    cookie = str(request.cookies.get(SESSION_COOKIE, "") or "").strip()
+    if cookie:
+        return cookie, "cookie"
+    return "", "none"
+
+
 def session_snapshot(token: str, *, engine: Engine | None = None) -> tuple[CurrentUser, str] | None:
     if not token:
         return None
@@ -185,14 +199,16 @@ def session_snapshot(token: str, *, engine: Engine | None = None) -> tuple[Curre
 
 
 def current_user(request: Request) -> CurrentUser:
-    snapshot = session_snapshot(request.cookies.get(SESSION_COOKIE, ""))
+    token, _source = request_session_token(request)
+    snapshot = session_snapshot(token)
     if not snapshot:
         raise HTTPException(status_code=401, detail="AUTHENTICATION_REQUIRED")
     return snapshot[0]
 
 
 def current_user_with_csrf(request: Request) -> CurrentUser:
-    snapshot = session_snapshot(request.cookies.get(SESSION_COOKIE, ""))
+    token, _source = request_session_token(request)
+    snapshot = session_snapshot(token)
     if not snapshot:
         raise HTTPException(status_code=401, detail="AUTHENTICATION_REQUIRED")
     supplied = request.headers.get("X-FlowSignal-CSRF", "")
