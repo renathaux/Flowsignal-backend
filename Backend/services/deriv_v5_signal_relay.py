@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.request import Request, urlopen
 
-from services.deriv_binary_v5_forward_validator import DEFAULT_DB_PATH
+from services.deriv_binary_simple_strategy import DEFAULT_DB_PATH
 
 RELAY_URL = os.getenv("BINARY_V5_RELAY_URL", "").strip()
 RELAY_SECRET = os.getenv("BINARY_V5_RELAY_SECRET", "").strip()
