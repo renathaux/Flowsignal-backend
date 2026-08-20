@@ -231,8 +231,17 @@ def execution_snapshot(user_id: str, deriv_account_id: str, *, engine: Engine | 
     with chosen.begin() as connection:
         row = connection.execute(select(binary_executions).where((binary_executions.c.user_id == user_id) &
             (binary_executions.c.deriv_account_id == deriv_account_id)).order_by(binary_executions.c.created_at.desc()).limit(1)).mappings().first()
-    return {"ok": True, "account": setting, "running_contract": dict(row) if row and row["broker_status"] not in {"WON", "LOST", "SETTLED"} else None,
-            "last_execution": dict(row) if row else None}
+    public_fields = (
+        "id", "signal_id", "strategy_version", "direction", "contract_type", "symbol",
+        "deriv_account_id", "account_type", "duration", "duration_unit", "stake", "currency",
+        "proposal_id", "contract_id", "transaction_id", "purchase_timestamp", "expiry_timestamp",
+        "buy_price", "potential_payout", "broker_status", "outcome", "profit_loss",
+        "settlement_payout", "settlement_timestamp", "settlement_price", "created_at", "updated_at",
+    )
+    public = {field: row[field] for field in public_fields} if row else None
+    return {"ok": True, "account": setting,
+            "running_contract": public if row and row["broker_status"] not in {"WON", "LOST", "SETTLED"} else None,
+            "last_execution": public}
 
 
 def _real_enabled() -> bool:
@@ -251,7 +260,8 @@ async def _recv(ws, req_id: int, *, terminal: bool = False) -> dict[str, Any]:
     raise RuntimeError("DERIV_CONTRACT_SETTLEMENT_TIMEOUT")
 
 
-async def _broker_async(access_token: str, account: dict[str, Any], direction: str, stake: float, currency: str) -> dict[str, Any]:
+async def _broker_async(access_token: str, account: dict[str, Any], direction: str, stake: float, currency: str,
+                        checkpoint: Callable[..., None] | None = None) -> dict[str, Any]:
     account_id = account_identifier(account)
     response = requests.post(f"{DERIV_API_BASE}/trading/v1/options/accounts/{account_id}/otp", headers=_headers(access_token), timeout=15)
     if not response.ok: raise RuntimeError(f"DERIV_OTP_FAILED_{response.status_code}")
@@ -265,9 +275,13 @@ async def _broker_async(access_token: str, account: dict[str, Any], direction: s
         proposal = (await _recv(ws,101)).get("proposal") or {}; proposal_id=str(proposal.get("id") or "")
         if not proposal_id: raise RuntimeError("DERIV_PROPOSAL_ID_MISSING")
         ask=float(proposal.get("ask_price") or stake)
+        if checkpoint: checkpoint("PROPOSED", proposal_id=proposal_id, potential_payout=float(proposal.get("payout") or 0))
         await ws.send(json.dumps({"buy":proposal_id,"price":ask,"req_id":102}))
+        if checkpoint: checkpoint("PURCHASE_REQUEST_SENT", proposal_id=proposal_id)
         buy=(await _recv(ws,102)).get("buy") or {}; contract_id=buy.get("contract_id")
         if contract_id in (None,""): raise RuntimeError("DERIV_CONTRACT_ID_MISSING")
+        if checkpoint: checkpoint("PURCHASED", contract_id=str(contract_id), transaction_id=buy.get("transaction_id"),
+            buy_price=float(buy.get("buy_price") or ask), purchase_timestamp=int(buy.get("purchase_time") or time.time()))
         await ws.send(json.dumps({"proposal_open_contract":1,"contract_id":contract_id,"subscribe":1,"req_id":103}))
         contract=(await _recv(ws,103,terminal=True)).get("proposal_open_contract") or {}
         profit=float(contract.get("profit") or 0); status=str(contract.get("status") or "").lower()
@@ -281,7 +295,8 @@ async def _broker_async(access_token: str, account: dict[str, Any], direction: s
 
 
 def deriv_broker(account_context: dict[str, Any], direction: str, stake: float, currency: str) -> dict[str, Any]:
-    return asyncio.run(_broker_async(account_context["access_token"], account_context["account"], direction, stake, currency))
+    return asyncio.run(_broker_async(account_context["access_token"], account_context["account"], direction, stake, currency,
+                                     account_context.get("checkpoint")))
 
 
 def execute_relayed_signal(user_id: str, connection_id: str, signal_id: str, *, engine: Engine | None = None,
@@ -311,10 +326,27 @@ def execute_relayed_signal(user_id: str, connection_id: str, signal_id: str, *, 
             execution_id=result.inserted_primary_key[0]
         except IntegrityError:
             return {"ok":False,"duplicate":True,"reason":"SIGNAL_ALREADY_EXECUTED","broker_action":False}
+    def checkpoint(status: str, **fields: Any) -> None:
+        allowed = {key: value for key, value in fields.items() if key in {
+            "proposal_id", "contract_id", "transaction_id", "buy_price", "potential_payout", "purchase_timestamp"
+        }}
+        allowed.update(broker_status=status, updated_at=time.time())
+        with chosen.begin() as connection:
+            connection.execute(update(binary_executions).where(binary_executions.c.id == execution_id).values(**allowed))
+
+    broker_context = dict(private)
+    broker_context["checkpoint"] = checkpoint
     try:
-        result=broker(private,direction,float(acct["binary_stake"]),acct["currency"])
+        result=broker(broker_context,direction,float(acct["binary_stake"]),acct["currency"])
     except Exception as exc:
-        with chosen.begin() as connection: connection.execute(update(binary_executions).where(binary_executions.c.id==execution_id).values(broker_status="FAILED_SAFE",broker_payload_json=json.dumps({"error":str(exc)[:300]}),updated_at=time.time()))
+        with chosen.begin() as connection:
+            current = connection.execute(select(binary_executions.c.broker_status).where(binary_executions.c.id == execution_id)).scalar_one()
+            safe_status = {
+                "PURCHASE_REQUEST_SENT": "PURCHASE_AMBIGUOUS",
+                "PURCHASED": "SETTLEMENT_PENDING",
+            }.get(str(current), "PROPOSAL_FAILED_SAFE" if current == "PROPOSED" else "FAILED_SAFE")
+            connection.execute(update(binary_executions).where(binary_executions.c.id==execution_id).values(
+                broker_status=safe_status,broker_payload_json=json.dumps({"error_code":type(exc).__name__}),updated_at=time.time()))
         raise
     values={k:result.get(k) for k in ("proposal_id","contract_id","transaction_id","buy_price","potential_payout","purchase_timestamp","expiry_timestamp","broker_status","outcome","profit_loss","settlement_payout","settlement_timestamp","settlement_price")}
     values.update(broker_payload_json=json.dumps(result.get("raw") or {},default=str),updated_at=time.time())
