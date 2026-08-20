@@ -35,6 +35,12 @@ async def receive_v5_demo_relay(request: Request, background_tasks: BackgroundTa
         background_tasks.add_task(execute_signal_candidates, result["signal_id"])
         return result
     except RuntimeError as exc:
+        print("BINARY_RELAY_REJECTED =", {
+            "reason": str(exc),
+            "body_preview": body.decode("utf-8", errors="replace")[:500],
+            "has_timestamp": bool(request.headers.get("X-FlowSignal-Relay-Timestamp", "")),
+            "has_signature": bool(request.headers.get("X-FlowSignal-Relay-Signature", "")),
+        })
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
