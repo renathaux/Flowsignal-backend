@@ -91,9 +91,9 @@ class V5RelayTests(unittest.TestCase):
         def fail(*_args):
             raise RuntimeError("offline")
         self.assertEqual(
-            deliver_pending_relays(self.research_db, now=1000, post=fail,
+            deliver_pending_relays(self.research_db, now=4300, post=fail,
                                    relay_url="https://relay.invalid", secret="secret"),
-            {"delivered": 0, "failed": 1, "disabled": 0},
+            {"delivered": 0, "failed": 1, "expired": 0, "disabled": 0},
         )
         with sqlite3.connect(str(self.research_db)) as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM signals").fetchone()[0], 1)
@@ -103,12 +103,27 @@ class V5RelayTests(unittest.TestCase):
             delivered.append((body, headers))
             return 200
         result = deliver_pending_relays(
-            self.research_db, now=1002, post=accept,
+            self.research_db, now=4302, post=accept,
             relay_url="https://relay.invalid", secret="secret",
         )
         self.assertEqual(result["delivered"], 1)
         with sqlite3.connect(str(self.research_db)) as connection:
             self.assertEqual(connection.execute("SELECT status, attempts FROM relay_outbox").fetchone(), ("DELIVERED", 2))
+
+    def test_stale_catch_up_signal_is_expired_without_posting(self):
+        record_observation(self.observation, self.research_db)
+        posted = []
+        result = deliver_pending_relays(
+            self.research_db, now=5000, post=lambda *_args: posted.append(True) or 200,
+            relay_url="https://relay.invalid", secret="secret",
+        )
+        self.assertEqual(result, {"delivered": 0, "failed": 0, "expired": 1, "disabled": 0})
+        self.assertEqual(posted, [])
+        with sqlite3.connect(str(self.research_db)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT status, last_error FROM relay_outbox").fetchone(),
+                ("EXPIRED", "STALE_SIGNAL_NOT_RELAYED"),
+            )
 
     def test_receiver_authentication_and_idempotency(self):
         record_observation(self.observation, self.research_db)
