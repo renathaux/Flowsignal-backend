@@ -21,6 +21,7 @@ from services.deriv_binary_v5_forward_validator import DEFAULT_DB_PATH
 RELAY_URL = os.getenv("BINARY_V5_RELAY_URL", "").strip()
 RELAY_SECRET = os.getenv("BINARY_V5_RELAY_SECRET", "").strip()
 MAX_ATTEMPTS_PER_DRAIN = 10
+MAX_RELAY_AGE_SECONDS = 30
 
 
 def sign_relay_payload(body: bytes, timestamp: int, secret: str) -> str:
@@ -61,9 +62,21 @@ def deliver_pending_relays(
         ).fetchall()
     finally:
         connection.close()
-    delivered = failed = 0
+    delivered = failed = expired = 0
     for row in rows:
         body = row["payload_json"].encode("utf-8")
+        payload = json.loads(row["payload_json"])
+        entry_timestamp = int(payload.get("entry_timestamp") or 0)
+        if not entry_timestamp or clock - entry_timestamp > MAX_RELAY_AGE_SECONDS:
+            with sqlite3.connect(str(db_path), timeout=15) as update:
+                update.execute(
+                    """UPDATE relay_outbox SET status='EXPIRED', attempts=attempts+1,
+                           delivered_at=?, last_error='STALE_SIGNAL_NOT_RELAYED'
+                       WHERE signal_id=? AND status='PENDING'""",
+                    (clock, row["signal_id"]),
+                )
+            expired += 1
+            continue
         timestamp = int(clock)
         headers = {
             "Content-Type": "application/json",
@@ -92,4 +105,4 @@ def deliver_pending_relays(
                 (clock, row["signal_id"]),
             )
         delivered += 1
-    return {"delivered": delivered, "failed": failed, "disabled": 0}
+    return {"delivered": delivered, "failed": failed, "expired": expired, "disabled": 0}
