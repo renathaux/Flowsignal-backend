@@ -1,8 +1,13 @@
 from fastapi import APIRouter, HTTPException
 from services.risk_service import get_risk_settings, update_risk_settings
 from services.settings_service import load_feature_flags, save_feature_flags
+from routes.user_auth import router as user_auth_router
 
 router = APIRouter()
+# api.py already mounts this router. Include the database-backed auth router
+# here so /auth/signup, /auth/login, email verification, session and logout
+# are actually exposed by the deployed FastAPI application.
+router.include_router(user_auth_router)
 
 
 @router.get("/settings/risk")
