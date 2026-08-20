@@ -31,6 +31,13 @@ from services.deriv_binary_v5_forward_validator import (  # noqa: E402
 from services.deriv_v5_signal_relay import deliver_pending_relays  # noqa: E402
 
 PUBLIC_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public"
+BOUNDARY_CHECKPOINT_KEY = "last_processed_entry_timestamp"
+RECONNECT_DELAY_SECONDS = 5
+SKIPPABLE_BOUNDARY_ERRORS = {
+    "Eleven aligned closed candles are required",
+    "Decision candle tick path is unavailable",
+    "Entry quote is more than two seconds before the boundary",
+}
 
 
 async def _one_request(payload: dict[str, Any]) -> dict[str, Any]:
@@ -104,6 +111,41 @@ async def _backfill_due_settlements(db_path: Path) -> None:
     settle_from_recorded_ticks(db_path)
 
 
+def _boundary_checkpoint(db_path: Path) -> int | None:
+    import sqlite3
+    with sqlite3.connect(str(db_path)) as connection:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key=?", (BOUNDARY_CHECKPOINT_KEY,)
+        ).fetchone()
+    return int(row[0]) if row else None
+
+
+def _save_boundary_checkpoint(entry_timestamp: int, db_path: Path) -> None:
+    import sqlite3
+    with sqlite3.connect(str(db_path)) as connection:
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (BOUNDARY_CHECKPOINT_KEY, str(int(entry_timestamp))),
+        )
+
+
+async def _process_boundary_safely(entry_timestamp: int, db_path: Path) -> dict[str, Any]:
+    try:
+        result = await process_boundary(entry_timestamp, db_path)
+    except ValueError as exc:
+        if str(exc) not in SKIPPABLE_BOUNDARY_ERRORS:
+            raise
+        result = {
+            "entry_timestamp": entry_timestamp,
+            "qualified": False,
+            "skipped": True,
+            "reason": str(exc)[:300],
+        }
+    _save_boundary_checkpoint(entry_timestamp, db_path)
+    return result
+
+
 async def catch_up(db_path: Path) -> None:
     state = initialize_database(db_path)
     import sqlite3
@@ -111,45 +153,55 @@ async def catch_up(db_path: Path) -> None:
     row = connection.execute("SELECT MAX(entry_timestamp) FROM observations").fetchone()
     connection.close()
     first = int(state["first_eligible_entry_timestamp"])
-    next_boundary = int(row[0]) + GRANULARITY_SECONDS if row and row[0] else first
+    completed = [value for value in (row[0] if row else None, _boundary_checkpoint(db_path)) if value]
+    next_boundary = max(map(int, completed)) + GRANULARITY_SECONDS if completed else first
     current_boundary = int(time.time()) // GRANULARITY_SECONDS * GRANULARITY_SECONDS
     while next_boundary <= current_boundary:
-        result = await process_boundary(next_boundary, db_path)
+        result = await _process_boundary_safely(next_boundary, db_path)
         print(json.dumps({"event": "V5_BOUNDARY_RECORDED", **result}), flush=True)
         next_boundary += GRANULARITY_SECONDS
     await _backfill_due_settlements(db_path)
 
 
 async def run_forever(db_path: Path) -> None:
-    await catch_up(db_path)
-    await asyncio.to_thread(deliver_pending_relays, db_path)
-    cleanup_raw_ticks(db_path)
-    next_cleanup = time.time() + 86400
-    next_relay_retry = time.time() + 10
-    next_boundary = (int(time.time()) // GRANULARITY_SECONDS + 1) * GRANULARITY_SECONDS
-    async with websockets.connect(PUBLIC_WS_URL, open_timeout=15, close_timeout=5) as ws:
-        await ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1, "req_id": 9601}))
-        while True:
-            message = json.loads(await ws.recv())
-            tick = message.get("tick")
-            if not isinstance(tick, dict):
-                continue
-            record_tick(tick, db_path)
-            settle_from_recorded_ticks(db_path, now_epoch=int(tick["epoch"]))
-            if time.time() >= next_relay_retry:
-                try:
-                    await asyncio.to_thread(deliver_pending_relays, db_path)
-                except Exception as exc:
-                    print(json.dumps({"event": "V5_RELAY_ERROR", "error": str(exc)[:300]}), flush=True)
-                next_relay_retry = time.time() + 10
+    next_cleanup = time.time()
+    while True:
+        try:
+            await catch_up(db_path)
+            await asyncio.to_thread(deliver_pending_relays, db_path)
             if time.time() >= next_cleanup:
-                result = cleanup_raw_ticks(db_path)
-                print(json.dumps({"event": "V5_RETENTION_CLEANUP", **result}), flush=True)
+                cleanup_raw_ticks(db_path)
                 next_cleanup = time.time() + 86400
-            while int(tick["epoch"]) >= next_boundary:
-                result = await process_boundary(next_boundary, db_path)
-                print(json.dumps({"event": "V5_BOUNDARY_RECORDED", **result}), flush=True)
-                next_boundary += GRANULARITY_SECONDS
+            next_relay_retry = time.time() + 10
+            next_boundary = (int(time.time()) // GRANULARITY_SECONDS + 1) * GRANULARITY_SECONDS
+            async with websockets.connect(PUBLIC_WS_URL, open_timeout=15, close_timeout=5) as ws:
+                await ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1, "req_id": 9601}))
+                while True:
+                    message = json.loads(await ws.recv())
+                    tick = message.get("tick")
+                    if not isinstance(tick, dict):
+                        continue
+                    record_tick(tick, db_path)
+                    settle_from_recorded_ticks(db_path, now_epoch=int(tick["epoch"]))
+                    if time.time() >= next_relay_retry:
+                        try:
+                            await asyncio.to_thread(deliver_pending_relays, db_path)
+                        except Exception as exc:
+                            print(json.dumps({"event": "V5_RELAY_ERROR", "error": str(exc)[:300]}), flush=True)
+                        next_relay_retry = time.time() + 10
+                    if time.time() >= next_cleanup:
+                        result = cleanup_raw_ticks(db_path)
+                        print(json.dumps({"event": "V5_RETENTION_CLEANUP", **result}), flush=True)
+                        next_cleanup = time.time() + 86400
+                    while int(tick["epoch"]) >= next_boundary:
+                        result = await _process_boundary_safely(next_boundary, db_path)
+                        print(json.dumps({"event": "V5_BOUNDARY_RECORDED", **result}), flush=True)
+                        next_boundary += GRANULARITY_SECONDS
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(json.dumps({"event": "V5_STREAM_RECONNECT", "error": str(exc)[:300]}), flush=True)
+            await asyncio.sleep(RECONNECT_DELAY_SECONDS)
 
 
 def main() -> None:
