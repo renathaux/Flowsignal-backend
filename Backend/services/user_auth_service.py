@@ -8,20 +8,27 @@ import secrets
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import HTTPException, Request, Response
-from sqlalchemy import Boolean, Column, Float, MetaData, String, Table, Text, select, update
+from sqlalchemy import Boolean, Column, Float, Integer, MetaData, String, Table, Text, func, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
 from db import engine as default_engine
+from services.email_service import send_verification_email
 
 SESSION_COOKIE = "flowsignal_session"
 USER_AUTH_SCHEME = "FlowSignalUser"
 SESSION_SECONDS = int(os.getenv("FLOWSIGNAL_SESSION_SECONDS", str(60 * 60 * 24 * 7)))
 PBKDF2_ITERATIONS = max(600_000, int(os.getenv("FLOWSIGNAL_PBKDF2_ITERATIONS", "600000")))
+OTP_PBKDF2_ITERATIONS = max(120_000, int(os.getenv("FLOWSIGNAL_OTP_PBKDF2_ITERATIONS", "120000")))
+OTP_TTL_SECONDS = max(60, int(os.getenv("FLOWSIGNAL_OTP_TTL_SECONDS", "600")))
+OTP_RESEND_SECONDS = max(15, int(os.getenv("FLOWSIGNAL_OTP_RESEND_SECONDS", "60")))
+OTP_MAX_ATTEMPTS = max(3, int(os.getenv("FLOWSIGNAL_OTP_MAX_ATTEMPTS", "5")))
+OTP_MAX_SENDS_PER_HOUR = max(3, int(os.getenv("FLOWSIGNAL_OTP_MAX_SENDS_PER_HOUR", "5")))
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+OTP_RE = re.compile(r"^\d{6}$")
 
 metadata = MetaData()
 users = Table(
@@ -45,6 +52,16 @@ sessions = Table(
     Column("expires_at", Float, nullable=False, index=True),
     Column("last_seen_at", Float, nullable=False),
     Column("revoked_at", Float),
+)
+email_verification_codes = Table(
+    "flowsignal_email_verification_codes", metadata,
+    Column("id", String(36), primary_key=True),
+    Column("user_id", String(36), nullable=False, index=True),
+    Column("code_hash", Text, nullable=False),
+    Column("created_at", Float, nullable=False),
+    Column("expires_at", Float, nullable=False, index=True),
+    Column("consumed_at", Float),
+    Column("attempt_count", Integer, nullable=False, default=0),
 )
 
 
@@ -73,6 +90,13 @@ def normalize_email(value: str) -> str:
     return email
 
 
+def mask_email(value: str) -> str:
+    email = normalize_email(value)
+    local, domain = email.split("@", 1)
+    visible = local[:2] if len(local) > 2 else local[:1]
+    return f"{visible}{'*' * max(2, len(local) - len(visible))}@{domain}"
+
+
 def hash_password(password: str) -> str:
     password = str(password or "")
     if len(password) < 10 or len(password) > 1024:
@@ -93,6 +117,26 @@ def verify_password(password: str, encoded: str) -> bool:
         salt = bytes.fromhex(salt_hex)
         expected = bytes.fromhex(digest_hex)
         actual = hashlib.pbkdf2_hmac("sha256", str(password).encode("utf-8"), salt, iterations)
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+
+def _hash_otp(code: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", code.encode("ascii"), salt, OTP_PBKDF2_ITERATIONS)
+    return f"otp_pbkdf2_sha256${OTP_PBKDF2_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+
+def _verify_otp(code: str, encoded: str) -> bool:
+    try:
+        scheme, rounds, salt_hex, digest_hex = str(encoded).split("$", 3)
+        if scheme != "otp_pbkdf2_sha256":
+            return False
+        iterations = int(rounds)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(digest_hex)
+        actual = hashlib.pbkdf2_hmac("sha256", code.encode("ascii"), salt, iterations)
         return hmac.compare_digest(actual, expected)
     except Exception:
         return False
@@ -144,6 +188,165 @@ def authenticate(email: str, password: str, *, engine: Engine | None = None) -> 
     return dict(row)
 
 
+def issue_email_verification(
+    email: str,
+    *,
+    engine: Engine | None = None,
+    sender: Callable[[str, str], None] | None = None,
+) -> dict[str, Any]:
+    chosen = _engine(engine)
+    normalized = normalize_email(email)
+    now = time.time()
+    send = sender or send_verification_email
+
+    with chosen.begin() as connection:
+        user = connection.execute(select(users).where(users.c.email == normalized)).mappings().first()
+        if not user or not user["is_active"]:
+            raise RuntimeError("EMAIL_NOT_REGISTERED")
+        if bool(user["email_verified"]):
+            return {"verified": True, "email": mask_email(normalized)}
+
+        latest = connection.execute(
+            select(email_verification_codes)
+            .where(email_verification_codes.c.user_id == user["id"])
+            .order_by(email_verification_codes.c.created_at.desc())
+            .limit(1)
+        ).mappings().first()
+        if latest and float(latest["created_at"]) > now - OTP_RESEND_SECONDS:
+            raise RuntimeError("VERIFICATION_CODE_COOLDOWN")
+
+        sends_last_hour = connection.execute(
+            select(func.count())
+            .select_from(email_verification_codes)
+            .where(
+                email_verification_codes.c.user_id == user["id"],
+                email_verification_codes.c.created_at >= now - 3600,
+            )
+        ).scalar_one()
+        if int(sends_last_hour or 0) >= OTP_MAX_SENDS_PER_HOUR:
+            raise RuntimeError("VERIFICATION_RATE_LIMITED")
+
+        connection.execute(
+            update(email_verification_codes)
+            .where(
+                email_verification_codes.c.user_id == user["id"],
+                email_verification_codes.c.consumed_at.is_(None),
+            )
+            .values(consumed_at=now)
+        )
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        code_id = str(uuid.uuid4())
+        connection.execute(email_verification_codes.insert().values(
+            id=code_id,
+            user_id=user["id"],
+            code_hash=_hash_otp(code),
+            created_at=now,
+            expires_at=now + OTP_TTL_SECONDS,
+            consumed_at=None,
+            attempt_count=0,
+        ))
+
+    try:
+        send(normalized, code)
+    except Exception as exc:
+        with chosen.begin() as connection:
+            connection.execute(
+                update(email_verification_codes)
+                .where(email_verification_codes.c.id == code_id)
+                .values(consumed_at=time.time())
+            )
+        if isinstance(exc, RuntimeError):
+            raise
+        raise RuntimeError("EMAIL_DELIVERY_FAILED") from exc
+
+    return {
+        "verified": False,
+        "verification_required": True,
+        "email": mask_email(normalized),
+        "expires_in": OTP_TTL_SECONDS,
+        "resend_after": OTP_RESEND_SECONDS,
+    }
+
+
+def verify_email_code(email: str, code: str, *, engine: Engine | None = None) -> dict[str, Any]:
+    chosen = _engine(engine)
+    normalized = normalize_email(email)
+    supplied = str(code or "").strip()
+    if not OTP_RE.fullmatch(supplied):
+        raise RuntimeError("INVALID_VERIFICATION_CODE")
+    now = time.time()
+
+    with chosen.begin() as connection:
+        user = connection.execute(select(users).where(users.c.email == normalized)).mappings().first()
+        if not user or not user["is_active"]:
+            raise RuntimeError("INVALID_VERIFICATION_CODE")
+        if bool(user["email_verified"]):
+            return public_user(dict(user))
+
+        record = connection.execute(
+            select(email_verification_codes)
+            .where(
+                email_verification_codes.c.user_id == user["id"],
+                email_verification_codes.c.consumed_at.is_(None),
+            )
+            .order_by(email_verification_codes.c.created_at.desc())
+            .limit(1)
+        ).mappings().first()
+        if not record or float(record["expires_at"]) <= now:
+            if record:
+                connection.execute(
+                    update(email_verification_codes)
+                    .where(email_verification_codes.c.id == record["id"])
+                    .values(consumed_at=now)
+                )
+            raise RuntimeError("VERIFICATION_CODE_EXPIRED")
+
+        attempts = int(record["attempt_count"] or 0)
+        if attempts >= OTP_MAX_ATTEMPTS:
+            connection.execute(
+                update(email_verification_codes)
+                .where(email_verification_codes.c.id == record["id"])
+                .values(consumed_at=now)
+            )
+            raise RuntimeError("VERIFICATION_ATTEMPTS_EXCEEDED")
+
+        if not _verify_otp(supplied, str(record["code_hash"])):
+            attempts += 1
+            values: dict[str, Any] = {"attempt_count": attempts}
+            if attempts >= OTP_MAX_ATTEMPTS:
+                values["consumed_at"] = now
+            connection.execute(
+                update(email_verification_codes)
+                .where(email_verification_codes.c.id == record["id"])
+                .values(**values)
+            )
+            raise RuntimeError(
+                "VERIFICATION_ATTEMPTS_EXCEEDED"
+                if attempts >= OTP_MAX_ATTEMPTS
+                else "INVALID_VERIFICATION_CODE"
+            )
+
+        connection.execute(
+            update(email_verification_codes)
+            .where(email_verification_codes.c.id == record["id"])
+            .values(consumed_at=now, attempt_count=attempts)
+        )
+        connection.execute(
+            update(users)
+            .where(users.c.id == user["id"])
+            .values(email_verified=True, updated_at=now)
+        )
+        connection.execute(
+            update(sessions)
+            .where(sessions.c.user_id == user["id"], sessions.c.revoked_at.is_(None))
+            .values(revoked_at=now)
+        )
+        verified = dict(user)
+        verified["email_verified"] = True
+        verified["updated_at"] = now
+        return public_user(verified)
+
+
 def create_session(user_id: str, *, engine: Engine | None = None) -> tuple[str, str, float]:
     chosen = _engine(engine)
     token = secrets.token_urlsafe(48)
@@ -193,6 +396,8 @@ def session_snapshot(token: str, *, engine: Engine | None = None) -> tuple[Curre
             return None
         user = connection.execute(select(users).where(users.c.id == session["user_id"])).mappings().first()
         if not user or not user["is_active"]:
+            return None
+        if str(user["role"]) == "user" and not bool(user["email_verified"]):
             return None
         connection.execute(update(sessions).where(sessions.c.token_hash == session["token_hash"]).values(last_seen_at=now))
     return CurrentUser(str(user["id"]), str(user["email"]), str(user["role"]), bool(user["email_verified"])), str(session["csrf_token"])
