@@ -16,6 +16,7 @@ from services.deriv_binary_execution_service import (
     latest_relay_signal,
     save_account_settings,
 )
+from services.deriv_binary_history_service import execution_history
 from services.deriv_binary_strategy_service import binary_signal_snapshot
 from services.deriv_v5_demo_relay_service import receive_signal
 
@@ -143,5 +144,18 @@ def execute_authoritative_v5(request: BinaryV5ExecutionRequest):
 def get_account_execution_status(user_id: str, deriv_account_id: str):
     try:
         return account_execution_snapshot(user_id.strip(), deriv_account_id.strip())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/binary/history/{user_id}/{deriv_account_id}")
+def get_binary_history(user_id: str, deriv_account_id: str, limit: int = 50, offset: int = 0):
+    try:
+        return execution_history(
+            user_id.strip(),
+            deriv_account_id.strip(),
+            limit=max(1, min(int(limit), 100)),
+            offset=max(0, int(offset)),
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
