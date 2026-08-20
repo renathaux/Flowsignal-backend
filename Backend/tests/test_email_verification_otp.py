@@ -9,7 +9,6 @@ from services.user_auth_service import (
     issue_email_verification,
     session_snapshot,
     signup,
-    users,
     verify_email_code,
 )
 
@@ -52,8 +51,9 @@ def test_wrong_code_does_not_verify():
     sent = []
     signup("otp@example.com", "very-secure-password", engine=engine)
     issue_email_verification("otp@example.com", engine=engine, sender=capture_sender(sent))
+    wrong = "000000" if sent[0][1] != "000000" else "000001"
     with pytest.raises(RuntimeError, match="INVALID_VERIFICATION_CODE"):
-        verify_email_code("otp@example.com", "000000", engine=engine)
+        verify_email_code("otp@example.com", wrong, engine=engine)
 
 
 def test_expired_code_is_rejected():
