@@ -9,6 +9,7 @@ import requests
 from services.deriv_user_connection_store import (
     consume_oauth_state,
     disconnect_connection,
+    latest_selected_account,
     load_connection,
     register_oauth_state,
     save_connection,
@@ -75,6 +76,16 @@ def exchange_authorization_code(code: str, code_verifier: str, *, user_id: str, 
         raise RuntimeError("Deriv token response did not include an access token")
 
     accounts = fetch_options_accounts(access_token)
+    authorized_ids = {
+        str(item.get("account_id") or item.get("id") or item.get("loginid") or "").strip()
+        for item in accounts
+    }
+    authorized_ids.discard("")
+    if authenticated_customer and not selected_account_id:
+        selected_account_id = latest_selected_account(user_id, authorized_ids)
+    if selected_account_id and selected_account_id not in authorized_ids:
+        raise RuntimeError("DERIV_SELECTED_ACCOUNT_NOT_AUTHORIZED")
+
     expires_in = int(payload.get("expires_in") or 3600)
     now = time.time(); expires_at = now + max(60, expires_in)
     if authenticated_customer:
