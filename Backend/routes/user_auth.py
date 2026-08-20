@@ -52,23 +52,50 @@ def _delivery_error(exc: RuntimeError) -> HTTPException:
     return HTTPException(status_code=400, detail=code)
 
 
+def _verification_response(email: str, response: Response):
+    try:
+        verification = issue_email_verification(email)
+    except RuntimeError as exc:
+        if str(exc) == "VERIFICATION_CODE_COOLDOWN":
+            clear_session_cookie(response)
+            return {
+                "ok": True,
+                "verification_required": True,
+                "email": mask_email(email),
+                "expires_in": None,
+                "resend_after": 60,
+                "delivery": "already_sent",
+            }
+        raise
+    clear_session_cookie(response)
+    return {
+        "ok": True,
+        "verification_required": True,
+        "email": verification["email"],
+        "expires_in": verification["expires_in"],
+        "resend_after": verification["resend_after"],
+        "delivery": "sent",
+    }
+
+
 @router.post("/signup")
 def create_account(payload: SignupRequest, response: Response):
     try:
         user = signup(payload.email, payload.password)
-        verification = issue_email_verification(user["email"])
-        clear_session_cookie(response)
-        return {
-            "ok": True,
-            "verification_required": True,
-            "email": verification["email"],
-            "expires_in": verification["expires_in"],
-            "resend_after": verification["resend_after"],
-        }
+        return _verification_response(user["email"], response)
     except RuntimeError as exc:
         code = str(exc)
         if code == "EMAIL_ALREADY_REGISTERED":
-            raise HTTPException(status_code=409, detail=code) from exc
+            try:
+                existing = authenticate(payload.email, payload.password)
+            except RuntimeError as auth_exc:
+                raise HTTPException(status_code=409, detail=code) from auth_exc
+            if str(existing.get("role", "user")) != "user" or bool(existing.get("email_verified")):
+                raise HTTPException(status_code=409, detail=code) from exc
+            try:
+                return _verification_response(str(existing["email"]), response)
+            except RuntimeError as send_exc:
+                raise _delivery_error(send_exc) from send_exc
         raise _delivery_error(exc) from exc
 
 
