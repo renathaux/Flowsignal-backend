@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from services.user_auth_service import (
     authenticate,
+    change_password,
     clear_session_cookie,
     create_session,
     current_user,
@@ -39,6 +40,11 @@ class VerifyEmailRequest(BaseModel):
 
 class ResendVerificationRequest(BaseModel):
     email: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
 
 
 def _delivery_error(exc: RuntimeError) -> HTTPException:
@@ -198,6 +204,16 @@ def logout(request: Request, response: Response):
     if source == "cookie":
         clear_session_cookie(response)
     return {"ok": True, "authenticated": False}
+
+
+@router.post("/change-password")
+def update_password(payload: ChangePasswordRequest, request: Request):
+    user = current_user_with_csrf(request)
+    token, _source = request_session_token(request)
+    try:
+        return change_password(user.id, payload.current_password, payload.new_password, token)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/me")
