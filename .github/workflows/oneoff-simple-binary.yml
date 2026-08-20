@@ -1,0 +1,200 @@
+name: One-off simple Binary strategy
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: ${{ !contains(github.event.head_commit.message, '[skip simple binary patch]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Replace heavy V5 qualification with simple 5m candle direction
+        shell: bash
+        run: |
+          cat > Backend/services/deriv_binary_simple_strategy.py <<'PY'
+          """Simple 5-minute EURUSD Binary signal.
+
+          Deliberately minimal: the next 5-minute contract follows the direction
+          of the just-completed 5-minute candle. A true doji waits. No Forex SMC,
+          BOS, ATR gate, displacement gate, reversal-count gate, fundamentals,
+          SL/TP, or RR is used here.
+          """
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          from pathlib import Path
+          from typing import Any, Iterable
+
+          from paths import DATA_DIR
+          from services import deriv_binary_v5_forward_validator as legacy
+
+          STRATEGY_VERSION = "DERIV_BINARY_SIMPLE_5M_1"
+          SYMBOL = "frxEURUSD"
+          GRANULARITY_SECONDS = 300
+          SIMPLE_SPEC = {
+              "minimum_absolute_body": 0.0,
+              "prediction": "SAME_AS_COMPLETED_CANDLE",
+          }
+          SPEC_SHA256 = hashlib.sha256(
+              json.dumps(SIMPLE_SPEC, sort_keys=True, separators=(",", ":")).encode()
+          ).hexdigest()
+          EXPECTED_SPEC_SHA256 = "755ea79159b49281b0671846d0883ec34702efa55c2cf397aafac47058f8e3cb"
+          DEFAULT_DB_PATH = DATA_DIR / "deriv_simple_5m_validation.sqlite3"
+
+          if SPEC_SHA256 != EXPECTED_SPEC_SHA256:
+              raise RuntimeError("Simple Binary specification hash mismatch")
+
+          # Reuse the durable research/outbox/settlement machinery while changing
+          # only the signal identity and decision rule.
+          legacy.STRATEGY_VERSION = STRATEGY_VERSION
+          legacy.FROZEN_THRESHOLDS = SIMPLE_SPEC
+          legacy.SPEC_SHA256 = SPEC_SHA256
+          legacy.EXPECTED_SPEC_SHA256 = EXPECTED_SPEC_SHA256
+
+          record_tick = legacy.record_tick
+          record_observation = legacy.record_observation
+          settle_from_recorded_ticks = legacy.settle_from_recorded_ticks
+          cleanup_raw_ticks = legacy.cleanup_raw_ticks
+          forward_report = legacy.forward_report
+
+          def initialize_database(db_path: str | Path = DEFAULT_DB_PATH, *, collection_start_timestamp: int | None = None) -> dict[str, Any]:
+              state = legacy.initialize_database(db_path, collection_start_timestamp=collection_start_timestamp)
+              start = int(state["collection_start_timestamp"])
+              state["first_eligible_entry_timestamp"] = ((start // GRANULARITY_SECONDS) + 1) * GRANULARITY_SECONDS
+              return state
+
+          def evaluate_completed_candle(candles: Iterable[dict[str, Any]], ticks: Iterable[dict[str, Any]], entry_timestamp: int) -> dict[str, Any]:
+              normalized = [{
+                  "epoch": int(float(c["epoch"])),
+                  "open": float(c["open"]),
+                  "high": float(c["high"]),
+                  "low": float(c["low"]),
+                  "close": float(c["close"]),
+              } for c in candles]
+              normalized.sort(key=lambda item: item["epoch"])
+              decision_epoch = int(entry_timestamp) - GRANULARITY_SECONDS
+              eligible = [c for c in normalized if c["epoch"] <= decision_epoch]
+              if not eligible or eligible[-1]["epoch"] != decision_epoch:
+                  raise ValueError("One aligned closed 5-minute candle is required")
+              decision = eligible[-1]
+              candle_ticks = sorted((
+                  {"epoch": int(t["epoch"]), "quote": float(t["quote"])}
+                  for t in ticks
+                  if decision_epoch <= int(t["epoch"]) < int(entry_timestamp)
+              ), key=lambda item: item["epoch"])
+              if len(candle_ticks) < 2:
+                  raise ValueError("Decision candle tick path is unavailable")
+              if int(entry_timestamp) - candle_ticks[-1]["epoch"] > 2:
+                  raise ValueError("Entry quote is more than two seconds before the boundary")
+
+              body = decision["close"] - decision["open"]
+              candle_direction = "BULLISH" if body > 0 else "BEARISH" if body < 0 else "DOJI"
+              qualified = body != 0
+              predicted_direction = "RISE" if body > 0 else "FALL" if body < 0 else None
+              candle_range = max(decision["high"] - decision["low"], 1e-12)
+              body_ratio = abs(body) / candle_range
+              upper_wick = decision["high"] - max(decision["open"], decision["close"])
+              lower_wick = min(decision["open"], decision["close"]) - decision["low"]
+              final_ticks = [t for t in candle_ticks if t["epoch"] >= int(entry_timestamp) - 60]
+              if len(final_ticks) < 2:
+                  final_ticks = candle_ticks[-2:]
+
+              observation_id = f"{STRATEGY_VERSION}:{SYMBOL}:{int(entry_timestamp)}"
+              signal_id = f"{STRATEGY_VERSION}:{SYMBOL}:{int(entry_timestamp)}:{predicted_direction}" if predicted_direction else None
+              return {
+                  "observation_id": observation_id,
+                  "signal_id": signal_id,
+                  "strategy_version": STRATEGY_VERSION,
+                  "spec_sha256": SPEC_SHA256,
+                  "symbol": SYMBOL,
+                  "decision_candle_epoch": decision_epoch,
+                  "entry_timestamp": int(entry_timestamp),
+                  "settlement_timestamp": int(entry_timestamp) + GRANULARITY_SECONDS,
+                  "entry_price": candle_ticks[-1]["quote"],
+                  "entry_quote_epoch": candle_ticks[-1]["epoch"],
+                  "candle": decision,
+                  "candle_direction": candle_direction,
+                  "net_displacement": body,
+                  "body_ratio": body_ratio,
+                  "upper_wick": upper_wick,
+                  "lower_wick": lower_wick,
+                  "qualified": qualified,
+                  "predicted_direction": predicted_direction,
+                  "reason": "FOLLOW_COMPLETED_CANDLE" if qualified else "DOJI_WAIT",
+                  "_signal_evidence": {
+                      "decision_candle": decision,
+                      "candle_direction": candle_direction,
+                      "predicted_direction": predicted_direction,
+                      "body_ratio": body_ratio,
+                      "upper_wick": upper_wick,
+                      "lower_wick": lower_wick,
+                      "final_60_second_ticks": final_ticks,
+                  },
+              }
+          PY
+
+          python - <<'PY'
+          from pathlib import Path
+
+          worker = Path('Backend/scripts/run_deriv_binary_v5_forward_validator.py')
+          text = worker.read_text()
+          old = 'from services.deriv_binary_v5_forward_validator import (  # noqa: E402'
+          new = 'from services.deriv_binary_simple_strategy import (  # noqa: E402'
+          if old not in text:
+              raise SystemExit('worker import anchor missing')
+          worker.write_text(text.replace(old, new, 1))
+
+          relay_sender = Path('Backend/services/deriv_v5_signal_relay.py')
+          text = relay_sender.read_text()
+          old = 'from services.deriv_binary_v5_forward_validator import DEFAULT_DB_PATH'
+          new = 'from services.deriv_binary_simple_strategy import DEFAULT_DB_PATH'
+          if old not in text:
+              raise SystemExit('relay sender DB anchor missing')
+          relay_sender.write_text(text.replace(old, new, 1))
+
+          inbox = Path('Backend/services/deriv_v5_demo_relay_service.py')
+          text = inbox.read_text()
+          replacements = {
+              'STRATEGY_VERSION = "DERIV_BINARY_V5_NOISY_REVERSAL_FROZEN_1"': 'STRATEGY_VERSION = "DERIV_BINARY_SIMPLE_5M_1"',
+              'RULE_HASH = "fab52bb80f7f4dd9150adb2f90d7e090816915ff70e6b368518e7fb39444b249"': 'RULE_HASH = "755ea79159b49281b0671846d0883ec34702efa55c2cf397aafac47058f8e3cb"',
+          }
+          for old, new in replacements.items():
+              if old not in text:
+                  raise SystemExit(f'inbox anchor missing: {old}')
+              text = text.replace(old, new, 1)
+          inbox.write_text(text)
+          PY
+
+          python -m py_compile Backend/services/deriv_binary_simple_strategy.py Backend/scripts/run_deriv_binary_v5_forward_validator.py Backend/services/deriv_v5_signal_relay.py Backend/services/deriv_v5_demo_relay_service.py Backend/services/deriv_binary_execution_service.py
+          PYTHONPATH=Backend python - <<'PY'
+          from services.deriv_binary_simple_strategy import evaluate_completed_candle, STRATEGY_VERSION, SPEC_SHA256
+          candles=[{"epoch":1000,"open":1.1000,"high":1.1012,"low":1.0998,"close":1.1010}]
+          # entry=1300 means decision epoch=1000; last quote is 1 second before boundary.
+          ticks=[{"epoch":1001,"quote":1.1000},{"epoch":1299,"quote":1.1010}]
+          out=evaluate_completed_candle(candles,ticks,1300)
+          assert out['qualified'] is True and out['predicted_direction']=='RISE'
+          assert out['signal_id']==f'{STRATEGY_VERSION}:frxEURUSD:1300:RISE'
+          assert SPEC_SHA256=='755ea79159b49281b0671846d0883ec34702efa55c2cf397aafac47058f8e3cb'
+          candles[0]['open']=1.1010; candles[0]['close']=1.1000
+          out=evaluate_completed_candle(candles,ticks,1300)
+          assert out['predicted_direction']=='FALL'
+          candles[0]['open']=candles[0]['close']=1.1000
+          out=evaluate_completed_candle(candles,ticks,1300)
+          assert out['qualified'] is False and out['predicted_direction'] is None
+          print('simple binary rule PASS')
+          PY
+      - name: Commit verified strategy change
+        shell: bash
+        run: |
+          rm .github/workflows/oneoff-simple-binary.yml
+          git config user.name "FlowSignal automation"
+          git config user.email "actions@users.noreply.github.com"
+          git add Backend/services/deriv_binary_simple_strategy.py Backend/scripts/run_deriv_binary_v5_forward_validator.py Backend/services/deriv_v5_signal_relay.py Backend/services/deriv_v5_demo_relay_service.py .github/workflows/oneoff-simple-binary.yml
+          git commit -m "Simplify Binary to completed-candle direction [skip simple binary patch]"
+          git push
