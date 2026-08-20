@@ -234,9 +234,16 @@ def latest_relay_signal(*, engine: Engine | None = None) -> dict[str, Any]:
 def execution_snapshot(user_id: str, deriv_account_id: str, *, engine: Engine | None = None) -> dict[str, Any]:
     chosen = _engine(engine)
     setting = account_settings(user_id, deriv_account_id, engine=chosen)
+    relay_entry_quote = None
     with chosen.begin() as connection:
         row = connection.execute(select(binary_executions).where((binary_executions.c.user_id == user_id) &
             (binary_executions.c.deriv_account_id == deriv_account_id)).order_by(binary_executions.c.created_at.desc()).limit(1)).mappings().first()
+        if row:
+            relay_row = connection.execute(
+                select(relay_signals.c.entry_quote).where(relay_signals.c.signal_id == row["signal_id"]).limit(1)
+            ).first()
+            if relay_row and relay_row[0] is not None:
+                relay_entry_quote = float(relay_row[0])
     public_fields = (
         "id", "signal_id", "strategy_version", "direction", "contract_type", "symbol",
         "deriv_account_id", "account_type", "duration", "duration_unit", "stake", "currency",
@@ -245,6 +252,12 @@ def execution_snapshot(user_id: str, deriv_account_id: str, *, engine: Engine | 
         "settlement_payout", "settlement_timestamp", "settlement_price", "recovery_status", "created_at", "updated_at",
     )
     public = {field: row[field] for field in public_fields} if row else None
+    if public is not None:
+        # The relay entry quote is the underlying EURUSD decision price. It is safe
+        # to expose only for this already user/account-scoped execution snapshot and
+        # lets the mobile UI show whether a running CALL/PUT is currently above or
+        # below its entry without exposing the relay payload itself.
+        public["entry_quote"] = relay_entry_quote
     return {"ok": True, "account": setting,
             "running_contract": public if row and row["broker_status"] not in {"WON", "LOST", "SETTLED"} else None,
             "last_execution": public}
