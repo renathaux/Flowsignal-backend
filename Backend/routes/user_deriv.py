@@ -91,9 +91,10 @@ def oauth_exchange(payload: OAuthExchangeRequest, request: Request):
 def status(payload: ConnectionRequest, request: Request):
     user = current_user(request)
     try:
-        return connection_snapshot(payload.connection_id.strip(), user_id=user.id)
+        return connection_snapshot(payload.connection_id.strip(), user_id=user.id, validate_token=True)
     except RuntimeError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
+        status_code = 401 if str(exc) == "DERIV_TOKEN_INVALID" else 403
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
 
 @router.post("/disconnect")
