@@ -80,6 +80,12 @@ binary_executions = Table(
     Column("settlement_timestamp", Integer),
     Column("settlement_price", Float),
     Column("broker_payload_json", Text),
+    Column("recovery_status", String(32)),
+    Column("recovery_lease_owner", String(128)),
+    Column("recovery_lease_expires_at", Float),
+    Column("recovery_attempt_count", Integer, nullable=False, default=0),
+    Column("recovery_next_retry_at", Float),
+    Column("recovery_error_code", String(64)),
     Column("created_at", Float, nullable=False),
     Column("updated_at", Float, nullable=False),
     UniqueConstraint("user_id", "deriv_account_id", "strategy_version", "signal_id", name="uq_deriv_binary_execution"),
@@ -236,7 +242,7 @@ def execution_snapshot(user_id: str, deriv_account_id: str, *, engine: Engine | 
         "deriv_account_id", "account_type", "duration", "duration_unit", "stake", "currency",
         "proposal_id", "contract_id", "transaction_id", "purchase_timestamp", "expiry_timestamp",
         "buy_price", "potential_payout", "broker_status", "outcome", "profit_loss",
-        "settlement_payout", "settlement_timestamp", "settlement_price", "created_at", "updated_at",
+        "settlement_payout", "settlement_timestamp", "settlement_price", "recovery_status", "created_at", "updated_at",
     )
     public = {field: row[field] for field in public_fields} if row else None
     return {"ok": True, "account": setting,

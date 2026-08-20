@@ -222,6 +222,25 @@ def private_selected_account(connection_id: str, user_id: str) -> dict[str, Any]
     return {"access_token": token, "account": account, "account_id": selected}
 
 
+def private_account(connection_id: str, user_id: str, account_id: str) -> dict[str, Any]:
+    """Return one exact owned account for monitor-only recovery.
+
+    Unlike new execution, settlement recovery does not require this account to
+    remain selected; it does require the persisted user, connection and Deriv
+    account identities to match exactly.
+    """
+    record = _record(connection_id, user_id)
+    if not record:
+        raise RuntimeError("DERIV_RECOVERY_RECONNECT_REQUIRED")
+    wanted = str(account_id or "").strip()
+    account = next((item for item in record.get("accounts") or []
+                    if str(item.get("account_id") or item.get("id") or item.get("loginid") or "").strip() == wanted), None)
+    token = str(record.get("access_token") or "").strip()
+    if not account or not token:
+        raise RuntimeError("DERIV_RECOVERY_ACCOUNT_NOT_AUTHORIZED")
+    return {"access_token": token, "account": account, "account_id": wanted}
+
+
 def assert_demo_connection(connection_id: str, user_id: str | None = None) -> dict[str, Any]:
     snapshot = connection_snapshot(connection_id, user_id=user_id)
     if not snapshot.get("connected"): raise RuntimeError("Deriv is not connected")
