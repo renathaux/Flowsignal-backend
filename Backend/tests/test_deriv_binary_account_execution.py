@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,6 +19,7 @@ if str(BACKEND) not in sys.path:
 from services.deriv_binary_execution_service import (
     DURATION, DURATION_UNIT, SYMBOL, account_settings, account_type,
     binary_accounts, binary_executions, execute_relayed_signal,
+    execution_snapshot,
     execute_signal_candidates,
     genuine_signal_validation, latest_relay_signal,
     save_account_settings, select_account, sync_accounts,
@@ -138,6 +140,10 @@ class AccountAwareBinaryExecutionTests(unittest.TestCase):
         with self.engine.begin() as c: row=c.execute(select(binary_executions)).mappings().one()
         self.assertEqual((row["proposal_id"],row["contract_id"],row["outcome"],row["profit_loss"]),("p1","c1","WIN",0.8))
         self.assertEqual((row["strategy_version"],row["rule_hash"]),(STRATEGY_VERSION,RULE_HASH))
+        snapshot=execution_snapshot("u1","VIRTUAL123",engine=self.engine)
+        self.assertNotIn("user_id",snapshot["last_execution"])
+        self.assertNotIn("rule_hash",snapshot["last_execution"])
+        self.assertNotIn("broker_payload_json",snapshot["last_execution"])
 
     def test_same_signal_is_independent_across_accounts_but_duplicate_safe(self):
         first=self.prepare("u1",self.demo("V1")); self.run_signal(first,"u1")
@@ -146,12 +152,63 @@ class AccountAwareBinaryExecutionTests(unittest.TestCase):
         self.assertEqual(duplicate["reason"],"SIGNAL_ALREADY_EXECUTED")
         with self.engine.begin() as c: self.assertEqual(c.execute(select(func.count()).select_from(binary_executions)).scalar_one(),2)
 
+    def test_simultaneous_attempts_make_only_one_broker_call(self):
+        private=self.prepare(); calls=[]
+        def broker(*_): calls.append(1); return self.broker_result()
+        with patch("services.deriv_binary_execution_service.private_selected_account",return_value=private):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results=list(pool.map(lambda _:execute_relayed_signal("u1","conn",self.signal_id,engine=self.engine,broker=broker),range(2)))
+        self.assertEqual(calls,[1])
+        self.assertEqual(sum(bool(result.get("executed")) for result in results),1)
+        self.assertEqual(sum(result.get("reason")=="SIGNAL_ALREADY_EXECUTED" for result in results),1)
+
     def test_restart_safe_reserved_row_blocks_second_purchase(self):
         private=self.prepare(); calls=[]
         def failed(*_): calls.append(1); raise RuntimeError("transport uncertain")
         with self.assertRaises(RuntimeError): self.run_signal(private,broker=failed)
         self.assertEqual(self.run_signal(private,broker=lambda *_:calls.append(2))["reason"],"SIGNAL_ALREADY_EXECUTED")
         self.assertEqual(calls,[1])
+
+    def test_proposal_checkpoint_survives_failure_and_blocks_retry(self):
+        private=self.prepare(); calls=[]
+        def failed(context,*_):
+            calls.append("proposal"); context["checkpoint"]("PROPOSED",proposal_id="proposal-durable")
+            raise RuntimeError("socket closed before buy")
+        with self.assertRaises(RuntimeError): self.run_signal(private,broker=failed)
+        with self.engine.begin() as c: row=c.execute(select(binary_executions)).mappings().one()
+        self.assertEqual((row["proposal_id"],row["broker_status"]),("proposal-durable","PROPOSAL_FAILED_SAFE"))
+        self.assertEqual(self.run_signal(private,broker=lambda *_:calls.append("retry"))["reason"],"SIGNAL_ALREADY_EXECUTED")
+        self.assertEqual(calls,["proposal"])
+
+    def test_purchase_timeout_is_ambiguous_and_never_retried(self):
+        private=self.prepare(); calls=[]
+        def uncertain(context,*_):
+            calls.append("buy-request"); context["checkpoint"]("PROPOSED",proposal_id="p-timeout")
+            context["checkpoint"]("PURCHASE_REQUEST_SENT",proposal_id="p-timeout")
+            raise TimeoutError("no buy response")
+        with self.assertRaises(TimeoutError): self.run_signal(private,broker=uncertain)
+        with self.engine.begin() as c: row=c.execute(select(binary_executions)).mappings().one()
+        self.assertEqual(row["broker_status"],"PURCHASE_AMBIGUOUS")
+        self.assertNotIn("no buy response",row["broker_payload_json"])
+        self.assertEqual(self.run_signal(private,broker=lambda *_:calls.append("retry"))["reason"],"SIGNAL_ALREADY_EXECUTED")
+        self.assertEqual(calls,["buy-request"])
+
+    def test_purchase_checkpoint_survives_settlement_monitor_timeout(self):
+        private=self.prepare()
+        def pending(context,*_):
+            context["checkpoint"]("PROPOSED",proposal_id="p1")
+            context["checkpoint"]("PURCHASED",contract_id="c1",transaction_id="t1",buy_price=1.0,purchase_timestamp=1100)
+            raise TimeoutError("settlement stream interrupted")
+        with self.assertRaises(TimeoutError): self.run_signal(private,broker=pending)
+        with self.engine.begin() as c: row=c.execute(select(binary_executions)).mappings().one()
+        self.assertEqual((row["contract_id"],row["broker_status"]),("c1","SETTLEMENT_PENDING"))
+
+    def test_cross_user_cannot_read_or_change_other_account_settings(self):
+        self.prepare("u1",self.demo("V1"),stake=7)
+        with self.assertRaisesRegex(RuntimeError,"DERIV_ACCOUNT_NOT_FOUND"):
+            account_settings("u2","V1",engine=self.engine)
+        with self.assertRaisesRegex(RuntimeError,"DERIV_ACCOUNT_NOT_FOUND"):
+            save_account_settings("u2","V1",enabled=True,stake=99,engine=self.engine)
 
     def test_candidate_dispatch_uses_each_selected_auto_account(self):
         first=self.prepare("u1",self.demo("V1")); self.prepare("u2",self.demo("V2")); calls=[]
