@@ -99,8 +99,10 @@ def exchange_authorization_code(code: str, code_verifier: str, *, user_id: str, 
 
 def fetch_options_accounts(access_token: str) -> list[dict[str, Any]]:
     response = requests.get(f"{DERIV_API_BASE}/trading/v1/options/accounts", headers=_headers(access_token), timeout=15)
+    if response.status_code in {401, 403}:
+        raise RuntimeError("DERIV_TOKEN_INVALID")
     if not response.ok:
-        raise RuntimeError(f"Deriv account lookup failed ({response.status_code})")
+        raise RuntimeError("DERIV_ACCOUNT_LOOKUP_UNAVAILABLE")
     payload = response.json()
     if isinstance(payload, list):
         return [item for item in payload if isinstance(item, dict)]
@@ -157,10 +159,25 @@ def _record(connection_id: str, user_id: str | None = None) -> dict[str, Any] | 
     return stored
 
 
-def connection_snapshot(connection_id: str, user_id: str | None = None) -> dict[str, Any]:
+def connection_snapshot(connection_id: str, user_id: str | None = None, *, validate_token: bool = False) -> dict[str, Any]:
     record = _record(connection_id, user_id)
     if not record:
         return {"connected": False, "account_aware": True}
+    if validate_token and time.time() - float(record.get("token_validated_at") or 0) >= 60:
+        try:
+            refreshed = fetch_options_accounts(str(record.get("access_token") or ""))
+        except RuntimeError as exc:
+            if str(exc) == "DERIV_TOKEN_INVALID":
+                disconnect(connection_id, user_id)
+            raise
+        refreshed_ids = {str(item.get("account_id") or item.get("id") or item.get("loginid") or "").strip() for item in refreshed}
+        selected = str(record.get("selected_account_id") or "").strip()
+        if selected and selected not in refreshed_ids:
+            raise RuntimeError("DERIV_SELECTED_ACCOUNT_NOT_AUTHORIZED")
+        with _LOCK:
+            _CONNECTIONS[connection_id]["accounts"] = refreshed
+            _CONNECTIONS[connection_id]["token_validated_at"] = time.time()
+        record = _CONNECTIONS[connection_id]
     public_accounts = [_public_account(item) for item in list(record.get("accounts") or [])]
     demos = [item for item in public_accounts if item.get("demo_verified")]
     return {
