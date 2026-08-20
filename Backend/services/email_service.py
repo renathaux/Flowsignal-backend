@@ -11,19 +11,19 @@ RESEND_API_URL = "https://api.resend.com/emails"
 DEFAULT_GMAIL_FROM = "flowsignal.contact@gmail.com"
 
 
-def _verification_html(code: str) -> str:
+def _code_html(code: str, *, title: str, instruction: str) -> str:
     return (
         "<div style='font-family:Arial,sans-serif;background:#07111e;color:#eaf3ff;"
         "padding:28px;border-radius:16px'>"
-        "<h2 style='margin:0 0 12px'>Verify your FlowSignal account</h2>"
-        "<p style='color:#a9bbce'>Enter this 6-digit code to finish creating your account.</p>"
+        f"<h2 style='margin:0 0 12px'>{title}</h2>"
+        f"<p style='color:#a9bbce'>{instruction}</p>"
         f"<div style='font-size:34px;font-weight:800;letter-spacing:8px;margin:24px 0'>{code}</div>"
         "<p style='color:#a9bbce'>This code expires in 10 minutes. If you did not request it, you can ignore this email.</p>"
         "</div>"
     )
 
 
-def _send_with_resend(email: str, code: str, api_key: str) -> None:
+def _send_with_resend(email: str, code: str, api_key: str, *, subject: str, html: str) -> None:
     sender = str(
         os.getenv("FLOWSIGNAL_EMAIL_FROM", "FlowSignal <onboarding@resend.dev>") or ""
     ).strip()
@@ -33,8 +33,8 @@ def _send_with_resend(email: str, code: str, api_key: str) -> None:
     payload = {
         "from": sender,
         "to": [str(email).strip()],
-        "subject": "Your FlowSignal verification code",
-        "html": _verification_html(code),
+        "subject": subject,
+        "html": html,
     }
     request = urllib.request.Request(
         RESEND_API_URL,
@@ -56,13 +56,13 @@ def _send_with_resend(email: str, code: str, api_key: str) -> None:
         raise RuntimeError("EMAIL_DELIVERY_FAILED") from exc
 
 
-def _send_with_gmail(email: str, code: str, app_password: str) -> None:
+def _send_with_gmail(email: str, app_password: str, *, subject: str, html: str) -> None:
     sender = str(os.getenv("FEEDBACK_EMAIL", DEFAULT_GMAIL_FROM) or DEFAULT_GMAIL_FROM).strip()
     if not sender:
         raise RuntimeError("EMAIL_FROM_NOT_CONFIGURED")
 
-    message = MIMEText(_verification_html(code), "html")
-    message["Subject"] = "Your FlowSignal verification code"
+    message = MIMEText(html, "html")
+    message["Subject"] = subject
     message["From"] = f"FlowSignal <{sender}>"
     message["To"] = str(email).strip()
     try:
@@ -74,15 +74,36 @@ def _send_with_gmail(email: str, code: str, app_password: str) -> None:
         raise RuntimeError("EMAIL_DELIVERY_FAILED") from exc
 
 
-def send_verification_email(email: str, code: str) -> None:
+def _send_code_email(email: str, code: str, *, subject: str, title: str, instruction: str) -> None:
+    html = _code_html(code, title=title, instruction=instruction)
     resend_key = str(os.getenv("RESEND_API_KEY", "") or "").strip()
     if resend_key:
-        _send_with_resend(email, code, resend_key)
+        _send_with_resend(email, code, resend_key, subject=subject, html=html)
         return
 
     gmail_password = str(os.getenv("FEEDBACK_APP_PASSWORD", "") or "").strip()
     if gmail_password:
-        _send_with_gmail(email, code, gmail_password)
+        _send_with_gmail(email, gmail_password, subject=subject, html=html)
         return
 
     raise RuntimeError("EMAIL_PROVIDER_NOT_CONFIGURED")
+
+
+def send_verification_email(email: str, code: str) -> None:
+    _send_code_email(
+        email,
+        code,
+        subject="Your FlowSignal verification code",
+        title="Verify your FlowSignal account",
+        instruction="Enter this 6-digit code to finish creating your account.",
+    )
+
+
+def send_password_reset_email(email: str, code: str) -> None:
+    _send_code_email(
+        email,
+        code,
+        subject="Reset your FlowSignal password",
+        title="Reset your FlowSignal password",
+        instruction="Enter this 6-digit code to choose a new password.",
+    )
