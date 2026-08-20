@@ -16,7 +16,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from services.deriv_binary_v5_forward_validator import (  # noqa: E402
+from services.deriv_binary_simple_strategy import (  # noqa: E402
     DEFAULT_DB_PATH,
     GRANULARITY_SECONDS,
     SYMBOL,
@@ -210,6 +210,10 @@ def main() -> None:
     parser.add_argument("--report", action="store_true")
     parser.add_argument("--once", action="store_true", help="Catch up and exit")
     args = parser.parse_args()
+    # Render still passes the legacy V5 disk filename; keep old research intact
+    # and route the simple strategy to its own durable database.
+    if args.db.name == "deriv_v5_forward_validation.sqlite3":
+        args.db = args.db.with_name("deriv_simple_5m_validation.sqlite3")
     if args.report:
         print(json.dumps(forward_report(args.db), indent=2))
         return
