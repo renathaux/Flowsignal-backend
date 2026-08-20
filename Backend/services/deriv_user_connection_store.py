@@ -96,6 +96,28 @@ def consume_oauth_state(user_id: str, state: str, code_verifier: str, *, engine:
         connection.execute(update(deriv_oauth_states).where(deriv_oauth_states.c.state_hash == state_hash).values(consumed_at=now))
 
 
+def latest_selected_account(user_id: str, authorized_account_ids: set[str], *, engine: Engine | None = None) -> str | None:
+    """Return the user's last explicit selection only when it is still authorized."""
+    if not user_id or not authorized_account_ids:
+        return None
+    chosen = _engine(engine)
+    with chosen.begin() as connection:
+        rows = connection.execute(
+            select(deriv_connections.c.selected_account_id)
+            .where(
+                (deriv_connections.c.user_id == user_id)
+                & (deriv_connections.c.disconnected == False)  # noqa: E712
+                & (deriv_connections.c.selected_account_id.is_not(None))
+            )
+            .order_by(deriv_connections.c.updated_at.desc())
+        ).all()
+    for row in rows:
+        selected = str(row[0] or "").strip()
+        if selected in authorized_account_ids:
+            return selected
+    return None
+
+
 def save_connection(user_id: str, access_token: str, accounts: list[dict[str, Any]], expires_at: float, *, selected_account_id: str | None = None, connection_id: str | None = None, engine: Engine | None = None) -> str:
     chosen = _engine(engine)
     cid = connection_id or secrets.token_urlsafe(32)
