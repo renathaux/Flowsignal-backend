@@ -9,11 +9,14 @@ from services.user_auth_service import (
     create_session,
     current_user,
     current_user_with_csrf,
+    issue_email_verification,
+    mask_email,
     public_user,
     request_session_token,
     revoke_session,
     session_snapshot,
     signup,
+    verify_email_code,
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -29,29 +32,70 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class VerifyEmailRequest(BaseModel):
+    email: str
+    code: str
+
+
+class ResendVerificationRequest(BaseModel):
+    email: str
+
+
+def _delivery_error(exc: RuntimeError) -> HTTPException:
+    code = str(exc)
+    if code == "VERIFICATION_CODE_COOLDOWN":
+        return HTTPException(status_code=429, detail=code)
+    if code == "VERIFICATION_RATE_LIMITED":
+        return HTTPException(status_code=429, detail=code)
+    if code in {"EMAIL_PROVIDER_NOT_CONFIGURED", "EMAIL_FROM_NOT_CONFIGURED", "EMAIL_DELIVERY_FAILED"}:
+        return HTTPException(status_code=503, detail=code)
+    return HTTPException(status_code=400, detail=code)
+
+
 @router.post("/signup")
 def create_account(payload: SignupRequest, response: Response):
     try:
         user = signup(payload.email, payload.password)
-        token, csrf, expires = create_session(user["id"])
+        verification = issue_email_verification(user["email"])
         clear_session_cookie(response)
         return {
             "ok": True,
-            "user": user,
-            "session_token": token,
-            "csrf_token": csrf,
-            "expires_at": expires,
+            "verification_required": True,
+            "email": verification["email"],
+            "expires_in": verification["expires_in"],
+            "resend_after": verification["resend_after"],
         }
     except RuntimeError as exc:
         code = str(exc)
-        status = 409 if code == "EMAIL_ALREADY_REGISTERED" else 400
-        raise HTTPException(status_code=status, detail=code) from exc
+        if code == "EMAIL_ALREADY_REGISTERED":
+            raise HTTPException(status_code=409, detail=code) from exc
+        raise _delivery_error(exc) from exc
 
 
 @router.post("/login")
 def login(payload: LoginRequest, response: Response):
     try:
         row = authenticate(payload.email, payload.password)
+        if str(row.get("role", "user")) == "user" and not bool(row.get("email_verified")):
+            try:
+                verification = issue_email_verification(str(row["email"]))
+                delivery = "sent"
+                masked = verification.get("email") or mask_email(str(row["email"]))
+            except RuntimeError as send_exc:
+                if str(send_exc) == "VERIFICATION_CODE_COOLDOWN":
+                    delivery = "already_sent"
+                    masked = mask_email(str(row["email"]))
+                else:
+                    raise _delivery_error(send_exc) from send_exc
+            clear_session_cookie(response)
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "EMAIL_VERIFICATION_REQUIRED",
+                    "email": masked,
+                    "delivery": delivery,
+                },
+            )
         token, csrf, expires = create_session(str(row["id"]))
         clear_session_cookie(response)
         return {
@@ -61,8 +105,47 @@ def login(payload: LoginRequest, response: Response):
             "csrf_token": csrf,
             "expires_at": expires,
         }
+    except HTTPException:
+        raise
     except RuntimeError as exc:
         raise HTTPException(status_code=401, detail="INVALID_EMAIL_OR_PASSWORD") from exc
+
+
+@router.post("/verify-email")
+def verify_email(payload: VerifyEmailRequest, response: Response):
+    try:
+        user = verify_email_code(payload.email, payload.code)
+        token, csrf, expires = create_session(str(user["id"]))
+        clear_session_cookie(response)
+        return {
+            "ok": True,
+            "verified": True,
+            "user": user,
+            "session_token": token,
+            "csrf_token": csrf,
+            "expires_at": expires,
+        }
+    except RuntimeError as exc:
+        code = str(exc)
+        status = 429 if code == "VERIFICATION_ATTEMPTS_EXCEEDED" else 400
+        raise HTTPException(status_code=status, detail=code) from exc
+
+
+@router.post("/resend-verification")
+def resend_verification(payload: ResendVerificationRequest):
+    try:
+        result = issue_email_verification(payload.email)
+        return {
+            "ok": True,
+            "verification_required": not bool(result.get("verified")),
+            "email": result.get("email") or mask_email(payload.email),
+            "expires_in": result.get("expires_in"),
+            "resend_after": result.get("resend_after"),
+        }
+    except RuntimeError as exc:
+        if str(exc) == "EMAIL_NOT_REGISTERED":
+            return {"ok": True, "verification_required": True}
+        raise _delivery_error(exc) from exc
 
 
 @router.get("/session")
