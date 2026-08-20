@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - codex/email-otp-verification
+  pull_request:
+    branches:
+      - main
 
 jobs:
   verify:
