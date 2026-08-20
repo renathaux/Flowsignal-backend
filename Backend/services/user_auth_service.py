@@ -430,6 +430,28 @@ def revoke_session(token: str, *, engine: Engine | None = None) -> None:
         connection.execute(update(sessions).where(sessions.c.token_hash == _token_hash(token)).values(revoked_at=time.time()))
 
 
+def change_password(user_id: str, current_password: str, new_password: str, current_token: str,
+                    *, engine: Engine | None = None) -> dict[str, Any]:
+    chosen = _engine(engine)
+    now = time.time()
+    new_hash = hash_password(new_password)
+    if hmac.compare_digest(str(new_password), str(current_password)):
+        raise RuntimeError("NEW_PASSWORD_MUST_DIFFER")
+    with chosen.begin() as connection:
+        user = connection.execute(select(users).where(users.c.id == user_id)).mappings().first()
+        if not user or not user["is_active"] or not verify_password(current_password, str(user["password_hash"])):
+            raise RuntimeError("CURRENT_PASSWORD_INVALID")
+        if verify_password(new_password, str(user["password_hash"])):
+            raise RuntimeError("NEW_PASSWORD_MUST_DIFFER")
+        connection.execute(update(users).where(users.c.id == user_id).values(password_hash=new_hash, updated_at=now))
+        connection.execute(update(sessions).where(
+            sessions.c.user_id == user_id,
+            sessions.c.revoked_at.is_(None),
+            sessions.c.token_hash != _token_hash(current_token),
+        ).values(revoked_at=now))
+    return {"ok": True, "other_sessions_revoked": True}
+
+
 def require_admin(request: Request) -> CurrentUser:
     user = current_user(request)
     if not user.is_admin:
