@@ -143,10 +143,15 @@ def execution_status(deriv_account_id: str, request: Request):
 
 
 @router.get("/binary/history/{deriv_account_id}")
-def history(deriv_account_id: str, request: Request, limit: int = 50):
+def history(deriv_account_id: str, request: Request, limit: int = 50, offset: int = 0):
     user = current_user(request)
     try:
-        return execution_history(user.id, deriv_account_id.strip(), limit=max(1, min(int(limit), 100)))
+        return execution_history(
+            user.id,
+            deriv_account_id.strip(),
+            limit=max(1, min(int(limit), 100)),
+            offset=max(0, int(offset)),
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
