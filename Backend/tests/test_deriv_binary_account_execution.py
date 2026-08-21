@@ -127,10 +127,9 @@ class AccountAwareBinaryExecutionTests(unittest.TestCase):
         with self.engine.begin() as c: row=c.execute(select(binary_executions)).mappings().one()
         self.assertEqual((seen["direction"],row["contract_type"],row["symbol"],row["duration"],row["duration_unit"]),("RISE","CALL",SYMBOL,5,"m"))
 
-    def test_broker_encodes_five_minutes_as_absolute_expiry(self):
+    def test_broker_encodes_five_minutes_as_300_seconds(self):
         source=(BACKEND/"services"/"deriv_binary_execution_service.py").read_text()
-        self.assertIn("proposal_expiry = int(time.time()) + (DURATION * 60)",source)
-        self.assertIn('"date_expiry":proposal_expiry',source)
+        self.assertIn('"duration":DURATION * 60,"duration_unit":"s"',source)
         self.assertNotIn('"duration":DURATION,"duration_unit":DURATION_UNIT,"underlying_symbol"',source)
 
     def test_fall_maps_to_put_without_recalculation(self):

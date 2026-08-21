@@ -310,13 +310,11 @@ async def _broker_async(access_token: str, account: dict[str, Any], direction: s
     if expected_path not in url: raise RuntimeError("DERIV_OTP_ACCOUNT_TYPE_MISMATCH")
     contract_type = "CALL" if direction == "RISE" else "PUT"
     async with websockets.connect(url, open_timeout=10, close_timeout=5) as ws:
-        # The Options API rejects the relative 5/m representation for EURUSD
-        # CALL/PUT with ContractBuyValidationError. Its proposal schema supports
-        # the equivalent absolute expiry, so retain the exact five-minute rule
-        # while avoiding any strategy/filter change.
-        proposal_expiry = int(time.time()) + (DURATION * 60)
+        # Encode the fixed five-minute expiry in seconds. The Options API rejects
+        # both 5/m and the equivalent absolute timestamp for this EURUSD request;
+        # 300/s is the remaining schema-equivalent form and changes no strategy rule.
         await ws.send(json.dumps({"proposal":1,"amount":stake,"basis":"stake","contract_type":contract_type,
-            "currency":currency,"date_expiry":proposal_expiry,"underlying_symbol":SYMBOL,"req_id":101}))
+            "currency":currency,"duration":DURATION * 60,"duration_unit":"s","underlying_symbol":SYMBOL,"req_id":101}))
         proposal = (await _recv(ws,101)).get("proposal") or {}; proposal_id=str(proposal.get("id") or "")
         if not proposal_id: raise RuntimeError("DERIV_PROPOSAL_ID_MISSING")
         ask=float(proposal.get("ask_price") or stake)
