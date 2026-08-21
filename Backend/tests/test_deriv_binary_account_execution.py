@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, func, select, update
 
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
@@ -180,6 +180,26 @@ class AccountAwareBinaryExecutionTests(unittest.TestCase):
         self.assertEqual(result["reason"], "BINARY_ACTIVE_CONTRACT_EXISTS")
         self.assertEqual(calls, [])
 
+    def test_confirmed_unsettled_contract_blocks_overlap_in_every_recovery_status(self):
+        for status in ("FAILED_SAFE", "SETTLEMENT_PENDING", "RECOVERING", "RECOVERY_RETRY", "RECONNECT_REQUIRED"):
+            with self.subTest(status=status):
+                self.engine.dispose()
+                self.temp.cleanup()
+                self.setUp()
+                private = self.prepare()
+                with self.engine.begin() as c:
+                    c.execute(binary_executions.insert().values(
+                        user_id="u1", deriv_account_id="VIRTUAL123", account_type="DEMO",
+                        strategy_version=STRATEGY_VERSION, rule_hash=RULE_HASH, signal_id=f"prior-{status}",
+                        direction="RISE", contract_type="CALL", symbol=SYMBOL, duration=15,
+                        duration_unit="m", stake=10, currency="USD", contract_id=f"contract-{status}",
+                        broker_status=status, created_at=900, updated_at=900,
+                    ))
+                calls=[]
+                result=self.run_signal(private, broker=lambda *_:calls.append(1))
+                self.assertEqual(result["reason"], "BINARY_ACTIVE_CONTRACT_EXISTS")
+                self.assertEqual(calls, [])
+
     def test_fall_maps_to_put_without_recalculation(self):
         fall_id=f"{STRATEGY_VERSION}:{SYMBOL}:1000:FALL"
         with self.engine.begin() as c:
@@ -266,6 +286,33 @@ class AccountAwareBinaryExecutionTests(unittest.TestCase):
         with self.engine.begin() as c: row=c.execute(select(binary_executions)).mappings().one()
         self.assertEqual((row["contract_id"],row["broker_status"]),("c1","SETTLEMENT_PENDING"))
         self.assertIsNotNone(execution_snapshot("u1","VIRTUAL123",engine=self.engine)["running_contract"])
+
+    def test_recovery_status_cannot_turn_confirmed_purchase_timeout_into_failed_safe(self):
+        private=self.prepare()
+        def pending(context,*_):
+            context["checkpoint"]("PROPOSED",proposal_id="p1")
+            context["checkpoint"]("PURCHASED",contract_id="c1",transaction_id="t1",buy_price=1.0,purchase_timestamp=1100)
+            with self.engine.begin() as c:
+                c.execute(update(binary_executions).values(broker_status="RECOVERING"))
+            raise TimeoutError("settlement stream interrupted")
+        with self.assertRaises(TimeoutError): self.run_signal(private,broker=pending)
+        with self.engine.begin() as c: row=c.execute(select(binary_executions)).mappings().one()
+        self.assertEqual((row["contract_id"],row["broker_status"]),("c1","SETTLEMENT_PENDING"))
+
+    def test_original_monitor_timeout_never_overwrites_recovered_settlement(self):
+        private=self.prepare()
+        def recovered(context,*_):
+            context["checkpoint"]("PROPOSED",proposal_id="p1")
+            context["checkpoint"]("PURCHASED",contract_id="c1",transaction_id="t1",buy_price=1.0,purchase_timestamp=1100)
+            with self.engine.begin() as c:
+                c.execute(update(binary_executions).values(
+                    broker_status="WON", outcome="WIN", profit_loss=0.8,
+                    settlement_timestamp=1400, updated_at=1400,
+                ))
+            raise TimeoutError("original monitor closed")
+        with self.assertRaises(TimeoutError): self.run_signal(private,broker=recovered)
+        with self.engine.begin() as c: row=c.execute(select(binary_executions)).mappings().one()
+        self.assertEqual((row["broker_status"],row["outcome"],row["settlement_timestamp"]),("WON","WIN",1400))
 
     def test_failed_or_unpurchased_execution_is_never_reported_live(self):
         private=self.prepare()

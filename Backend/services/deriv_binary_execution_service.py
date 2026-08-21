@@ -279,10 +279,13 @@ def execution_snapshot(user_id: str, deriv_account_id: str, *, engine: Engine | 
         # lets the mobile UI show whether a running CALL/PUT is currently above or
         # below its entry without exposing the relay payload itself.
         public["entry_quote"] = relay_entry_quote
+    # A confirmed contract remains live/lock-active until settlement is
+    # durably recorded. Recovery statuses are monitor state, not permission to
+    # purchase an overlapping contract.
     is_confirmed_live = bool(
         row
         and str(row.get("contract_id") or "").strip()
-        and str(row.get("broker_status") or "").upper() in ACTIVE_CONTRACT_STATUSES
+        and not row.get("settlement_timestamp")
     )
     return {"ok": True, "account": setting,
             "running_contract": public if is_confirmed_live else None,
@@ -373,7 +376,7 @@ def execute_relayed_signal(user_id: str, connection_id: str, signal_id: str, *, 
             (binary_executions.c.user_id == user_id) &
             (binary_executions.c.deriv_account_id == aid) &
             binary_executions.c.contract_id.is_not(None) &
-            binary_executions.c.broker_status.in_(ACTIVE_CONTRACT_STATUSES)
+            binary_executions.c.settlement_timestamp.is_(None)
         ).limit(1)).first()
         if active: return {"ok":False,"reason":"BINARY_ACTIVE_CONTRACT_EXISTS","broker_action":False}
         direction=signal["direction"]; contract_type="CALL" if direction=="RISE" else "PUT"; now=time.time()
@@ -410,15 +413,29 @@ def execute_relayed_signal(user_id: str, connection_id: str, signal_id: str, *, 
             safe_error = safe_error.replace(access_token, "[REDACTED]")
         safe_error = safe_error[:300]
         with chosen.begin() as connection:
-            current = connection.execute(select(binary_executions.c.broker_status).where(binary_executions.c.id == execution_id)).scalar_one()
-            safe_status = {
-                "PURCHASE_REQUEST_SENT": "PURCHASE_AMBIGUOUS",
-                "PURCHASED": "SETTLEMENT_PENDING",
-            }.get(str(current), "PROPOSAL_FAILED_SAFE" if current == "PROPOSED" else "FAILED_SAFE")
-            connection.execute(update(binary_executions).where(binary_executions.c.id==execution_id).values(
-                broker_status=safe_status,broker_payload_json=json.dumps({
-                    "error_code": type(exc).__name__, "error": safe_error,
-                }),updated_at=time.time()))
+            current = connection.execute(select(
+                binary_executions.c.broker_status,
+                binary_executions.c.contract_id,
+                binary_executions.c.settlement_timestamp,
+            ).where(binary_executions.c.id == execution_id)).mappings().one()
+            if current["settlement_timestamp"]:
+                # Recovery may have completed while the original websocket
+                # monitor was unwinding. Never overwrite a durable settlement.
+                safe_status = str(current["broker_status"])
+            elif str(current["contract_id"] or "").strip():
+                # Once Deriv returned a contract id this is a confirmed
+                # purchase awaiting settlement, regardless of recovery status.
+                safe_status = "SETTLEMENT_PENDING"
+            else:
+                safe_status = {
+                    "PURCHASE_REQUEST_SENT": "PURCHASE_AMBIGUOUS",
+                }.get(str(current["broker_status"]),
+                      "PROPOSAL_FAILED_SAFE" if current["broker_status"] == "PROPOSED" else "FAILED_SAFE")
+            if not current["settlement_timestamp"]:
+                connection.execute(update(binary_executions).where(binary_executions.c.id==execution_id).values(
+                    broker_status=safe_status,broker_payload_json=json.dumps({
+                        "error_code": type(exc).__name__, "error": safe_error,
+                    }),updated_at=time.time()))
         print(json.dumps({"event": "BINARY_BROKER_FAILED_SAFE", "execution_id": execution_id,
                           "account_id": aid, "account_type": acct["account_type"],
                           "signal_id": signal_id, "status": safe_status, "error": safe_error}), flush=True)
