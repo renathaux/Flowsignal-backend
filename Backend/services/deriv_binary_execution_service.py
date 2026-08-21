@@ -25,7 +25,8 @@ from services.deriv_service import DERIV_API_BASE, _headers, private_selected_ac
 from services.deriv_v5_demo_relay_service import RULE_HASH, STRATEGY_VERSION, relay_signals
 
 SYMBOL = "frxEURUSD"
-DURATION = 5
+SIGNAL_TIMEFRAME_MINUTES = 5
+DEFAULT_CONTRACT_DURATION_MINUTES = 15
 DURATION_UNIT = "m"
 DEFAULT_STAKE = 1.0
 REAL_EXECUTION_FLAG = "BINARY_REAL_EXECUTION_ENABLED"
@@ -47,6 +48,7 @@ binary_accounts = Table(
     Column("selected", Boolean, nullable=False, default=False),
     Column("binary_auto_enabled", Boolean, nullable=False, default=False),
     Column("binary_stake", Float, nullable=False, default=DEFAULT_STAKE),
+    Column("binary_duration_minutes", Integer, nullable=False, default=DEFAULT_CONTRACT_DURATION_MINUTES),
     Column("updated_at", Float, nullable=False),
     UniqueConstraint("user_id", "deriv_account_id", name="uq_deriv_binary_account"),
 )
@@ -189,7 +191,8 @@ def sync_accounts(user_id: str, connection_id: str, accounts: list[dict[str, Any
                 connection.execute(update(binary_accounts).where(binary_accounts.c.id == existing["id"]).values(**values))
             else:
                 connection.execute(binary_accounts.insert().values(user_id=user_id, deriv_account_id=item["account_id"],
-                    binary_auto_enabled=False, binary_stake=DEFAULT_STAKE, **values))
+                    binary_auto_enabled=False, binary_stake=DEFAULT_STAKE,
+                    binary_duration_minutes=DEFAULT_CONTRACT_DURATION_MINUTES, **values))
     return normalized
 
 
@@ -217,17 +220,23 @@ def account_settings(user_id: str, deriv_account_id: str, *, engine: Engine | No
     with chosen.begin() as connection:
         row = connection.execute(select(binary_accounts).where((binary_accounts.c.user_id == user_id) & (binary_accounts.c.deriv_account_id == deriv_account_id))).mappings().first()
     if not row: raise RuntimeError("DERIV_ACCOUNT_NOT_FOUND")
-    return {k: row[k] for k in ("user_id", "deriv_account_id", "account_type", "currency", "balance", "auth_state", "selected", "binary_auto_enabled", "binary_stake")}
+    return {k: row[k] for k in ("user_id", "deriv_account_id", "account_type", "currency", "balance", "auth_state", "selected", "binary_auto_enabled", "binary_stake", "binary_duration_minutes")}
 
 
-def save_account_settings(user_id: str, deriv_account_id: str, *, enabled: bool, stake: float, engine: Engine | None = None) -> dict[str, Any]:
+def save_account_settings(user_id: str, deriv_account_id: str, *, enabled: bool, stake: float,
+                          duration_minutes: Any = None, engine: Engine | None = None) -> dict[str, Any]:
     chosen = _engine(engine)
     try: amount = round(float(stake), 2)
     except (TypeError, ValueError): raise RuntimeError("BINARY_STAKE_INVALID") from None
     if amount <= 0 or amount > 100000: raise RuntimeError("BINARY_STAKE_INVALID")
+    values: dict[str, Any] = {"binary_auto_enabled": bool(enabled), "binary_stake": amount, "updated_at": time.time()}
+    if duration_minutes is not None:
+        if isinstance(duration_minutes, bool) or not isinstance(duration_minutes, int) or not 1 <= duration_minutes <= 60:
+            raise RuntimeError("BINARY_DURATION_INVALID")
+        values["binary_duration_minutes"] = duration_minutes
     with chosen.begin() as connection:
         result = connection.execute(update(binary_accounts).where((binary_accounts.c.user_id == user_id) &
-            (binary_accounts.c.deriv_account_id == deriv_account_id)).values(binary_auto_enabled=bool(enabled), binary_stake=amount, updated_at=time.time()))
+            (binary_accounts.c.deriv_account_id == deriv_account_id)).values(**values))
         if result.rowcount != 1: raise RuntimeError("DERIV_ACCOUNT_NOT_FOUND")
     return account_settings(user_id, deriv_account_id, engine=chosen)
 
@@ -301,6 +310,7 @@ async def _recv(ws, req_id: int, *, terminal: bool = False) -> dict[str, Any]:
 
 
 async def _broker_async(access_token: str, account: dict[str, Any], direction: str, stake: float, currency: str,
+                        duration_minutes: int,
                         checkpoint: Callable[..., None] | None = None) -> dict[str, Any]:
     account_id = account_identifier(account)
     response = requests.post(f"{DERIV_API_BASE}/trading/v1/options/accounts/{account_id}/otp", headers=_headers(access_token), timeout=15)
@@ -310,11 +320,9 @@ async def _broker_async(access_token: str, account: dict[str, Any], direction: s
     if expected_path not in url: raise RuntimeError("DERIV_OTP_ACCOUNT_TYPE_MISMATCH")
     contract_type = "CALL" if direction == "RISE" else "PUT"
     async with websockets.connect(url, open_timeout=10, close_timeout=5) as ws:
-        # Encode the fixed five-minute expiry in seconds. The Options API rejects
-        # both 5/m and the equivalent absolute timestamp for this EURUSD request;
-        # 300/s is the remaining schema-equivalent form and changes no strategy rule.
         await ws.send(json.dumps({"proposal":1,"amount":stake,"basis":"stake","contract_type":contract_type,
-            "currency":currency,"duration":DURATION * 60,"duration_unit":"s","underlying_symbol":SYMBOL,"req_id":101}))
+            "currency":currency,"duration":duration_minutes,"duration_unit":DURATION_UNIT,
+            "underlying_symbol":SYMBOL,"req_id":101}))
         proposal = (await _recv(ws,101)).get("proposal") or {}; proposal_id=str(proposal.get("id") or "")
         if not proposal_id: raise RuntimeError("DERIV_PROPOSAL_ID_MISSING")
         ask=float(proposal.get("ask_price") or stake)
@@ -339,6 +347,7 @@ async def _broker_async(access_token: str, account: dict[str, Any], direction: s
 
 def deriv_broker(account_context: dict[str, Any], direction: str, stake: float, currency: str) -> dict[str, Any]:
     return asyncio.run(_broker_async(account_context["access_token"], account_context["account"], direction, stake, currency,
+                                     int(account_context["duration_minutes"]),
                                      account_context.get("checkpoint")))
 
 
@@ -360,6 +369,13 @@ def execute_relayed_signal(user_id: str, connection_id: str, signal_id: str, *, 
         if not acct: return {"ok":False,"reason":"DERIV_ACCOUNT_IDENTITY_UNCERTAIN","broker_action":False}
         if not acct["binary_auto_enabled"]: return {"ok":False,"reason":"BINARY_AUTO_OFF","broker_action":False}
         if acct["account_type"] == "REAL" and not _real_enabled(): return {"ok":False,"reason":"REAL_BINARY_EXECUTION_DISABLED","broker_action":False}
+        active = connection.execute(select(binary_executions.c.id).where(
+            (binary_executions.c.user_id == user_id) &
+            (binary_executions.c.deriv_account_id == aid) &
+            binary_executions.c.contract_id.is_not(None) &
+            binary_executions.c.broker_status.in_(ACTIVE_CONTRACT_STATUSES)
+        ).limit(1)).first()
+        if active: return {"ok":False,"reason":"BINARY_ACTIVE_CONTRACT_EXISTS","broker_action":False}
         direction=signal["direction"]; contract_type="CALL" if direction=="RISE" else "PUT"; now=time.time()
         try:
             connection.execute(binary_signal_claims.insert().values(
@@ -368,7 +384,8 @@ def execute_relayed_signal(user_id: str, connection_id: str, signal_id: str, *, 
             ))
             result=connection.execute(binary_executions.insert().values(user_id=user_id,deriv_account_id=aid,
                 account_type=acct["account_type"],strategy_version=STRATEGY_VERSION,rule_hash=RULE_HASH,signal_id=signal_id,
-                direction=direction,contract_type=contract_type,symbol=SYMBOL,duration=DURATION,duration_unit=DURATION_UNIT,
+                direction=direction,contract_type=contract_type,symbol=SYMBOL,
+                duration=acct["binary_duration_minutes"],duration_unit=DURATION_UNIT,
                 stake=acct["binary_stake"],currency=acct["currency"],broker_status="RESERVED",created_at=now,updated_at=now))
             execution_id=result.inserted_primary_key[0]
         except IntegrityError:
@@ -383,6 +400,7 @@ def execute_relayed_signal(user_id: str, connection_id: str, signal_id: str, *, 
 
     broker_context = dict(private)
     broker_context["checkpoint"] = checkpoint
+    broker_context["duration_minutes"] = int(acct["binary_duration_minutes"])
     try:
         result=broker(broker_context,direction,float(acct["binary_stake"]),acct["currency"])
     except Exception as exc:

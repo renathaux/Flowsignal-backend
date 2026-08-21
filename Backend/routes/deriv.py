@@ -1,5 +1,5 @@
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, conint
 
 from services.deriv_service import (
     connection_snapshot,
@@ -66,6 +66,7 @@ class BinaryAccountSettingsRequest(BaseModel):
     deriv_account_id: str
     enabled: bool
     stake: float
+    duration_minutes: conint(strict=True, ge=1, le=60) | None = None
 
 
 class BinaryV5ExecutionRequest(BaseModel):
@@ -123,7 +124,11 @@ def select_deriv_account(request: DerivAccountSelectionRequest):
 @router.post("/binary/account-settings")
 def update_binary_account_settings(request: BinaryAccountSettingsRequest):
     try:
-        return save_account_settings(request.user_id.strip(), request.deriv_account_id.strip(), enabled=request.enabled, stake=request.stake)
+        return save_account_settings(
+            request.user_id.strip(), request.deriv_account_id.strip(),
+            enabled=request.enabled, stake=request.stake,
+            duration_minutes=request.duration_minutes,
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

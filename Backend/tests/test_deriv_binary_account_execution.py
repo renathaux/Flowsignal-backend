@@ -18,7 +18,7 @@ if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
 from services.deriv_binary_execution_service import (
-    DURATION, DURATION_UNIT, SYMBOL, account_settings, account_type,
+    DEFAULT_CONTRACT_DURATION_MINUTES, DURATION_UNIT, SYMBOL, account_settings, account_type,
     binary_accounts, binary_executions, binary_signal_claims, execute_relayed_signal,
     execution_snapshot,
     execute_signal_candidates,
@@ -120,17 +120,65 @@ class AccountAwareBinaryExecutionTests(unittest.TestCase):
             result=self.run_signal(private, broker=lambda *_: calls.append(1))
         self.assertEqual(result["reason"], "REAL_BINARY_EXECUTION_DISABLED"); self.assertEqual(calls, [])
 
-    def test_demo_executes_authoritative_rise_as_call_for_exactly_five_minutes(self):
+    def test_demo_executes_signal_as_call_with_saved_contract_duration(self):
         private=self.prepare(); seen={}
-        def broker(_account,direction,stake,currency): seen.update(direction=direction,stake=stake,currency=currency); return self.broker_result()
+        save_account_settings("u1", "VIRTUAL123", enabled=True, stake=2.5, duration_minutes=37, engine=self.engine)
+        def broker(context,direction,stake,currency):
+            seen.update(direction=direction,stake=stake,currency=currency,duration=context["duration_minutes"])
+            return self.broker_result()
         self.assertTrue(self.run_signal(private,broker=broker)["executed"])
         with self.engine.begin() as c: row=c.execute(select(binary_executions)).mappings().one()
-        self.assertEqual((seen["direction"],row["contract_type"],row["symbol"],row["duration"],row["duration_unit"]),("RISE","CALL",SYMBOL,5,"m"))
+        self.assertEqual((seen["direction"],seen["duration"],row["contract_type"],row["symbol"],row["duration"],row["duration_unit"]),("RISE",37,"CALL",SYMBOL,37,"m"))
 
-    def test_broker_encodes_five_minutes_as_300_seconds(self):
+    def test_broker_proposal_uses_exact_saved_duration_in_minutes(self):
         source=(BACKEND/"services"/"deriv_binary_execution_service.py").read_text()
-        self.assertIn('"duration":DURATION * 60,"duration_unit":"s"',source)
-        self.assertNotIn('"duration":DURATION,"duration_unit":DURATION_UNIT,"underlying_symbol"',source)
+        self.assertIn('"duration":duration_minutes,"duration_unit":DURATION_UNIT',source)
+        self.assertNotIn('duration_minutes * 60',source)
+
+    def test_duration_defaults_to_fifteen_and_persists_across_sync_and_other_settings(self):
+        sync_accounts("u1", "conn-1", [self.demo("V1")], engine=self.engine)
+        self.assertEqual(account_settings("u1", "V1", engine=self.engine)["binary_duration_minutes"], DEFAULT_CONTRACT_DURATION_MINUTES)
+        save_account_settings("u1", "V1", enabled=True, stake=10, duration_minutes=23, engine=self.engine)
+        save_account_settings("u1", "V1", enabled=False, stake=11, engine=self.engine)
+        sync_accounts("u1", "conn-2", [self.demo("V1")], engine=self.engine)
+        saved = account_settings("u1", "V1", engine=self.engine)
+        self.assertEqual(saved["binary_duration_minutes"], 23)
+        self.assertEqual(saved["binary_stake"], 11)
+
+    def test_duration_accepts_bounds_and_rejects_invalid_values(self):
+        sync_accounts("u1", "conn", [self.demo("V1")], engine=self.engine)
+        for valid in (1, 60):
+            saved = save_account_settings("u1", "V1", enabled=True, stake=10, duration_minutes=valid, engine=self.engine)
+            self.assertEqual(saved["binary_duration_minutes"], valid)
+        for invalid in (0, 61, 1.5, "15", True):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(RuntimeError, "BINARY_DURATION_INVALID"):
+                save_account_settings("u1", "V1", enabled=True, stake=10, duration_minutes=invalid, engine=self.engine)
+        self.assertEqual(account_settings("u1", "V1", engine=self.engine)["binary_duration_minutes"], 60)
+
+    def test_duration_is_isolated_per_user_and_account(self):
+        sync_accounts("u1", "c1", [self.demo("V1"), self.real("R1")], selected_account_id="V1", engine=self.engine)
+        sync_accounts("u2", "c2", [self.demo("V2")], engine=self.engine)
+        save_account_settings("u1", "V1", enabled=True, stake=10, duration_minutes=11, engine=self.engine)
+        save_account_settings("u1", "R1", enabled=False, stake=1, duration_minutes=22, engine=self.engine)
+        save_account_settings("u2", "V2", enabled=True, stake=10, duration_minutes=33, engine=self.engine)
+        self.assertEqual(account_settings("u1", "V1", engine=self.engine)["binary_duration_minutes"], 11)
+        self.assertEqual(account_settings("u1", "R1", engine=self.engine)["binary_duration_minutes"], 22)
+        self.assertEqual(account_settings("u2", "V2", engine=self.engine)["binary_duration_minutes"], 33)
+
+    def test_active_confirmed_contract_blocks_overlap_for_same_account(self):
+        private = self.prepare()
+        with self.engine.begin() as c:
+            c.execute(binary_executions.insert().values(
+                user_id="u1", deriv_account_id="VIRTUAL123", account_type="DEMO",
+                strategy_version=STRATEGY_VERSION, rule_hash=RULE_HASH, signal_id="prior",
+                direction="RISE", contract_type="CALL", symbol=SYMBOL, duration=15,
+                duration_unit="m", stake=10, currency="USD", contract_id="active-1",
+                broker_status="OPEN", created_at=900, updated_at=900,
+            ))
+        calls=[]
+        result=self.run_signal(private, broker=lambda *_:calls.append(1))
+        self.assertEqual(result["reason"], "BINARY_ACTIVE_CONTRACT_EXISTS")
+        self.assertEqual(calls, [])
 
     def test_fall_maps_to_put_without_recalculation(self):
         fall_id=f"{STRATEGY_VERSION}:{SYMBOL}:1000:FALL"

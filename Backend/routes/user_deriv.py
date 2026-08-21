@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, conint
 
 from services.deriv_service import (
     bind_oauth_state,
@@ -47,6 +47,7 @@ class AccountSettingsRequest(BaseModel):
     deriv_account_id: str
     enabled: bool
     stake: float
+    duration_minutes: conint(strict=True, ge=1, le=60) | None = None
 
 
 class V5ExecutionRequest(BaseModel):
@@ -129,7 +130,10 @@ def get_account_settings(deriv_account_id: str, request: Request):
 def update_account_settings(payload: AccountSettingsRequest, request: Request):
     user = current_user_with_csrf(request)
     try:
-        return save_account_settings(user.id, payload.deriv_account_id.strip(), enabled=payload.enabled, stake=payload.stake)
+        return save_account_settings(
+            user.id, payload.deriv_account_id.strip(), enabled=payload.enabled,
+            stake=payload.stake, duration_minutes=payload.duration_minutes,
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
