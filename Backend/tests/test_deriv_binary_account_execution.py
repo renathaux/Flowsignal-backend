@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -18,7 +19,7 @@ if str(BACKEND) not in sys.path:
 
 from services.deriv_binary_execution_service import (
     DURATION, DURATION_UNIT, SYMBOL, account_settings, account_type,
-    binary_accounts, binary_executions, execute_relayed_signal,
+    binary_accounts, binary_executions, binary_signal_claims, execute_relayed_signal,
     execution_snapshot,
     execute_signal_candidates,
     genuine_signal_validation, latest_relay_signal,
@@ -152,6 +153,15 @@ class AccountAwareBinaryExecutionTests(unittest.TestCase):
         self.assertEqual(duplicate["reason"],"SIGNAL_ALREADY_EXECUTED")
         with self.engine.begin() as c: self.assertEqual(c.execute(select(func.count()).select_from(binary_executions)).scalar_one(),2)
 
+    def test_same_physical_account_is_claimed_once_across_legacy_users(self):
+        first=self.prepare("u1",self.demo("V1")); second=self.prepare("u2",self.demo("V1")); calls=[]
+        self.run_signal(first,"u1",broker=lambda *_:calls.append("u1") or self.broker_result())
+        duplicate=self.run_signal(second,"u2",broker=lambda *_:calls.append("u2") or self.broker_result())
+        self.assertEqual(duplicate["reason"],"SIGNAL_ALREADY_EXECUTED")
+        self.assertEqual(calls,["u1"])
+        with self.engine.begin() as c:
+            self.assertEqual(c.execute(select(func.count()).select_from(binary_signal_claims)).scalar_one(),1)
+
     def test_simultaneous_attempts_make_only_one_broker_call(self):
         private=self.prepare(); calls=[]
         def broker(*_): calls.append(1); return self.broker_result()
@@ -189,7 +199,7 @@ class AccountAwareBinaryExecutionTests(unittest.TestCase):
         with self.assertRaises(TimeoutError): self.run_signal(private,broker=uncertain)
         with self.engine.begin() as c: row=c.execute(select(binary_executions)).mappings().one()
         self.assertEqual(row["broker_status"],"PURCHASE_AMBIGUOUS")
-        self.assertNotIn("no buy response",row["broker_payload_json"])
+        self.assertIn("no buy response",row["broker_payload_json"])
         self.assertEqual(self.run_signal(private,broker=lambda *_:calls.append("retry"))["reason"],"SIGNAL_ALREADY_EXECUTED")
         self.assertEqual(calls,["buy-request"])
 
@@ -202,6 +212,23 @@ class AccountAwareBinaryExecutionTests(unittest.TestCase):
         with self.assertRaises(TimeoutError): self.run_signal(private,broker=pending)
         with self.engine.begin() as c: row=c.execute(select(binary_executions)).mappings().one()
         self.assertEqual((row["contract_id"],row["broker_status"]),("c1","SETTLEMENT_PENDING"))
+        self.assertIsNotNone(execution_snapshot("u1","VIRTUAL123",engine=self.engine)["running_contract"])
+
+    def test_failed_or_unpurchased_execution_is_never_reported_live(self):
+        private=self.prepare()
+        with self.assertRaisesRegex(RuntimeError,"proposal rejected"):
+            self.run_signal(private,broker=lambda *_:(_ for _ in ()).throw(RuntimeError("proposal rejected")))
+        snapshot=execution_snapshot("u1","VIRTUAL123",engine=self.engine)
+        self.assertIsNone(snapshot["running_contract"])
+        self.assertEqual(snapshot["last_execution"]["broker_status"],"FAILED_SAFE")
+
+    def test_failure_diagnostic_redacts_access_token(self):
+        private=self.prepare(); private["access_token"]="super-secret-token"
+        with self.assertRaises(RuntimeError):
+            self.run_signal(private,broker=lambda *_:(_ for _ in ()).throw(RuntimeError("failure super-secret-token")))
+        with self.engine.begin() as c: payload=c.execute(select(binary_executions.c.broker_payload_json)).scalar_one()
+        self.assertIn("[REDACTED]",payload)
+        self.assertNotIn("super-secret-token",payload)
 
     def test_cross_user_cannot_read_or_change_other_account_settings(self):
         self.prepare("u1",self.demo("V1"),stake=7)
@@ -217,6 +244,16 @@ class AccountAwareBinaryExecutionTests(unittest.TestCase):
         with patch("services.deriv_binary_execution_service.private_selected_account",side_effect=selected):
             results=execute_signal_candidates(self.signal_id,engine=self.engine,broker=lambda context,*_: calls.append(context["account_id"]) or self.broker_result())
         self.assertEqual(sorted(calls),["V1","V2"]); self.assertTrue(all(r["ok"] for r in results))
+
+    def test_candidate_dispatch_uses_newest_session_for_same_account(self):
+        self.prepare("u1",self.demo("V1")); time.sleep(0.01); self.prepare("u2",self.demo("V1")); calls=[]
+        def selected(_connection,user):
+            return {"access_token":"t","account":self.demo("V1"),"account_id":"V1"}
+        with patch("services.deriv_binary_execution_service.private_selected_account",side_effect=selected):
+            results=execute_signal_candidates(self.signal_id,engine=self.engine,
+                broker=lambda _context,*_:calls.append("broker") or self.broker_result())
+        self.assertEqual(calls,["broker"])
+        self.assertEqual(len(results),1)
 
     def test_invalid_stake_and_currency_are_blocked(self):
         sync_accounts("u1","c",[self.demo()],engine=self.engine)

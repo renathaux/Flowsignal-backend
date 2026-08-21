@@ -90,6 +90,18 @@ binary_executions = Table(
     Column("updated_at", Float, nullable=False),
     UniqueConstraint("user_id", "deriv_account_id", "strategy_version", "signal_id", name="uq_deriv_binary_execution"),
 )
+binary_signal_claims = Table(
+    "deriv_binary_signal_claims", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("deriv_account_id", String(255), nullable=False),
+    Column("strategy_version", String(100), nullable=False),
+    Column("signal_id", String(255), nullable=False),
+    Column("user_id", String(255), nullable=False),
+    Column("created_at", Float, nullable=False),
+    UniqueConstraint("deriv_account_id", "strategy_version", "signal_id", name="uq_deriv_binary_account_signal_claim"),
+)
+
+ACTIVE_CONTRACT_STATUSES = frozenset({"PURCHASED", "OPEN", "RUNNING", "SETTLEMENT_PENDING"})
 
 
 def _engine(engine: Engine | None) -> Engine:
@@ -258,8 +270,13 @@ def execution_snapshot(user_id: str, deriv_account_id: str, *, engine: Engine | 
         # lets the mobile UI show whether a running CALL/PUT is currently above or
         # below its entry without exposing the relay payload itself.
         public["entry_quote"] = relay_entry_quote
+    is_confirmed_live = bool(
+        row
+        and str(row.get("contract_id") or "").strip()
+        and str(row.get("broker_status") or "").upper() in ACTIVE_CONTRACT_STATUSES
+    )
     return {"ok": True, "account": setting,
-            "running_contract": public if row and row["broker_status"] not in {"WON", "LOST", "SETTLED"} else None,
+            "running_contract": public if is_confirmed_live else None,
             "last_execution": public}
 
 
@@ -271,7 +288,11 @@ async def _recv(ws, req_id: int, *, terminal: bool = False) -> dict[str, Any]:
     deadline = time.monotonic() + 330
     while time.monotonic() < deadline:
         message = json.loads(await asyncio.wait_for(ws.recv(), timeout=max(1, deadline-time.monotonic())))
-        if message.get("error"): raise RuntimeError(str((message.get("error") or {}).get("message") or "DERIV_WEBSOCKET_ERROR"))
+        if message.get("error"):
+            error = message.get("error") or {}
+            code = re.sub(r"[^A-Za-z0-9_.-]", "_", str(error.get("code") or "WEBSOCKET_ERROR"))[:80]
+            detail = str(error.get("message") or "Deriv websocket request failed").replace("\n", " ")[:240]
+            raise RuntimeError(f"DERIV_{code}: {detail}")
         if message.get("req_id") != req_id: continue
         if not terminal: return message
         contract = message.get("proposal_open_contract") or {}
@@ -338,6 +359,10 @@ def execute_relayed_signal(user_id: str, connection_id: str, signal_id: str, *, 
         if acct["account_type"] == "REAL" and not _real_enabled(): return {"ok":False,"reason":"REAL_BINARY_EXECUTION_DISABLED","broker_action":False}
         direction=signal["direction"]; contract_type="CALL" if direction=="RISE" else "PUT"; now=time.time()
         try:
+            connection.execute(binary_signal_claims.insert().values(
+                deriv_account_id=aid, strategy_version=STRATEGY_VERSION,
+                signal_id=signal_id, user_id=user_id, created_at=now,
+            ))
             result=connection.execute(binary_executions.insert().values(user_id=user_id,deriv_account_id=aid,
                 account_type=acct["account_type"],strategy_version=STRATEGY_VERSION,rule_hash=RULE_HASH,signal_id=signal_id,
                 direction=direction,contract_type=contract_type,symbol=SYMBOL,duration=DURATION,duration_unit=DURATION_UNIT,
@@ -358,6 +383,11 @@ def execute_relayed_signal(user_id: str, connection_id: str, signal_id: str, *, 
     try:
         result=broker(broker_context,direction,float(acct["binary_stake"]),acct["currency"])
     except Exception as exc:
+        safe_error = str(exc).replace("\n", " ")
+        access_token = str(private.get("access_token") or "")
+        if access_token:
+            safe_error = safe_error.replace(access_token, "[REDACTED]")
+        safe_error = safe_error[:300]
         with chosen.begin() as connection:
             current = connection.execute(select(binary_executions.c.broker_status).where(binary_executions.c.id == execution_id)).scalar_one()
             safe_status = {
@@ -365,7 +395,12 @@ def execute_relayed_signal(user_id: str, connection_id: str, signal_id: str, *, 
                 "PURCHASED": "SETTLEMENT_PENDING",
             }.get(str(current), "PROPOSAL_FAILED_SAFE" if current == "PROPOSED" else "FAILED_SAFE")
             connection.execute(update(binary_executions).where(binary_executions.c.id==execution_id).values(
-                broker_status=safe_status,broker_payload_json=json.dumps({"error_code":type(exc).__name__}),updated_at=time.time()))
+                broker_status=safe_status,broker_payload_json=json.dumps({
+                    "error_code": type(exc).__name__, "error": safe_error,
+                }),updated_at=time.time()))
+        print(json.dumps({"event": "BINARY_BROKER_FAILED_SAFE", "execution_id": execution_id,
+                          "account_id": aid, "account_type": acct["account_type"],
+                          "signal_id": signal_id, "status": safe_status, "error": safe_error}), flush=True)
         raise
     values={k:result.get(k) for k in ("proposal_id","contract_id","transaction_id","buy_price","potential_payout","purchase_timestamp","expiry_timestamp","broker_status","outcome","profit_loss","settlement_payout","settlement_timestamp","settlement_price")}
     values.update(broker_payload_json=json.dumps(result.get("raw") or {},default=str),updated_at=time.time())
@@ -388,7 +423,11 @@ def execute_signal_candidates(signal_id: str, *, engine: Engine | None = None,
         rows = connection.execute(select(binary_accounts).where(
             binary_accounts.c.selected.is_(True) & binary_accounts.c.binary_auto_enabled.is_(True) &
             (binary_accounts.c.auth_state == "CONNECTED")
-        )).mappings().all()
+        ).order_by(binary_accounts.c.updated_at.desc())).mappings().all()
+    # A reconnect can leave legacy user/session rows pointing at the same physical
+    # Deriv login. Dispatch only the newest selected row for each exact account.
+    # The durable account-level claim below still closes concurrent race windows.
+    rows = list({row["deriv_account_id"]: row for row in reversed(rows)}.values())
     results = []
     for row in rows:
         try:
