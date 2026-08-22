@@ -9,4 +9,4 @@ if [[ -z "${DATABASE_URL:-}" ]]; then
 fi
 
 python -m alembic -c alembic.ini upgrade head
-exec uvicorn api:app --host 0.0.0.0 --port "${PORT:-10000}"
+exec uvicorn app_bootstrap:app --host 0.0.0.0 --port "${PORT:-10000}"
