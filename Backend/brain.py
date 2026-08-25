@@ -4,6 +4,7 @@ from strategies import shared as _shared
 from strategies import strict_trader as _strict_trader
 from strategies.eurusd_strategy import analyze_eurusd
 from strategies.smc_breakout_adapter import evaluate_15m_breakout as evaluate_smc_15m_breakout
+from strategies.xauusd_risk_guard import build_xauusd_risk_levels
 from strategies.xauusd_strategy import analyze_xauusd
 
 
@@ -36,6 +37,42 @@ def classify_consolidation_observation_only(data_15m, symbol):
 
 
 _strict_trader.classify_consolidation = classify_consolidation_observation_only
+
+
+# XAUUSD stop-loss hardening. Gold remains fully anchored to 15m structure.
+# EURUSD continues to use the generic strict risk builder unchanged.
+_original_build_risk_levels = _strict_trader.build_risk_levels
+
+
+def build_risk_levels_with_xauusd_15m(
+    data_15m,
+    side,
+    entry,
+    symbol,
+    setup_break_time=None,
+    execution_settings=None,
+):
+    normalized = _shared.normalize_symbol(symbol)
+    if normalized != "XAUUSD":
+        return _original_build_risk_levels(
+            data_15m,
+            side,
+            entry,
+            symbol,
+            setup_break_time=setup_break_time,
+            execution_settings=execution_settings,
+        )
+    return build_xauusd_risk_levels(
+        data_15m,
+        side,
+        entry,
+        symbol,
+        setup_break_time=setup_break_time,
+        execution_settings=execution_settings,
+    )
+
+
+_strict_trader.build_risk_levels = build_risk_levels_with_xauusd_15m
 
 
 # Do not let a persisted setup that was blocked by the old consolidation gate
@@ -79,5 +116,6 @@ _shared.analyze_xauusd = analyze_xauusd
 _shared.get_strict_mtf_signal = get_strict_mtf_signal
 _shared.evaluate_smc_15m_breakout = evaluate_smc_15m_breakout
 _shared.classify_consolidation_observation_only = classify_consolidation_observation_only
+_shared.build_risk_levels_with_xauusd_15m = build_risk_levels_with_xauusd_15m
 
 sys.modules[__name__] = _shared

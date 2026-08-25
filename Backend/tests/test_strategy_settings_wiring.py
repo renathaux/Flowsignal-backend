@@ -11,10 +11,16 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-import api
 from models import Base, RuntimeSetting
 from services import strategy_settings_service as settings_service
 from strategies import shared, strict_trader
+
+# Keep these unit tests aimed at the generic strict-trader functions. Importing
+# api activates brain.py's production XAUUSD adapters process-wide.
+ORIGINAL_EVALUATE_15M_BREAKOUT = strict_trader.evaluate_15m_breakout
+ORIGINAL_BUILD_RISK_LEVELS = strict_trader.build_risk_levels
+
+import api
 
 
 class StrategySettingsExecutionCacheTests(unittest.TestCase):
@@ -421,12 +427,12 @@ class StrategySettingsStructureWiringTests(unittest.TestCase):
         with patch.object(strict_trader, "atr14", return_value=0.0), patch.object(
             strict_trader, "detect_raw_swings", return_value=self.swings()
         ), patch.object(strict_trader, "clear_opposite_watch"):
-            buy = strict_trader.evaluate_15m_breakout(
+            buy = ORIGINAL_EVALUATE_15M_BREAKOUT(
                 self.breakout_frame("BUY", 100.26),
                 "XAUUSD",
                 execution_settings=settings,
             )
-            sell = strict_trader.evaluate_15m_breakout(
+            sell = ORIGINAL_EVALUATE_15M_BREAKOUT(
                 self.breakout_frame("SELL", 89.74),
                 "XAUUSD",
                 execution_settings=settings,
@@ -440,17 +446,17 @@ class StrategySettingsStructureWiringTests(unittest.TestCase):
         with patch.object(strict_trader, "atr14", return_value=0.0), patch.object(
             strict_trader, "detect_raw_swings", return_value=self.swings()
         ), patch.object(strict_trader, "clear_opposite_watch"):
-            accepted = strict_trader.evaluate_15m_breakout(
+            accepted = ORIGINAL_EVALUATE_15M_BREAKOUT(
                 self.breakout_frame("BUY", 100.11),
                 "XAUUSD",
                 execution_settings={"bos_buffer_points": 10},
             )
-            rejected = strict_trader.evaluate_15m_breakout(
+            rejected = ORIGINAL_EVALUATE_15M_BREAKOUT(
                 self.breakout_frame("BUY", 100.11),
                 "XAUUSD",
                 execution_settings={"bos_buffer_points": 25},
             )
-            wick_only = strict_trader.evaluate_15m_breakout(
+            wick_only = ORIGINAL_EVALUATE_15M_BREAKOUT(
                 self.breakout_frame("BUY", 100.0),
                 "XAUUSD",
                 execution_settings={"bos_buffer_points": 5},
@@ -634,7 +640,7 @@ class StrategySettingsStructureWiringTests(unittest.TestCase):
             "get_cached_execution_settings",
             side_effect=AssertionError("unexpected second settings read"),
         ):
-            levels = strict_trader.build_risk_levels(
+            levels = ORIGINAL_BUILD_RISK_LEVELS(
                 frame,
                 "BUY",
                 100.0,

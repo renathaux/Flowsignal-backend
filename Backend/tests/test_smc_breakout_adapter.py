@@ -43,7 +43,7 @@ class SmcBreakoutAdapterTests(unittest.TestCase):
             "config": {"source_algorithm": "LudoGH68_SMC_Structures"},
         }
 
-    @patch("strategies.smc_breakout_adapter.analyze_structure")
+    @patch("strategies.smc_breakout_adapter.analyze_legacy_structure")
     def test_fresh_bullish_bos_becomes_v1_buy_break(self, analyze):
         analyze.return_value = self.structure(direction="BULLISH", event_type="BOS", break_index=19)
         result = evaluate_15m_breakout(self.frame(), "EURUSD")
@@ -52,19 +52,33 @@ class SmcBreakoutAdapterTests(unittest.TestCase):
         self.assertEqual(result["source"], "smc_structure_engine")
         self.assertEqual(result["bos_buffer"], 0.0)
 
-    @patch("strategies.smc_breakout_adapter.analyze_structure")
+    @patch("strategies.smc_breakout_adapter.analyze_legacy_structure")
     def test_fresh_bearish_choch_becomes_v1_sell_break(self, analyze):
         analyze.return_value = self.structure(direction="BEARISH", event_type="CHOCH", break_index=19)
         result = evaluate_15m_breakout(self.frame(), "EURUSD")
         self.assertEqual(result["side"], "SELL")
         self.assertEqual(result["break_type"], "CHOCH")
 
-    @patch("strategies.smc_breakout_adapter.analyze_structure")
+    @patch("strategies.smc_breakout_adapter.analyze_legacy_structure")
     def test_historical_chart_event_is_not_fresh_entry(self, analyze):
         analyze.return_value = self.structure(direction="BULLISH", event_type="BOS", break_index=10)
         result = evaluate_15m_breakout(self.frame(), "EURUSD")
         self.assertEqual(result["side"], "WAIT")
         self.assertEqual(result["reason"], "WAIT_NO_FRESH_15M_SMC_BREAK")
+
+    @patch("strategies.smc_breakout_adapter.analyze_xauusd_structure")
+    @patch("strategies.smc_breakout_adapter.analyze_legacy_structure")
+    def test_xauusd_uses_protected_engine_without_changing_eurusd(self, legacy, protected):
+        protected.return_value = self.structure(direction="BULLISH", event_type="BOS", break_index=19)
+        xauusd = evaluate_15m_breakout(self.frame(), "XAUUSD")
+        self.assertEqual(xauusd["side"], "BUY")
+        protected.assert_called_once()
+        legacy.assert_not_called()
+
+        legacy.return_value = self.structure(direction="BULLISH", event_type="BOS", break_index=19)
+        eurusd = evaluate_15m_breakout(self.frame(), "EURUSD")
+        self.assertEqual(eurusd["side"], "BUY")
+        legacy.assert_called_once()
 
 
 if __name__ == "__main__":
