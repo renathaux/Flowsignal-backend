@@ -49,7 +49,7 @@ def detect_confirmed_swings(
     left_bars: int = 2,
     right_bars: int = 2,
 ) -> list[SwingPoint]:
-    """Compatibility helper retained for tests/tools; not the BOS engine."""
+    """Return non-repainting pivots confirmed by bars on both sides."""
     data = _normalize_frame(frame)
     if len(data) < left_bars + right_bars + 1:
         return []
@@ -78,38 +78,26 @@ def detect_confirmed_swings(
     return sorted(swings, key=lambda item: (item.confirmed_index, item.index, item.swing_type))
 
 
-def _highest_index(highs: list[float], end: int, lookback: int = LOOKBACK) -> int:
-    start = max(0, end - lookback + 1)
-    return max(range(start, end + 1), key=lambda idx: (highs[idx], idx))
+def _latest_swing(swings, swing_type, *, before_index=None, after_index=None):
+    candidates = [s for s in swings if s.swing_type == swing_type]
+    if before_index is not None:
+        candidates = [s for s in candidates if s.index < before_index]
+    if after_index is not None:
+        candidates = [s for s in candidates if s.index > after_index]
+    return candidates[-1] if candidates else None
 
 
-def _lowest_index(lows: list[float], end: int, lookback: int = LOOKBACK) -> int:
-    start = max(0, end - lookback + 1)
-    return min(range(start, end + 1), key=lambda idx: (lows[idx], -idx))
-
-
-def _structure_highest_index(highs: list[float], end: int, lookback: int = LOOKBACK) -> int:
-    start = max(0, end - lookback + 1)
-    fallback = _highest_index(highs, end, lookback)
-    chosen = None
-    for idx in range(end - 1, max(start, 1) - 1, -1):
-        if idx + 1 > end:
-            continue
-        if highs[idx] > highs[idx - 1] and highs[idx + 1] <= highs[idx] and idx >= fallback:
-            chosen = idx
-    return fallback if chosen is None else chosen
-
-
-def _structure_lowest_index(lows: list[float], end: int, lookback: int = LOOKBACK) -> int:
-    start = max(0, end - lookback + 1)
-    fallback = _lowest_index(lows, end, lookback)
-    chosen = None
-    for idx in range(end - 1, max(start, 1) - 1, -1):
-        if idx + 1 > end:
-            continue
-        if lows[idx] < lows[idx - 1] and lows[idx + 1] >= lows[idx] and idx >= fallback:
-            chosen = idx
-    return fallback if chosen is None else chosen
+def _serialise_swing(swing):
+    if swing is None:
+        return None
+    return {
+        "type": swing.swing_type,
+        "index": int(swing.index),
+        "confirmed_index": int(swing.confirmed_index),
+        "timestamp": swing.timestamp,
+        "confirmed_timestamp": swing.confirmed_timestamp,
+        "price": float(swing.price),
+    }
 
 
 def _fib_levels(direction, structure_high, structure_low, high_start, low_start, timestamps):
@@ -118,7 +106,7 @@ def _fib_levels(direction, structure_high, structure_low, high_start, low_start,
         return []
     output = []
     for value in FIB_LEVELS:
-        if direction == 1:
+        if direction == 2:
             price = structure_high - (structure_range - structure_range * value)
             start = high_start
         else:
@@ -139,10 +127,15 @@ def analyze_structure(
     left_bars: int = 2,
     right_bars: int = 2,
 ) -> dict:
-    """Port of the TradingView structure state machine, using closed candles.
+    """Analyze external market structure from confirmed, protected pivots.
 
-    left_bars/right_bars are accepted for API compatibility but are not used by
-    this structure engine; the source algorithm uses a 10-bar structure lookback.
+    Internal/local pivots are still returned for chart context, but they do not
+    automatically become BOS/CHoCH levels. A bullish BOS protects the pullback
+    low that led to the new high; only a candle close through that protected
+    higher low can produce a bearish CHoCH. The bearish case is symmetric.
+
+    This prevents the common failure mode where a small internal pullback is
+    promoted to a full structure reversal and then flips the trading direction.
     """
     data = _normalize_frame(frame)
     if data.empty:
@@ -155,131 +148,154 @@ def analyze_structure(
             "config": {"lookback": LOOKBACK, "fvg": False},
         }
 
-    opens = data["Open"].astype(float).tolist()
     highs = data["High"].astype(float).tolist()
     lows = data["Low"].astype(float).tolist()
     closes = data["Close"].astype(float).tolist()
     timestamps = list(data.index)
+    swings = detect_confirmed_swings(
+        data,
+        left_bars=left_bars,
+        right_bars=right_bars,
+    )
 
-    structure_high = highs[0]
-    structure_low = lows[0]
-    structure_high_start = 0
-    structure_low_start = 0
-    # Source mapping: 1=bearish structure, 2=bullish structure, 0=unset.
-    structure_direction = 0
+    confirmed_by_index: dict[int, list[SwingPoint]] = {}
+    for swing in swings:
+        confirmed_by_index.setdefault(swing.confirmed_index, []).append(swing)
+
+    available: list[SwingPoint] = []
+    bias: StructureBias = "NEUTRAL"
+    direction_code = 0
     events = []
+    broken_high: SwingPoint | None = None
+    broken_low: SwingPoint | None = None
+    protected_low: SwingPoint | None = None
+    protected_high: SwingPoint | None = None
+    last_event_index = -1
 
-    for index in range(1, len(data)):
+    for index in range(len(data)):
+        available.extend(confirmed_by_index.get(index, []))
+        if index == 0:
+            continue
+
         close = closes[index]
-        prev1 = closes[index - 1] if index >= 1 else None
-        prev2 = closes[index - 2] if index >= 2 else None
-        prev3 = closes[index - 3] if index >= 3 else None
+        previous_close = closes[index - 1]
+        latest_high = _latest_swing(available, "HIGH", before_index=index + 1)
+        latest_low = _latest_swing(available, "LOW", before_index=index + 1)
 
-        enough_low = (
-            index >= 3
-            and index - 1 > structure_low_start
-            and index - 2 > structure_low_start
-            and index - 3 > structure_low_start
+        high_reference = broken_high or latest_high
+        low_reference = broken_low or latest_low
+
+        if bias == "BULLISH":
+            low_reference = protected_low or low_reference
+        elif bias == "BEARISH":
+            high_reference = protected_high or high_reference
+
+        broke_high = bool(
+            high_reference is not None
+            and index > high_reference.confirmed_index
+            and close > high_reference.price
+            and previous_close <= high_reference.price
         )
-        enough_high = (
-            index >= 3
-            and index - 1 > structure_high_start
-            and index - 2 > structure_high_start
-            and index - 3 > structure_high_start
+        broke_low = bool(
+            low_reference is not None
+            and index > low_reference.confirmed_index
+            and close < low_reference.price
+            and previous_close >= low_reference.price
         )
 
-        low_broken = (
-            index >= 3
-            and close < structure_low
-            and prev1 >= structure_low and prev2 >= structure_low and prev3 >= structure_low
-            and enough_low
-        ) or (structure_direction == 2 and close < structure_low)
-
-        high_broken = (
-            index >= 3
-            and close > structure_high
-            and prev1 <= structure_high and prev2 <= structure_high and prev3 <= structure_high
-            and enough_high
-        ) or (structure_direction == 1 and close > structure_high)
-
-        if low_broken:
-            event_type = "BOS" if structure_direction == 1 else "CHOCH"
-            events.append({
-                "event_type": event_type,
-                "direction": "BEARISH",
-                "timestamp": timestamps[index].isoformat(),
-                "close": float(close),
-                "broken_swing_timestamp": timestamps[structure_low_start].isoformat(),
-                "broken_level": float(structure_low),
-                "structure_start_index": int(structure_low_start),
-                "break_index": int(index),
-                "previous_direction": int(structure_direction),
-                "new_direction": 1,
-            })
-            structure_direction = 1
-            structure_high_start = _structure_highest_index(highs, index, LOOKBACK)
-            structure_low_start = index
-            structure_high = highs[structure_high_start]
-            structure_low = lows[index]
-
-        elif high_broken:
-            event_type = "BOS" if structure_direction == 2 else "CHOCH"
+        if broke_high:
+            previous_bias = bias
+            event_type = "BOS" if bias == "BULLISH" else "CHOCH"
             events.append({
                 "event_type": event_type,
                 "direction": "BULLISH",
                 "timestamp": timestamps[index].isoformat(),
                 "close": float(close),
-                "broken_swing_timestamp": timestamps[structure_high_start].isoformat(),
-                "broken_level": float(structure_high),
-                "structure_start_index": int(structure_high_start),
+                "broken_swing_timestamp": high_reference.timestamp,
+                "broken_level": float(high_reference.price),
+                "structure_start_index": int(high_reference.index),
                 "break_index": int(index),
-                "previous_direction": int(structure_direction),
+                "previous_direction": 2 if previous_bias == "BULLISH" else 1 if previous_bias == "BEARISH" else 0,
                 "new_direction": 2,
+                "importance": "EXTERNAL",
             })
-            structure_direction = 2
-            structure_high_start = index
-            structure_low_start = _structure_lowest_index(lows, index, LOOKBACK)
-            structure_high = highs[index]
-            structure_low = lows[structure_low_start]
+            bias = "BULLISH"
+            direction_code = 2
+            broken_high = latest_high if latest_high is not None else high_reference
+            broken_low = None
+            candidate_low = _latest_swing(
+                available,
+                "LOW",
+                before_index=index,
+                after_index=last_event_index,
+            )
+            if candidate_low is not None:
+                protected_low = candidate_low
+            protected_high = None
+            last_event_index = index
+            continue
 
-        else:
-            if highs[index] > structure_high and structure_direction in (0, 2):
-                can_update = not (
-                    index >= 3
-                    and index - 1 > structure_high_start
-                    and index - 2 > structure_high_start
-                    and index - 3 > structure_high_start
-                )
-                if can_update:
-                    structure_high = highs[index]
-                    structure_high_start = index
-            elif lows[index] < structure_low and structure_direction in (0, 1):
-                can_update = not (
-                    index >= 3
-                    and index - 1 > structure_low_start
-                    and index - 2 > structure_low_start
-                    and index - 3 > structure_low_start
-                )
-                if can_update:
-                    structure_low = lows[index]
-                    structure_low_start = index
+        if broke_low:
+            previous_bias = bias
+            event_type = "BOS" if bias == "BEARISH" else "CHOCH"
+            events.append({
+                "event_type": event_type,
+                "direction": "BEARISH",
+                "timestamp": timestamps[index].isoformat(),
+                "close": float(close),
+                "broken_swing_timestamp": low_reference.timestamp,
+                "broken_level": float(low_reference.price),
+                "structure_start_index": int(low_reference.index),
+                "break_index": int(index),
+                "previous_direction": 2 if previous_bias == "BULLISH" else 1 if previous_bias == "BEARISH" else 0,
+                "new_direction": 1,
+                "importance": "EXTERNAL",
+            })
+            bias = "BEARISH"
+            direction_code = 1
+            broken_low = latest_low if latest_low is not None else low_reference
+            broken_high = None
+            candidate_high = _latest_swing(
+                available,
+                "HIGH",
+                before_index=index,
+                after_index=last_event_index,
+            )
+            if candidate_high is not None:
+                protected_high = candidate_high
+            protected_low = None
+            last_event_index = index
 
-    bias: StructureBias = (
-        "BULLISH" if structure_direction == 2
-        else "BEARISH" if structure_direction == 1
-        else "NEUTRAL"
-    )
+    latest_high = _latest_swing(swings, "HIGH")
+    latest_low = _latest_swing(swings, "LOW")
+    if bias == "BULLISH":
+        structure_high_swing = broken_high or latest_high
+        structure_low_swing = protected_low or latest_low
+    elif bias == "BEARISH":
+        structure_high_swing = protected_high or latest_high
+        structure_low_swing = broken_low or latest_low
+    else:
+        structure_high_swing = latest_high
+        structure_low_swing = latest_low
+
+    structure_high = float(structure_high_swing.price if structure_high_swing else max(highs))
+    structure_low = float(structure_low_swing.price if structure_low_swing else min(lows))
+    high_start = int(structure_high_swing.index if structure_high_swing else highs.index(max(highs)))
+    low_start = int(structure_low_swing.index if structure_low_swing else lows.index(min(lows)))
+
     current_structure = {
-        "direction": int(structure_direction),
+        "direction": int(direction_code),
         "bias": bias,
-        "high": float(structure_high),
-        "low": float(structure_low),
-        "high_start_index": int(structure_high_start),
-        "low_start_index": int(structure_low_start),
-        "high_start_timestamp": timestamps[structure_high_start].isoformat(),
-        "low_start_timestamp": timestamps[structure_low_start].isoformat(),
+        "high": structure_high,
+        "low": structure_low,
+        "high_start_index": high_start,
+        "low_start_index": low_start,
+        "high_start_timestamp": timestamps[high_start].isoformat(),
+        "low_start_timestamp": timestamps[low_start].isoformat(),
         "end_timestamp": timestamps[-1].isoformat(),
         "range": float(abs(structure_high - structure_low)),
+        "protected_high": _serialise_swing(protected_high),
+        "protected_low": _serialise_swing(protected_low),
     }
 
     return {
@@ -287,22 +303,25 @@ def analyze_structure(
         "events": events,
         "current_structure": current_structure,
         "fib_levels": _fib_levels(
-            structure_direction,
+            direction_code,
             structure_high,
             structure_low,
-            structure_high_start,
-            structure_low_start,
+            high_start,
+            low_start,
             timestamps,
-        ),
-        "swings": [],
+        ) if direction_code else [],
+        "swings": [_serialise_swing(swing) for swing in swings],
         "config": {
             "lookback": LOOKBACK,
+            "left_bars": left_bars,
+            "right_bars": right_bars,
             "break_with_candle_body": True,
-            "current_structure": True,
+            "protected_external_structure": True,
+            "internal_swings_are_not_reversal_triggers": True,
             "fib_values": list(FIB_LEVELS),
             "fvg": False,
             "closed_candles_only": True,
             "repainting": False,
-            "source_algorithm": "LudoGH68_SMC_Structures",
+            "source_algorithm": "FlowSignal_protected_SMC_structure",
         },
     }
