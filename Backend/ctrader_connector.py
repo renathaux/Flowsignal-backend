@@ -5097,6 +5097,68 @@ def modify_position_sltp(position_id, stop_loss_price=None, take_profit_price=No
             "take_profit": take_profit_price,
         }
 
+    def confirm_by_readback(reason):
+        """Resolve an ambiguous amend response from broker-authoritative state."""
+        try:
+            positions = fetch_ctrader_open_positions() or []
+        except Exception as readback_error:
+            return {
+                "ok": False,
+                "reason": f"{reason}; readback failed: {readback_error}",
+                "position_id": position_id_value,
+                "stop_loss": request_payload.get("stopLoss"),
+                "take_profit": request_payload.get("takeProfit"),
+            }
+
+        position = next(
+            (
+                row for row in positions
+                if str(row.get("position_id") or row.get("positionId"))
+                == str(position_id_value)
+            ),
+            None,
+        )
+        if not position:
+            return {
+                "ok": False,
+                "reason": f"{reason}; position not found during readback",
+                "position_id": position_id_value,
+                "stop_loss": request_payload.get("stopLoss"),
+                "take_profit": request_payload.get("takeProfit"),
+            }
+
+        actual_sl = position.get("stop_loss") or position.get("stopLoss")
+        actual_tp = position.get("take_profit") or position.get("takeProfit")
+
+        def matches(requested, actual):
+            if requested is None:
+                return True
+            try:
+                requested_value = float(requested)
+                actual_value = float(actual)
+            except (TypeError, ValueError):
+                return False
+            return abs(requested_value - actual_value) <= max(
+                1e-8,
+                abs(requested_value) * 1e-9,
+            )
+
+        confirmed = (
+            matches(request_payload.get("stopLoss"), actual_sl)
+            and matches(request_payload.get("takeProfit"), actual_tp)
+        )
+        return {
+            "ok": confirmed,
+            "reason": (
+                "Broker amendment confirmed by position readback"
+                if confirmed else reason
+            ),
+            "position_id": position_id_value,
+            "stop_loss": actual_sl,
+            "take_profit": actual_tp,
+            "confirmed_by_readback": confirmed,
+        }
+
     try:
         position_id_value = int(position_id)
     except (TypeError, ValueError):
@@ -5162,6 +5224,11 @@ def modify_position_sltp(position_id, stop_loss_price=None, take_profit_price=No
         payload = response.get("payload", {})
 
         if payload.get("errorCode"):
+            readback = confirm_by_readback(
+                payload.get("description") or payload.get("errorCode")
+            )
+            if readback.get("ok"):
+                return readback
             return {
                 "ok": False,
                 "reason": payload.get("description") or payload.get("errorCode"),
@@ -5180,13 +5247,7 @@ def modify_position_sltp(position_id, stop_loss_price=None, take_profit_price=No
         }
     except Exception as e:
         print("CTRADER MODIFY POSITION SLTP ERROR:", e)
-        return {
-            "ok": False,
-            "reason": str(e),
-            "position_id": position_id_value,
-            "stop_loss": request_payload.get("stopLoss"),
-            "take_profit": request_payload.get("takeProfit"),
-        }
+        return confirm_by_readback(str(e))
     finally:
         try:
             sock.close()

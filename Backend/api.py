@@ -8236,7 +8236,25 @@ def sync_live_positions(panel_data=None):
                 saved_sl,
                 normalize_symbol=normalize_symbol,
             )
-            broker_manual_sl_adopted = broker_sl_change == "MORE_PROTECTIVE"
+            broker_sl_is_valid = False
+            try:
+                broker_sl_value = float(broker_synced_sl)
+                entry_value = float(entry)
+                broker_sl_is_valid = (
+                    (side == "BUY" and broker_sl_value < entry_value)
+                    or (side == "SELL" and broker_sl_value > entry_value)
+                )
+            except (TypeError, ValueError):
+                broker_sl_value = None
+
+            # A non-null broker level is authoritative. This includes manual
+            # changes made directly in cTrader; FlowSignal must mirror them
+            # instead of repairing them back to an older application value.
+            broker_manual_sl_adopted = bool(
+                broker_sl_is_valid
+                and saved_sl is not None
+                and not live_prices_match(symbol, broker_synced_sl, saved_sl)
+            )
 
             if broker_manual_sl_adopted:
                 adopted_sl = float(broker_synced_sl)
@@ -8262,7 +8280,65 @@ def sync_live_positions(panel_data=None):
                     "side": side,
                     "position_id": position_id,
                     "broker_sl": adopted_sl,
-                    "reason": "manual broker SL reduces risk",
+                    "risk_change": broker_sl_change,
+                    "reason": "valid broker SL is authoritative",
+                })
+
+            broker_manual_tp_adopted = False
+            try:
+                broker_tp_value = float(broker_synced_tp2)
+                entry_value = float(entry)
+                broker_tp_is_valid = (
+                    (side == "BUY" and broker_tp_value > entry_value)
+                    or (side == "SELL" and broker_tp_value < entry_value)
+                )
+            except (TypeError, ValueError):
+                broker_tp_value = None
+                broker_tp_is_valid = False
+
+            if (
+                broker_tp_is_valid
+                and saved_tp2 is not None
+                and not live_prices_match(symbol, broker_synced_tp2, saved_tp2)
+            ):
+                saved_tp2 = broker_tp_value
+                synced_tp2 = broker_tp_value
+                try:
+                    saved_tp1 = round(
+                        calculate_tp1_from_tp2(entry, saved_tp2, side),
+                        2 if symbol == "XAUUSD" else 5,
+                    )
+                    synced_tp1 = saved_tp1
+                except (TypeError, ValueError):
+                    pass
+                levels_modified_at = time.time()
+                user_modified_levels = {
+                    **user_modified_levels,
+                    "tp1": saved_tp1,
+                    "tp2": saved_tp2,
+                }
+                if isinstance(current_order, dict):
+                    current_order["tp1"] = saved_tp1
+                    current_order["take_profit_1"] = saved_tp1
+                    current_order["tp2"] = saved_tp2
+                    current_order["take_profit_2"] = saved_tp2
+                    current_order["take_profit"] = saved_tp2
+                    current_order["user_modified_levels"] = copy.deepcopy(
+                        user_modified_levels
+                    )
+                    current_order["levels_modified_at"] = levels_modified_at
+                    current_order["manual_broker_tp_adopted"] = True
+                    current_order["manual_broker_tp_adopted_at"] = levels_modified_at
+                    persist_live_trade_state(current_order)
+                broker_manual_tp_adopted = True
+                broker_tp_missing_or_mismatch = False
+                print("LIVE_MANUAL_BROKER_TP_ADOPTED =", {
+                    "symbol": symbol,
+                    "side": side,
+                    "position_id": position_id,
+                    "broker_tp": broker_tp_value,
+                    "derived_tp1": saved_tp1,
+                    "reason": "valid broker TP is authoritative",
                 })
 
             broker_sl_missing_or_mismatch = (
@@ -8590,6 +8666,15 @@ def sync_live_positions(panel_data=None):
                     levels_modified_at
                     if broker_manual_sl_adopted
                     else (current_order or {}).get("manual_broker_sl_adopted_at")
+                ),
+                "manual_broker_tp_adopted": bool(
+                    broker_manual_tp_adopted
+                    or (current_order or {}).get("manual_broker_tp_adopted")
+                ),
+                "manual_broker_tp_adopted_at": (
+                    levels_modified_at
+                    if broker_manual_tp_adopted
+                    else (current_order or {}).get("manual_broker_tp_adopted_at")
                 ),
                 "raw": position.get("raw", position),
             }
