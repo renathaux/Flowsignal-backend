@@ -1,127 +1,128 @@
 """XAUUSD-specific risk-level hardening.
 
-The strict strategy still owns entries, RR rules, TP selection and execution.
-This module changes only the source of XAUUSD stop-loss structure: the stop is
-anchored to a confirmed 5-minute pivot, never manufactured from the minimum
-SL-distance setting.
+Gold remains a 15-minute structure strategy. The stop loss is anchored to the
+protected 15m structure swing and then placed 5 pips beyond that swing. The
+configured minimum SL distance is only a validation floor; it never manufactures
+an arbitrary stop.
 """
 from __future__ import annotations
 
-import math
-
 import pandas as pd
 
-from indicators.smc.engine import detect_confirmed_swings
+from indicators.smc.engine import analyze_structure
 from . import shared
 from . import strict_trader
 
 
-def _closed_5m(data_5m):
-    return strict_trader.closed_frame(data_5m, 5)
+XAUUSD_SL_BUFFER_PIPS = 5.0
 
 
-def _entry_cutoff_position(data_5m, entry, setup_break_time):
-    """Locate the confirmation candle whose close became the entry price."""
-    if data_5m is None or data_5m.empty:
-        return None
-    anchor = strict_trader.utc_timestamp(
-        strict_trader.candle_close_time(setup_break_time, 15)
-        if setup_break_time
-        else None
-    )
-    tolerance = max(strict_trader.point_size("XAUUSD") * 0.5, 1e-9)
-    matches = []
-    for position, (index_value, row) in enumerate(data_5m.iterrows()):
-        try:
-            ts = pd.Timestamp(index_value)
-            if ts.tzinfo is None:
-                ts = ts.tz_localize("UTC")
-            else:
-                ts = ts.tz_convert("UTC")
-            close_time = ts + pd.Timedelta(minutes=5)
-            close = float(row["Close"])
-        except Exception:
-            continue
-        if anchor is not None and close_time <= anchor:
-            continue
-        if math.isclose(close, float(entry), rel_tol=0.0, abs_tol=tolerance):
-            matches.append(position)
-    return matches[0] if matches else len(data_5m) - 1
+def _gold_pip_size():
+    # FlowSignal XAUUSD quotes to 0.01 points. In the existing Gold convention,
+    # one pip is 0.10, so five pips = 0.50 = 50 points.
+    return 0.10
 
 
-def _choose_5m_stop(data_5m, side, entry, configured_minimum_sl_points):
-    closed = _closed_5m(data_5m)
-    if closed is None or len(closed) < 5:
+def _five_pip_buffer():
+    return XAUUSD_SL_BUFFER_PIPS * _gold_pip_size()
+
+
+def _slice_to_setup(data_15m, setup_break_time):
+    if data_15m is None or data_15m.empty:
+        return data_15m
+    source = data_15m.copy()
+    setup_timestamp = strict_trader.utc_timestamp(setup_break_time)
+    if setup_timestamp is None:
+        return source.iloc[:-1].copy()
+    index = pd.DatetimeIndex(source.index)
+    if index.tz is None:
+        index = index.tz_localize("UTC")
+    else:
+        index = index.tz_convert("UTC")
+    return source.loc[index <= setup_timestamp].copy()
+
+
+def _protected_15m_stop(data_15m, side, entry, minimum_sl_points):
+    if data_15m is None or len(data_15m) < 5:
         return {
             "ok": False,
-            "reason": "WAIT_NO_CONFIRMED_5M_SWING_SL",
-            "sl_structure_source": "confirmed_5m_swing",
+            "reason": "WAIT_NO_PROTECTED_15M_SWING_SL",
+            "sl_structure_source": "protected_15m_structure",
         }
 
-    pivots = detect_confirmed_swings(closed, left_bars=2, right_bars=2)
-    required_type = "LOW" if side == "BUY" else "HIGH"
-    candidates = [pivot for pivot in pivots if pivot.swing_type == required_type]
-    if not candidates:
+    try:
+        structure = analyze_structure(data_15m)
+    except Exception as exc:
         return {
             "ok": False,
-            "reason": "WAIT_NO_CONFIRMED_5M_SWING_SL",
-            "sl_structure_source": "confirmed_5m_swing",
+            "reason": "WAIT_15M_STRUCTURE_ERROR",
+            "sl_structure_source": "protected_15m_structure",
+            "structure_error": str(exc),
         }
 
-    buffer = strict_trader.sl_buffer("XAUUSD")
-    minimum = strict_trader.minimum_sl_distance(
-        "XAUUSD",
-        configured_minimum_sl_points,
-    )
+    current = structure.get("current_structure") or {}
+    if side == "BUY":
+        swing_price = current.get("low")
+        swing_time = current.get("low_start_timestamp")
+        swing_type = "LOW"
+    else:
+        swing_price = current.get("high")
+        swing_time = current.get("high_start_timestamp")
+        swing_type = "HIGH"
+
+    if swing_price is None:
+        return {
+            "ok": False,
+            "reason": "WAIT_NO_PROTECTED_15M_SWING_SL",
+            "sl_structure_source": "protected_15m_structure",
+        }
+
+    swing_price = float(swing_price)
+    entry = float(entry)
+    buffer = _five_pip_buffer()
+    stop = swing_price - buffer if side == "BUY" else swing_price + buffer
+    side_ok = stop < entry if side == "BUY" else stop > entry
+    distance = abs(entry - stop)
+    minimum = strict_trader.minimum_sl_distance("XAUUSD", minimum_sl_points)
     point = strict_trader.point_size("XAUUSD")
-    rejected = []
 
-    for pivot in reversed(candidates):
-        swing_price = float(pivot.price)
-        stop = swing_price - buffer if side == "BUY" else swing_price + buffer
-        distance = abs(float(entry) - stop)
-        side_ok = stop < float(entry) if side == "BUY" else stop > float(entry)
-        if side_ok and distance >= minimum:
-            return {
-                "ok": True,
-                "stop_loss": stop,
-                "distance": distance,
-                "distance_points": distance / point,
-                "buffer": buffer,
-                "swing": {
-                    "type": pivot.swing_type,
-                    "price": swing_price,
-                    "time": pivot.timestamp,
-                    "confirmed_time": pivot.confirmed_timestamp,
-                    "index": int(pivot.index),
-                    "confirmed_index": int(pivot.confirmed_index),
-                },
-                "sl_structure_source": "confirmed_5m_swing",
-                "rejected_5m_sl_candidates": rejected,
-            }
-        rejected.append({
-            "price": swing_price,
-            "time": pivot.timestamp,
-            "distance_points": distance / point,
-            "reason": (
-                "wrong_side"
-                if not side_ok
-                else "below_minimum_sl_distance"
-            ),
-        })
+    if not side_ok:
+        return {
+            "ok": False,
+            "reason": "WAIT_15M_SWING_WRONG_SIDE",
+            "sl_structure_source": "protected_15m_structure",
+            "sl_swing_used": swing_price,
+            "sl_swing_time": swing_time,
+        }
+    if distance < minimum:
+        return {
+            "ok": False,
+            "reason": "WAIT_SL_TOO_SMALL",
+            "sl_structure_source": "protected_15m_structure",
+            "sl_swing_used": swing_price,
+            "sl_swing_time": swing_time,
+            "minimum_distance": minimum,
+            "distance": distance,
+        }
 
     return {
-        "ok": False,
-        "reason": "WAIT_NO_SAFE_5M_SWING_SL",
-        "minimum_distance": minimum,
+        "ok": True,
+        "stop_loss": stop,
+        "distance": distance,
+        "distance_points": distance / point,
         "buffer": buffer,
-        "sl_structure_source": "confirmed_5m_swing",
-        "rejected_5m_sl_candidates": rejected,
+        "buffer_pips": XAUUSD_SL_BUFFER_PIPS,
+        "swing": {
+            "type": swing_type,
+            "price": swing_price,
+            "time": swing_time,
+        },
+        "sl_structure_source": "protected_15m_structure",
+        "structure_bias": structure.get("bias"),
     }
 
 
 def build_xauusd_risk_levels(
-    data_5m,
     data_15m,
     side,
     entry,
@@ -130,7 +131,7 @@ def build_xauusd_risk_levels(
     setup_break_time=None,
     execution_settings=None,
 ):
-    """Build XAUUSD levels with 5m swing SL and existing 15m TP/RR rules."""
+    """Build XAUUSD levels from protected 15m swing + 5-pip SL buffer."""
     if shared.normalize_symbol(symbol) != "XAUUSD":
         raise ValueError("build_xauusd_risk_levels is XAUUSD-only")
 
@@ -140,17 +141,9 @@ def build_xauusd_risk_levels(
         strict_trader.MIN_SL_POINTS,
     )
 
-    closed = _closed_5m(data_5m)
-    cutoff = _entry_cutoff_position(closed, entry, setup_break_time)
-    if closed is None or closed.empty or cutoff is None:
-        return {
-            "ok": False,
-            "reason": "WAIT_NO_CONFIRMED_5M_SWING_SL",
-            "sl_structure_source": "confirmed_5m_swing",
-        }
-    stop_source = closed.iloc[: cutoff + 1].copy()
-    stop = _choose_5m_stop(
-        stop_source,
+    swing_source = _slice_to_setup(data_15m, setup_break_time)
+    stop = _protected_15m_stop(
+        swing_source,
         side,
         float(entry),
         configured_minimum_sl_points,
@@ -158,21 +151,7 @@ def build_xauusd_risk_levels(
     if not stop.get("ok"):
         return stop
 
-    swing_source = data_15m.copy()
-    setup_timestamp = strict_trader.utc_timestamp(setup_break_time)
-    if setup_timestamp is not None:
-        try:
-            source_index = pd.DatetimeIndex(swing_source.index)
-            if source_index.tz is None:
-                source_index = source_index.tz_localize("UTC")
-            else:
-                source_index = source_index.tz_convert("UTC")
-            swing_source = swing_source.loc[source_index <= setup_timestamp]
-        except Exception:
-            return {"ok": False, "reason": "WAIT_NO_VALID_TP_STRUCTURE"}
-    else:
-        swing_source = swing_source.iloc[:-1].copy()
-
+    # Keep the existing 15m TP/RR selection unchanged.
     swings_15m = strict_trader.detect_valid_swings(swing_source, symbol)
     risk = float(stop["distance"])
     tp2 = strict_trader.select_tp2(
@@ -207,14 +186,13 @@ def build_xauusd_risk_levels(
         "risk_reward_ratio": round(float(tp2["rr"]), 4),
         "risk_reward": f"1:{round(float(tp2['rr']), 2):g}",
         "sl_buffer": round(float(stop["buffer"]), dec),
-        "sl_buffer_points": strict_trader.SL_BUFFER_POINTS,
+        "sl_buffer_pips": XAUUSD_SL_BUFFER_PIPS,
+        "sl_buffer_points": round(float(stop["buffer"]) / strict_trader.point_size(symbol), 2),
         "minimum_sl_points": int(configured_minimum_sl_points),
         "sl_distance_points": round(float(stop["distance_points"]), 2),
         "sl_swing_used": round(float(stop["swing"]["price"]), dec),
         "sl_swing_time": stop["swing"].get("time"),
-        "sl_swing_confirmed_time": stop["swing"].get("confirmed_time"),
-        "sl_structure_source": "confirmed_5m_swing",
-        "rejected_5m_sl_candidates": stop.get("rejected_5m_sl_candidates", []),
+        "sl_structure_source": "protected_15m_structure",
         "tp_structure_used": (
             round(float(tp2["swing"]["price"]), dec)
             if tp2.get("swing")
