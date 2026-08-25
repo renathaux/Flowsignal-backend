@@ -1,15 +1,14 @@
 """XAUUSD-specific risk-level hardening.
 
 Gold remains a 15-minute structure strategy. The stop loss is anchored to the
-protected 15m structure swing and then placed 5 pips beyond that swing. The
-configured minimum SL distance is only a validation floor; it never manufactures
-an arbitrary stop.
+immutable opposite swing owned by the accepted BOS/CHoCH event and then placed
+5 pips beyond that swing. The configured minimum SL distance is only a
+validation floor; it never manufactures an arbitrary stop.
 """
 from __future__ import annotations
 
 import pandas as pd
 
-from indicators.smc.engine import analyze_structure
 from . import shared
 from . import strict_trader
 
@@ -40,82 +39,33 @@ def _slice_to_setup(data_15m, setup_break_time):
     return source.loc[index <= setup_timestamp].copy()
 
 
-def _protected_15m_stop(data_15m, side, entry, minimum_sl_points):
+def _event_owned_15m_stop(
+    data_15m,
+    side,
+    entry,
+    minimum_sl_points,
+    event_invalidation_swing=None,
+    setup_break_time=None,
+):
     if data_15m is None or len(data_15m) < 5:
         return {
             "ok": False,
-            "reason": "WAIT_NO_PROTECTED_15M_SWING_SL",
-            "sl_structure_source": "protected_15m_structure",
+            "reason": "WAIT_NO_STRUCTURAL_SL_SWING",
+            "sl_structure_source": "event_owned_15m_smc_swing",
         }
-
-    try:
-        structure = analyze_structure(data_15m)
-    except Exception as exc:
-        return {
-            "ok": False,
-            "reason": "WAIT_15M_STRUCTURE_ERROR",
-            "sl_structure_source": "protected_15m_structure",
-            "structure_error": str(exc),
-        }
-
-    current = structure.get("current_structure") or {}
-    if side == "BUY":
-        protected = current.get("protected_low")
-        swing_type = "LOW"
-    else:
-        protected = current.get("protected_high")
-        swing_type = "HIGH"
-
-    if not isinstance(protected, dict) or protected.get("price") is None:
-        return {
-            "ok": False,
-            "reason": "WAIT_NO_PROTECTED_15M_SWING_SL",
-            "sl_structure_source": "protected_15m_structure",
-        }
-
-    swing_price = float(protected["price"])
-    swing_time = protected.get("timestamp")
-    entry = float(entry)
-    buffer = _five_pip_buffer()
-    stop = swing_price - buffer if side == "BUY" else swing_price + buffer
-    side_ok = stop < entry if side == "BUY" else stop > entry
-    distance = abs(entry - stop)
-    minimum = strict_trader.minimum_sl_distance("XAUUSD", minimum_sl_points)
-    point = strict_trader.point_size("XAUUSD")
-
-    if not side_ok:
-        return {
-            "ok": False,
-            "reason": "WAIT_15M_SWING_WRONG_SIDE",
-            "sl_structure_source": "protected_15m_structure",
-            "sl_swing_used": swing_price,
-            "sl_swing_time": swing_time,
-        }
-    if distance < minimum:
-        return {
-            "ok": False,
-            "reason": "WAIT_SL_TOO_SMALL",
-            "sl_structure_source": "protected_15m_structure",
-            "sl_swing_used": swing_price,
-            "sl_swing_time": swing_time,
-            "minimum_distance": minimum,
-            "distance": distance,
-        }
-
+    stop = strict_trader.select_structural_stop_loss(
+        event_invalidation_swing,
+        side,
+        float(entry),
+        "XAUUSD",
+        setup_break_time=setup_break_time,
+        minimum_sl_distance_points=minimum_sl_points,
+    )
+    if not stop.get("ok"):
+        return stop
     return {
-        "ok": True,
-        "stop_loss": stop,
-        "distance": distance,
-        "distance_points": distance / point,
-        "buffer": buffer,
+        **stop,
         "buffer_pips": XAUUSD_SL_BUFFER_PIPS,
-        "swing": {
-            "type": swing_type,
-            "price": swing_price,
-            "time": swing_time,
-        },
-        "sl_structure_source": "protected_15m_structure",
-        "structure_bias": structure.get("bias"),
     }
 
 
@@ -127,8 +77,9 @@ def build_xauusd_risk_levels(
     *,
     setup_break_time=None,
     execution_settings=None,
+    event_invalidation_swing=None,
 ):
-    """Build XAUUSD levels from protected 15m swing + 5-pip SL buffer."""
+    """Build XAUUSD levels from the event-owned 15m swing + 5-pip SL buffer."""
     if shared.normalize_symbol(symbol) != "XAUUSD":
         raise ValueError("build_xauusd_risk_levels is XAUUSD-only")
 
@@ -139,11 +90,13 @@ def build_xauusd_risk_levels(
     )
 
     swing_source = _slice_to_setup(data_15m, setup_break_time)
-    stop = _protected_15m_stop(
+    stop = _event_owned_15m_stop(
         swing_source,
         side,
         float(entry),
         configured_minimum_sl_points,
+        event_invalidation_swing=event_invalidation_swing,
+        setup_break_time=setup_break_time,
     )
     if not stop.get("ok"):
         return stop
@@ -189,7 +142,9 @@ def build_xauusd_risk_levels(
         "sl_distance_points": round(float(stop["distance_points"]), 2),
         "sl_swing_used": round(float(stop["swing"]["price"]), dec),
         "sl_swing_time": stop["swing"].get("time"),
-        "sl_structure_source": "protected_15m_structure",
+        "sl_swing_confirmation_time": stop["swing"].get("confirmation_time"),
+        "sl_swing_source": stop["swing"].get("source"),
+        "sl_structure_source": stop.get("sl_structure_source"),
         "tp_structure_used": (
             round(float(tp2["swing"]["price"]), dec)
             if tp2.get("swing")

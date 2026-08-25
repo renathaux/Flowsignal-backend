@@ -2107,11 +2107,7 @@ def normalize_trade_levels(symbol, action, entry, sl, tp1, tp2):
     minimum_required_distance = min_distance + buffer_distance
 
     if original_sl_distance < min_distance:
-        adjusted = True
-        if normalized_action == "BUY":
-            sl_value = round(entry_value - minimum_required_distance, precision)
-        else:
-            sl_value = round(entry_value + minimum_required_distance, precision)
+        return reject("Strategy SL is below the broker minimum distance")
 
     adjusted_sl_distance = abs(entry_value - sl_value)
     tp1_ratio = get_tp1_ratio_of_tp2()

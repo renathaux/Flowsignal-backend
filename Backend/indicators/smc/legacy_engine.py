@@ -135,6 +135,21 @@ def _fib_levels(direction, structure_high, structure_low, high_start, low_start,
     return output
 
 
+def _legacy_event_invalidation_swing(swing_type, price, swing_index, break_index, timestamps):
+    return {
+        "type": swing_type,
+        "price": float(price),
+        "swing_time": timestamps[swing_index].isoformat(),
+        "swing_index": int(swing_index),
+        # The legacy engine establishes its opposite structural extremum when
+        # the closed break candle is processed; it does not use right-bar pivot
+        # confirmation. That acceptance close is therefore its confirmation.
+        "confirmation_time": timestamps[break_index].isoformat(),
+        "confirmation_index": int(break_index),
+        "source": "LEGACY_CURRENT_STRUCTURE",
+    }
+
+
 def analyze_structure(
     frame: pd.DataFrame,
     *,
@@ -210,6 +225,7 @@ def analyze_structure(
         if low_broken:
             if distance_gate.accept(structure_low):
                 event_type = "BOS" if structure_direction == 1 else "CHOCH"
+                event_high_start = _structure_highest_index(highs, index, LOOKBACK)
                 events.append({
                     "event_type": event_type,
                     "direction": "BEARISH",
@@ -221,6 +237,13 @@ def analyze_structure(
                     "break_index": int(index),
                     "previous_direction": int(structure_direction),
                     "new_direction": 1,
+                    "event_invalidation_swing": _legacy_event_invalidation_swing(
+                        "HIGH",
+                        highs[event_high_start],
+                        event_high_start,
+                        index,
+                        timestamps,
+                    ),
                 })
                 structure_direction = 1
             structure_high_start = _structure_highest_index(highs, index, LOOKBACK)
@@ -231,6 +254,7 @@ def analyze_structure(
         elif high_broken:
             if distance_gate.accept(structure_high):
                 event_type = "BOS" if structure_direction == 2 else "CHOCH"
+                event_low_start = _structure_lowest_index(lows, index, LOOKBACK)
                 events.append({
                     "event_type": event_type,
                     "direction": "BULLISH",
@@ -242,6 +266,13 @@ def analyze_structure(
                     "break_index": int(index),
                     "previous_direction": int(structure_direction),
                     "new_direction": 2,
+                    "event_invalidation_swing": _legacy_event_invalidation_swing(
+                        "LOW",
+                        lows[event_low_start],
+                        event_low_start,
+                        index,
+                        timestamps,
+                    ),
                 })
                 structure_direction = 2
             structure_high_start = index

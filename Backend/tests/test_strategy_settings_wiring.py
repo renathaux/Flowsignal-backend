@@ -646,6 +646,11 @@ class StrategySettingsStructureWiringTests(unittest.TestCase):
                 100.0,
                 "XAUUSD",
                 execution_settings=settings,
+                event_invalidation_swing={
+                    "type": "LOW", "price": 99.1, "swing_time": None,
+                    "confirmation_time": None,
+                    "source": "LEGACY_CURRENT_STRUCTURE",
+                },
             )
         self.assertTrue(levels["ok"])
         self.assertEqual(levels["minimum_sl_points"], 100)

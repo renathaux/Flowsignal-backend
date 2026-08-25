@@ -943,6 +943,77 @@ def select_stop_loss(
     }
 
 
+def select_structural_stop_loss(
+    event_invalidation_swing,
+    side,
+    entry,
+    symbol,
+    setup_break_time=None,
+    minimum_sl_distance_points=None,
+):
+    required = "LOW" if side == "BUY" else "HIGH"
+    swing = event_invalidation_swing
+    if not isinstance(swing, dict) or swing.get("price") is None:
+        return {"ok": False, "reason": "WAIT_NO_STRUCTURAL_SL_SWING"}
+    if str(swing.get("type") or "").upper() != required:
+        return {"ok": False, "reason": "WAIT_STRUCTURAL_SL_SWING_TYPE_MISMATCH"}
+
+    swing_price = swing.get("price")
+    swing_time = swing.get("swing_time")
+    confirmation_time = swing.get("confirmation_time")
+
+    setup_ts = utc_timestamp(setup_break_time)
+    swing_ts = utc_timestamp(swing_time)
+    confirmation_ts = utc_timestamp(confirmation_time)
+    if setup_ts is not None and swing_ts is not None and swing_ts > setup_ts:
+        return {
+            "ok": False,
+            "reason": "WAIT_SL_SWING_AFTER_SETUP",
+            "sl_swing_time": swing_time,
+            "setup_break_time": setup_break_time,
+        }
+    if setup_ts is not None and confirmation_ts is not None and confirmation_ts > setup_ts:
+        return {
+            "ok": False,
+            "reason": "WAIT_SL_SWING_CONFIRMED_AFTER_SETUP",
+            "sl_swing_confirmation_time": confirmation_time,
+            "setup_break_time": setup_break_time,
+        }
+
+    swing_price = float(swing_price)
+    entry = float(entry)
+    buffer = sl_buffer(symbol)
+    stop = swing_price - buffer if side == "BUY" else swing_price + buffer
+    distance = abs(entry - stop)
+    minimum = minimum_sl_distance(symbol, minimum_sl_distance_points)
+    if not (stop < entry if side == "BUY" else stop > entry):
+        return {"ok": False, "reason": "WAIT_15M_SWING_WRONG_SIDE"}
+    if distance < minimum:
+        return {
+            "ok": False,
+            "reason": "WAIT_SL_TOO_SMALL",
+            "minimum_distance": minimum,
+            "distance": distance,
+            "sl_swing_used": swing_price,
+            "sl_swing_time": swing_time,
+        }
+    return {
+        "ok": True,
+        "stop_loss": stop,
+        "swing": {
+            "type": required,
+            "price": swing_price,
+            "time": swing_time,
+            "confirmation_time": confirmation_time,
+            "source": swing.get("source"),
+        },
+        "distance": distance,
+        "distance_points": distance / point_size(symbol),
+        "buffer": buffer,
+        "sl_structure_source": "event_owned_15m_smc_swing",
+    }
+
+
 def select_tp2(
     swings,
     side,
@@ -1019,6 +1090,7 @@ def build_risk_levels(
     symbol,
     setup_break_time=None,
     execution_settings=None,
+    event_invalidation_swing=None,
 ):
     dec = decimals(symbol)
     swing_source = data_15m.copy()
@@ -1041,11 +1113,12 @@ def build_risk_levels(
         "minimum_sl_distance_points",
         MIN_SL_POINTS,
     )
-    stop = select_stop_loss(
-        swings,
+    stop = select_structural_stop_loss(
+        event_invalidation_swing,
         side,
         float(entry),
         symbol,
+        setup_break_time=setup_break_time,
         minimum_sl_distance_points=configured_minimum_sl_points,
     )
     if not stop.get("ok"):
@@ -1086,6 +1159,10 @@ def build_risk_levels(
         "minimum_sl_points": int(configured_minimum_sl_points),
         "sl_distance_points": round(stop["distance_points"], 2),
         "sl_swing_used": round(float(stop["swing"]["price"]), dec),
+        "sl_swing_time": stop["swing"].get("time"),
+        "sl_swing_confirmation_time": stop["swing"].get("confirmation_time"),
+        "sl_swing_source": stop["swing"].get("source"),
+        "sl_structure_source": stop.get("sl_structure_source"),
         "tp_structure_used": (
             round(float(tp2["swing"]["price"]), dec)
             if tp2.get("swing")
@@ -1671,6 +1748,7 @@ def get_mtf_signal(data_5m, data_15m, data_1h, symbol):
         normalized_symbol,
         setup_break_time=breakout.get("break_time"),
         execution_settings=execution_settings,
+        event_invalidation_swing=breakout.get("event_invalidation_swing"),
     )
     if not levels.get("ok"):
         stages = strategy_stage_states(

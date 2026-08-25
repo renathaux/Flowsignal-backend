@@ -102,6 +102,20 @@ def _serialise_swing(swing):
     }
 
 
+def _serialise_event_invalidation_swing(swing, source):
+    if swing is None:
+        return None
+    return {
+        "type": swing.swing_type,
+        "price": float(swing.price),
+        "swing_time": swing.timestamp,
+        "swing_index": int(swing.index),
+        "confirmation_time": swing.confirmed_timestamp,
+        "confirmation_index": int(swing.confirmed_index),
+        "source": source,
+    }
+
+
 def _fib_levels(direction, structure_high, structure_low, high_start, low_start, timestamps):
     structure_range = abs(structure_high - structure_low)
     if structure_range <= 0:
@@ -223,6 +237,20 @@ def analyze_structure(
                 continue
             previous_bias = bias
             event_type = "CHOCH" if bias == "BEARISH" else "BOS"
+            current_leg_low = _latest_swing(
+                available,
+                "LOW",
+                before_index=index,
+                after_index=last_event_index,
+            )
+            event_low = current_leg_low or _latest_swing(
+                available,
+                "LOW",
+                before_index=index,
+            )
+            event_low_source = (
+                "CURRENT_LEG" if current_leg_low is not None else "FALLBACK_HISTORY"
+            )
             events.append({
                 "event_type": event_type,
                 "direction": "BULLISH",
@@ -235,20 +263,18 @@ def analyze_structure(
                 "previous_direction": 2 if previous_bias == "BULLISH" else 1 if previous_bias == "BEARISH" else 0,
                 "new_direction": 2,
                 "importance": "EXTERNAL",
+                "event_invalidation_swing": _serialise_event_invalidation_swing(
+                    event_low,
+                    event_low_source,
+                ),
             })
 
             # On the first bullish break or a true bullish CHoCH, lock the
             # regime's origin low. Continuation BOS must not ratchet this level
             # upward to every small internal higher low.
             if previous_bias != "BULLISH":
-                candidate_low = _latest_swing(
-                    available,
-                    "LOW",
-                    before_index=index,
-                    after_index=last_event_index,
-                ) or _latest_swing(available, "LOW", before_index=index)
-                if candidate_low is not None:
-                    external_low = candidate_low
+                if event_low is not None:
+                    external_low = event_low
             external_high = None
             bias = "BULLISH"
             direction_code = 2
@@ -260,6 +286,20 @@ def analyze_structure(
                 continue
             previous_bias = bias
             event_type = "CHOCH" if bias == "BULLISH" else "BOS"
+            current_leg_high = _latest_swing(
+                available,
+                "HIGH",
+                before_index=index,
+                after_index=last_event_index,
+            )
+            event_high = current_leg_high or _latest_swing(
+                available,
+                "HIGH",
+                before_index=index,
+            )
+            event_high_source = (
+                "CURRENT_LEG" if current_leg_high is not None else "FALLBACK_HISTORY"
+            )
             events.append({
                 "event_type": event_type,
                 "direction": "BEARISH",
@@ -272,17 +312,15 @@ def analyze_structure(
                 "previous_direction": 2 if previous_bias == "BULLISH" else 1 if previous_bias == "BEARISH" else 0,
                 "new_direction": 1,
                 "importance": "EXTERNAL",
+                "event_invalidation_swing": _serialise_event_invalidation_swing(
+                    event_high,
+                    event_high_source,
+                ),
             })
 
             if previous_bias != "BEARISH":
-                candidate_high = _latest_swing(
-                    available,
-                    "HIGH",
-                    before_index=index,
-                    after_index=last_event_index,
-                ) or _latest_swing(available, "HIGH", before_index=index)
-                if candidate_high is not None:
-                    external_high = candidate_high
+                if event_high is not None:
+                    external_high = event_high
             external_low = None
             bias = "BEARISH"
             direction_code = 1

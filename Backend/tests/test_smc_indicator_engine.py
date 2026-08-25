@@ -4,6 +4,7 @@ from unittest.mock import patch
 import pandas as pd
 
 from indicators.smc.engine import SwingPoint, analyze_structure, detect_confirmed_swings
+from indicators.smc.legacy_engine import analyze_structure as analyze_legacy_structure
 
 
 class SmcIndicatorEngineTests(unittest.TestCase):
@@ -182,12 +183,54 @@ class SmcIndicatorEngineTests(unittest.TestCase):
         event = result["events"][-1]
         self.assertEqual((event["event_type"], event["direction"]), ("CHOCH", "BEARISH"))
         self.assertEqual(event["broken_level"], 100.0)
+        self.assertEqual(event["event_invalidation_swing"]["type"], "HIGH")
+        self.assertEqual(event["event_invalidation_swing"]["price"], 115.0)
+        self.assertEqual(result["current_structure"]["protected_high"]["price"], 115.0)
 
     def test_closed_break_of_protected_bearish_high_is_bullish_choch(self):
         result = self.bearish_external_case(121)
         event = result["events"][-1]
         self.assertEqual((event["event_type"], event["direction"]), ("CHOCH", "BULLISH"))
         self.assertEqual(event["broken_level"], 120.0)
+        self.assertEqual(event["event_invalidation_swing"]["type"], "LOW")
+        self.assertEqual(event["event_invalidation_swing"]["price"], 105.0)
+        self.assertEqual(result["current_structure"]["protected_low"]["price"], 105.0)
+
+    def test_continuation_bos_owns_current_leg_swing_without_ratchet_of_protected_level(self):
+        bullish = self.bullish_external_case(104)
+        first, continuation = bullish["events"][:2]
+        self.assertEqual(first["event_invalidation_swing"]["price"], 100.0)
+        self.assertEqual(continuation["event_invalidation_swing"]["price"], 105.0)
+        self.assertEqual(bullish["current_structure"]["protected_low"]["price"], 100.0)
+
+        bearish = self.bearish_external_case(116)
+        first, continuation = bearish["events"][:2]
+        self.assertEqual(first["event_invalidation_swing"]["price"], 120.0)
+        self.assertEqual(continuation["event_invalidation_swing"]["price"], 115.0)
+        self.assertEqual(bearish["current_structure"]["protected_high"]["price"], 120.0)
+
+    def test_every_event_owned_swing_was_confirmed_by_break(self):
+        for result in (
+            self.bullish_external_case(99),
+            self.bearish_external_case(121),
+        ):
+            for event in result["events"]:
+                swing = event["event_invalidation_swing"]
+                self.assertIsNotNone(swing)
+                self.assertLessEqual(swing["confirmation_index"], event["break_index"])
+
+    def test_legacy_engine_emits_event_owned_opposite_extrema_without_detector_change(self):
+        closes = [104, 103, 106, 108, 106, 109, 111, 110, 107, 110, 113, 112, 114, 116, 104, 99]
+        result = analyze_legacy_structure(
+            self.external_frame(closes), timeframe="15m", point_size=0.01)
+        self.assertTrue(result["events"])
+        for event in result["events"]:
+            swing = event["event_invalidation_swing"]
+            expected_type = "LOW" if event["direction"] == "BULLISH" else "HIGH"
+            self.assertEqual(swing["type"], expected_type)
+            self.assertEqual(swing["source"], "LEGACY_CURRENT_STRUCTURE")
+            self.assertLessEqual(swing["swing_index"], event["break_index"])
+            self.assertEqual(swing["confirmation_index"], event["break_index"])
 
     def test_wick_through_protected_low_without_close_is_not_choch(self):
         result = self.bullish_external_case(101, final_low=99)

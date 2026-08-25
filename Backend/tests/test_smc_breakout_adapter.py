@@ -37,6 +37,15 @@ class SmcBreakoutAdapterTests(unittest.TestCase):
                 "break_index": break_index,
                 "previous_direction": 1 if direction == "BULLISH" else 2,
                 "new_direction": 2 if direction == "BULLISH" else 1,
+                "event_invalidation_swing": {
+                    "type": "LOW" if direction == "BULLISH" else "HIGH",
+                    "price": 1.1000 if direction == "BULLISH" else 1.1200,
+                    "swing_time": "2026-08-17T03:30:00+00:00",
+                    "swing_index": 14,
+                    "confirmation_time": "2026-08-17T04:45:00+00:00",
+                    "confirmation_index": break_index,
+                    "source": "LEGACY_CURRENT_STRUCTURE",
+                },
             }],
             "fib_levels": [],
             "swings": [],
@@ -51,6 +60,12 @@ class SmcBreakoutAdapterTests(unittest.TestCase):
         self.assertEqual(result["break_type"], "BOS")
         self.assertEqual(result["source"], "smc_structure_engine")
         self.assertEqual(result["bos_buffer"], 0.0)
+        self.assertIn("accepted_setup_structure", result)
+        self.assertEqual(result["event_invalidation_swing"]["type"], "LOW")
+        self.assertEqual(result["breakouts"][0]["event_invalidation_swing"]["price"], 1.1000)
+        for call in analyze.call_args_list:
+            self.assertEqual(call.kwargs["timeframe"], "15m")
+            self.assertEqual(call.kwargs["point_size"], 0.00001)
 
     @patch("strategies.smc_breakout_adapter.analyze_legacy_structure")
     def test_fresh_bearish_choch_becomes_v1_sell_break(self, analyze):
@@ -58,6 +73,7 @@ class SmcBreakoutAdapterTests(unittest.TestCase):
         result = evaluate_15m_breakout(self.frame(), "EURUSD")
         self.assertEqual(result["side"], "SELL")
         self.assertEqual(result["break_type"], "CHOCH")
+        self.assertEqual(result["event_invalidation_swing"]["type"], "HIGH")
 
     @patch("strategies.smc_breakout_adapter.analyze_legacy_structure")
     def test_historical_chart_event_is_not_fresh_entry(self, analyze):
@@ -72,13 +88,13 @@ class SmcBreakoutAdapterTests(unittest.TestCase):
         protected.return_value = self.structure(direction="BULLISH", event_type="BOS", break_index=19)
         xauusd = evaluate_15m_breakout(self.frame(), "XAUUSD")
         self.assertEqual(xauusd["side"], "BUY")
-        protected.assert_called_once()
+        self.assertEqual(protected.call_count, 2)
         legacy.assert_not_called()
 
         legacy.return_value = self.structure(direction="BULLISH", event_type="BOS", break_index=19)
         eurusd = evaluate_15m_breakout(self.frame(), "EURUSD")
         self.assertEqual(eurusd["side"], "BUY")
-        legacy.assert_called_once()
+        self.assertEqual(legacy.call_count, 2)
 
 
 if __name__ == "__main__":

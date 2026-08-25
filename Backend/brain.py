@@ -39,8 +39,8 @@ def classify_consolidation_observation_only(data_15m, symbol):
 _strict_trader.classify_consolidation = classify_consolidation_observation_only
 
 
-# XAUUSD stop-loss hardening. Gold remains fully anchored to 15m structure.
-# EURUSD continues to use the generic strict risk builder unchanged.
+# Route both symbols' accepted 15m SMC snapshot through risk construction.
+# Gold retains its existing five-pip structural buffer implementation.
 _original_build_risk_levels = _strict_trader.build_risk_levels
 
 
@@ -51,6 +51,7 @@ def build_risk_levels_with_xauusd_15m(
     symbol,
     setup_break_time=None,
     execution_settings=None,
+    event_invalidation_swing=None,
 ):
     normalized = _shared.normalize_symbol(symbol)
     if normalized != "XAUUSD":
@@ -61,6 +62,7 @@ def build_risk_levels_with_xauusd_15m(
             symbol,
             setup_break_time=setup_break_time,
             execution_settings=execution_settings,
+            event_invalidation_swing=event_invalidation_swing,
         )
     return build_xauusd_risk_levels(
         data_15m,
@@ -69,6 +71,7 @@ def build_risk_levels_with_xauusd_15m(
         symbol,
         setup_break_time=setup_break_time,
         execution_settings=execution_settings,
+        event_invalidation_swing=event_invalidation_swing,
     )
 
 

@@ -1,8 +1,9 @@
 """Adapter that makes the new SMC structure engine authoritative for V1's 15m break gate.
 
-Only the 15m BOS/CHoCH detection is replaced. The existing strict trader keeps
-its EMA, consolidation, 5m confirmation, SL/TP, RR, risk, cooldown and broker
-execution safeguards.
+Each accepted 15m BOS/CHoCH event carries its immutable invalidation swing so
+stop-loss selection can reuse that exact chronological event context. The
+existing strict trader keeps its EMA, consolidation, 5m confirmation, TP/RR,
+risk, cooldown and broker execution safeguards.
 """
 from __future__ import annotations
 
@@ -13,6 +14,22 @@ from indicators.smc.legacy_engine import analyze_structure as analyze_legacy_str
 from . import shared
 
 MAX_FRESH_15M_CANDLES = 4
+
+
+def _point_size(symbol):
+    normalized = shared.normalize_symbol(symbol)
+    configured = shared.get_strategy_decimals(normalized)
+    decimals = configured if configured is not None else (2 if normalized == "XAUUSD" else 5)
+    return 10 ** (-int(decimals))
+
+
+def _analyze_15m(data_15m, symbol):
+    analyzer = (
+        analyze_xauusd_structure
+        if shared.normalize_symbol(symbol) == "XAUUSD"
+        else analyze_legacy_structure
+    )
+    return analyzer(data_15m, timeframe="15m", point_size=_point_size(symbol))
 
 
 def _iso(value):
@@ -89,12 +106,7 @@ def evaluate_15m_breakout(data_15m, symbol, execution_settings=None):
         return result
 
     try:
-        structure_analyzer = (
-            analyze_xauusd_structure
-            if shared.normalize_symbol(symbol) == "XAUUSD"
-            else analyze_legacy_structure
-        )
-        structure = structure_analyzer(data_15m)
+        structure = _analyze_15m(data_15m, symbol)
     except Exception as exc:
         result["reason"] = "WAIT_SMC_STRUCTURE_ERROR"
         result["smc_error"] = str(exc)
@@ -134,6 +146,32 @@ def evaluate_15m_breakout(data_15m, symbol, execution_settings=None):
         result["reason"] = "WAIT_NO_FRESH_15M_SMC_BREAK"
         return result
 
+    # Rebuild the same accepted SMC event at the setup candle. This prevents a
+    # later candle (or a later internal working swing) from becoming the SL
+    # reference for an already accepted setup.
+    try:
+        setup_frame = data_15m.iloc[:break_index + 1].copy()
+        accepted_setup_structure = _analyze_15m(setup_frame, symbol)
+    except Exception as exc:
+        result["reason"] = "WAIT_SMC_SETUP_STRUCTURE_ERROR"
+        result["smc_error"] = str(exc)
+        return result
+    setup_events = list(accepted_setup_structure.get("events") or [])
+    setup_event = setup_events[-1] if setup_events else None
+    if not setup_event or (
+        int(setup_event.get("break_index", -1)) != break_index
+        or str(setup_event.get("event_type") or "").upper()
+        != str(latest.get("event_type") or "").upper()
+        or str(setup_event.get("direction") or "").upper()
+        != str(latest.get("direction") or "").upper()
+    ):
+        result["reason"] = "WAIT_SMC_SETUP_STRUCTURE_MISMATCH"
+        return result
+    accepted_current = accepted_setup_structure.get("current_structure") or {}
+    event_invalidation_swing = setup_event.get("event_invalidation_swing")
+    result["accepted_setup_structure"] = accepted_setup_structure
+    result["event_invalidation_swing"] = event_invalidation_swing
+
     direction = str(latest.get("direction") or "").upper()
     side = "BUY" if direction == "BULLISH" else "SELL" if direction == "BEARISH" else "WAIT"
     if side == "WAIT":
@@ -154,7 +192,7 @@ def evaluate_15m_breakout(data_15m, symbol, execution_settings=None):
         "valid_reason": "smc_broken_structure_level",
         "swing_size": float(current.get("range") or 0.0),
     }
-    invalidation = current.get("low") if side == "BUY" else current.get("high")
+    invalidation = accepted_current.get("low") if side == "BUY" else accepted_current.get("high")
     candidate = {
         "side": side,
         "level": level,
@@ -169,6 +207,8 @@ def evaluate_15m_breakout(data_15m, symbol, execution_settings=None):
         "bos_buffer": 0.0,
         "source": "smc_structure_engine",
         "smc_event_age_15m_candles": age,
+        "accepted_setup_structure": accepted_setup_structure,
+        "event_invalidation_swing": event_invalidation_swing,
     }
     result["breakouts"] = [candidate]
     result.update(candidate)
