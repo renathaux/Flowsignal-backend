@@ -127,15 +127,17 @@ def analyze_structure(
     left_bars: int = 2,
     right_bars: int = 2,
 ) -> dict:
-    """Analyze external market structure from confirmed, protected pivots.
+    """Analyze conservative external market structure from confirmed pivots.
 
-    Internal/local pivots are still returned for chart context, but they do not
-    automatically become BOS/CHoCH levels. A bullish BOS protects the pullback
-    low that led to the new high; only a candle close through that protected
-    higher low can produce a bearish CHoCH. The bearish case is symmetric.
+    Local pivots remain available as internal swing context, but they cannot
+    flip the market by themselves. Once a bullish regime is established, the
+    external low that originated that regime stays protected through ordinary
+    higher-low pullbacks and continuation BOS events. A bearish CHoCH requires
+    a candle-body close through that external protected low. The bearish case
+    is symmetric.
 
-    This prevents the common failure mode where a small internal pullback is
-    promoted to a full structure reversal and then flips the trading direction.
+    This deliberately trades fewer reversals in exchange for avoiding rapid
+    BUY/SELL flipping on internal Gold pullbacks.
     """
     data = _normalize_frame(frame)
     if data.empty:
@@ -166,10 +168,8 @@ def analyze_structure(
     bias: StructureBias = "NEUTRAL"
     direction_code = 0
     events = []
-    broken_high: SwingPoint | None = None
-    broken_low: SwingPoint | None = None
-    protected_low: SwingPoint | None = None
-    protected_high: SwingPoint | None = None
+    external_low: SwingPoint | None = None
+    external_high: SwingPoint | None = None
     last_event_index = -1
 
     for index in range(len(data)):
@@ -179,16 +179,26 @@ def analyze_structure(
 
         close = closes[index]
         previous_close = closes[index - 1]
-        latest_high = _latest_swing(available, "HIGH", before_index=index + 1)
-        latest_low = _latest_swing(available, "LOW", before_index=index + 1)
-
-        high_reference = broken_high or latest_high
-        low_reference = broken_low or latest_low
 
         if bias == "BULLISH":
-            low_reference = protected_low or low_reference
+            high_reference = _latest_swing(
+                available,
+                "HIGH",
+                before_index=index,
+                after_index=last_event_index,
+            )
+            low_reference = external_low
         elif bias == "BEARISH":
-            high_reference = protected_high or high_reference
+            high_reference = external_high
+            low_reference = _latest_swing(
+                available,
+                "LOW",
+                before_index=index,
+                after_index=last_event_index,
+            )
+        else:
+            high_reference = _latest_swing(available, "HIGH", before_index=index)
+            low_reference = _latest_swing(available, "LOW", before_index=index)
 
         broke_high = bool(
             high_reference is not None
@@ -205,7 +215,7 @@ def analyze_structure(
 
         if broke_high:
             previous_bias = bias
-            event_type = "BOS" if bias == "BULLISH" else "CHOCH"
+            event_type = "CHOCH" if bias == "BEARISH" else "BOS"
             events.append({
                 "event_type": event_type,
                 "direction": "BULLISH",
@@ -219,25 +229,28 @@ def analyze_structure(
                 "new_direction": 2,
                 "importance": "EXTERNAL",
             })
+
+            # On the first bullish break or a true bullish CHoCH, lock the
+            # regime's origin low. Continuation BOS must not ratchet this level
+            # upward to every small internal higher low.
+            if previous_bias != "BULLISH":
+                candidate_low = _latest_swing(
+                    available,
+                    "LOW",
+                    before_index=index,
+                    after_index=last_event_index,
+                ) or _latest_swing(available, "LOW", before_index=index)
+                if candidate_low is not None:
+                    external_low = candidate_low
+            external_high = None
             bias = "BULLISH"
             direction_code = 2
-            broken_high = latest_high if latest_high is not None else high_reference
-            broken_low = None
-            candidate_low = _latest_swing(
-                available,
-                "LOW",
-                before_index=index,
-                after_index=last_event_index,
-            )
-            if candidate_low is not None:
-                protected_low = candidate_low
-            protected_high = None
             last_event_index = index
             continue
 
         if broke_low:
             previous_bias = bias
-            event_type = "BOS" if bias == "BEARISH" else "CHOCH"
+            event_type = "CHOCH" if bias == "BULLISH" else "BOS"
             events.append({
                 "event_type": event_type,
                 "direction": "BEARISH",
@@ -251,32 +264,25 @@ def analyze_structure(
                 "new_direction": 1,
                 "importance": "EXTERNAL",
             })
+
+            if previous_bias != "BEARISH":
+                candidate_high = _latest_swing(
+                    available,
+                    "HIGH",
+                    before_index=index,
+                    after_index=last_event_index,
+                ) or _latest_swing(available, "HIGH", before_index=index)
+                if candidate_high is not None:
+                    external_high = candidate_high
+            external_low = None
             bias = "BEARISH"
             direction_code = 1
-            broken_low = latest_low if latest_low is not None else low_reference
-            broken_high = None
-            candidate_high = _latest_swing(
-                available,
-                "HIGH",
-                before_index=index,
-                after_index=last_event_index,
-            )
-            if candidate_high is not None:
-                protected_high = candidate_high
-            protected_low = None
             last_event_index = index
 
     latest_high = _latest_swing(swings, "HIGH")
     latest_low = _latest_swing(swings, "LOW")
-    if bias == "BULLISH":
-        structure_high_swing = broken_high or latest_high
-        structure_low_swing = protected_low or latest_low
-    elif bias == "BEARISH":
-        structure_high_swing = protected_high or latest_high
-        structure_low_swing = broken_low or latest_low
-    else:
-        structure_high_swing = latest_high
-        structure_low_swing = latest_low
+    structure_high_swing = external_high if bias == "BEARISH" else latest_high
+    structure_low_swing = external_low if bias == "BULLISH" else latest_low
 
     structure_high = float(structure_high_swing.price if structure_high_swing else max(highs))
     structure_low = float(structure_low_swing.price if structure_low_swing else min(lows))
@@ -294,8 +300,8 @@ def analyze_structure(
         "low_start_timestamp": timestamps[low_start].isoformat(),
         "end_timestamp": timestamps[-1].isoformat(),
         "range": float(abs(structure_high - structure_low)),
-        "protected_high": _serialise_swing(protected_high),
-        "protected_low": _serialise_swing(protected_low),
+        "protected_high": _serialise_swing(external_high),
+        "protected_low": _serialise_swing(external_low),
     }
 
     return {
@@ -317,11 +323,12 @@ def analyze_structure(
             "right_bars": right_bars,
             "break_with_candle_body": True,
             "protected_external_structure": True,
+            "continuation_bos_does_not_move_external_invalidation": True,
             "internal_swings_are_not_reversal_triggers": True,
             "fib_values": list(FIB_LEVELS),
             "fvg": False,
             "closed_candles_only": True,
             "repainting": False,
-            "source_algorithm": "FlowSignal_protected_SMC_structure",
+            "source_algorithm": "FlowSignal_protected_external_SMC_structure",
         },
     }
