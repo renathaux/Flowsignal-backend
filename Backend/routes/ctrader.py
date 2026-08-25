@@ -16,6 +16,7 @@ install_ctrader_transport_guard()
 from ctrader_connector import (
     get_ctrader_market_data,
     get_live_prices,
+    get_symbol_risk_fallback,
     start_ctrader_live_price_stream,
 )
 from indicators.smc import analyze_structure as analyze_xauusd_structure
@@ -235,7 +236,14 @@ def chart_smc_structure(
         if normalized_symbol == "XAUUSD"
         else analyze_legacy_structure
     )
-    structure = structure_analyzer(closed, left_bars=2, right_bars=2)
+    point_size = get_symbol_risk_fallback(normalized_symbol).get("tick_size")
+    structure = structure_analyzer(
+        closed,
+        left_bars=2,
+        right_bars=2,
+        timeframe=normalized_timeframe,
+        point_size=point_size,
+    )
     structure.update({
         "symbol": normalized_symbol,
         "timeframe": normalized_timeframe,

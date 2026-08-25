@@ -13,6 +13,8 @@ from typing import Literal
 
 import pandas as pd
 
+from .structure_distance import StructureDistanceGate
+
 
 StructureBias = Literal["BULLISH", "BEARISH", "NEUTRAL"]
 SwingType = Literal["HIGH", "LOW"]
@@ -126,6 +128,8 @@ def analyze_structure(
     *,
     left_bars: int = 2,
     right_bars: int = 2,
+    timeframe: str | None = None,
+    point_size: float | None = None,
 ) -> dict:
     """Analyze conservative external market structure from confirmed pivots.
 
@@ -171,6 +175,7 @@ def analyze_structure(
     external_low: SwingPoint | None = None
     external_high: SwingPoint | None = None
     last_event_index = -1
+    distance_gate = StructureDistanceGate(timeframe=timeframe, point_size=point_size)
 
     for index in range(len(data)):
         available.extend(confirmed_by_index.get(index, []))
@@ -214,6 +219,8 @@ def analyze_structure(
         )
 
         if broke_high:
+            if not distance_gate.accept(high_reference.price):
+                continue
             previous_bias = bias
             event_type = "CHOCH" if bias == "BEARISH" else "BOS"
             events.append({
@@ -249,6 +256,8 @@ def analyze_structure(
             continue
 
         if broke_low:
+            if not distance_gate.accept(low_reference.price):
+                continue
             previous_bias = bias
             event_type = "CHOCH" if bias == "BULLISH" else "BOS"
             events.append({
@@ -330,5 +339,6 @@ def analyze_structure(
             "closed_candles_only": True,
             "repainting": False,
             "source_algorithm": "FlowSignal_protected_external_SMC_structure",
+            **distance_gate.config(),
         },
     }

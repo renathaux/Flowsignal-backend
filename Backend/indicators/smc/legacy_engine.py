@@ -13,6 +13,8 @@ from typing import Literal
 
 import pandas as pd
 
+from .structure_distance import StructureDistanceGate
+
 
 StructureBias = Literal["BULLISH", "BEARISH", "NEUTRAL"]
 SwingType = Literal["HIGH", "LOW"]
@@ -138,6 +140,8 @@ def analyze_structure(
     *,
     left_bars: int = 2,
     right_bars: int = 2,
+    timeframe: str | None = None,
+    point_size: float | None = None,
 ) -> dict:
     """Port of the TradingView structure state machine, using closed candles.
 
@@ -167,6 +171,7 @@ def analyze_structure(
     structure_low_start = 0
     # Source mapping: 1=bearish structure, 2=bullish structure, 0=unset.
     structure_direction = 0
+    distance_gate = StructureDistanceGate(timeframe=timeframe, point_size=point_size)
     events = []
 
     for index in range(1, len(data)):
@@ -203,40 +208,42 @@ def analyze_structure(
         ) or (structure_direction == 1 and close > structure_high)
 
         if low_broken:
-            event_type = "BOS" if structure_direction == 1 else "CHOCH"
-            events.append({
-                "event_type": event_type,
-                "direction": "BEARISH",
-                "timestamp": timestamps[index].isoformat(),
-                "close": float(close),
-                "broken_swing_timestamp": timestamps[structure_low_start].isoformat(),
-                "broken_level": float(structure_low),
-                "structure_start_index": int(structure_low_start),
-                "break_index": int(index),
-                "previous_direction": int(structure_direction),
-                "new_direction": 1,
-            })
-            structure_direction = 1
+            if distance_gate.accept(structure_low):
+                event_type = "BOS" if structure_direction == 1 else "CHOCH"
+                events.append({
+                    "event_type": event_type,
+                    "direction": "BEARISH",
+                    "timestamp": timestamps[index].isoformat(),
+                    "close": float(close),
+                    "broken_swing_timestamp": timestamps[structure_low_start].isoformat(),
+                    "broken_level": float(structure_low),
+                    "structure_start_index": int(structure_low_start),
+                    "break_index": int(index),
+                    "previous_direction": int(structure_direction),
+                    "new_direction": 1,
+                })
+                structure_direction = 1
             structure_high_start = _structure_highest_index(highs, index, LOOKBACK)
             structure_low_start = index
             structure_high = highs[structure_high_start]
             structure_low = lows[index]
 
         elif high_broken:
-            event_type = "BOS" if structure_direction == 2 else "CHOCH"
-            events.append({
-                "event_type": event_type,
-                "direction": "BULLISH",
-                "timestamp": timestamps[index].isoformat(),
-                "close": float(close),
-                "broken_swing_timestamp": timestamps[structure_high_start].isoformat(),
-                "broken_level": float(structure_high),
-                "structure_start_index": int(structure_high_start),
-                "break_index": int(index),
-                "previous_direction": int(structure_direction),
-                "new_direction": 2,
-            })
-            structure_direction = 2
+            if distance_gate.accept(structure_high):
+                event_type = "BOS" if structure_direction == 2 else "CHOCH"
+                events.append({
+                    "event_type": event_type,
+                    "direction": "BULLISH",
+                    "timestamp": timestamps[index].isoformat(),
+                    "close": float(close),
+                    "broken_swing_timestamp": timestamps[structure_high_start].isoformat(),
+                    "broken_level": float(structure_high),
+                    "structure_start_index": int(structure_high_start),
+                    "break_index": int(index),
+                    "previous_direction": int(structure_direction),
+                    "new_direction": 2,
+                })
+                structure_direction = 2
             structure_high_start = index
             structure_low_start = _structure_lowest_index(lows, index, LOOKBACK)
             structure_high = highs[index]
@@ -304,6 +311,6 @@ def analyze_structure(
             "closed_candles_only": True,
             "repainting": False,
             "source_algorithm": "LudoGH68_SMC_Structures",
+            **distance_gate.config(),
         },
     }
-
