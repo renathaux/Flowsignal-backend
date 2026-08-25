@@ -1,14 +1,64 @@
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
-from indicators.smc.engine import analyze_structure, detect_confirmed_swings
+from indicators.smc.engine import SwingPoint, analyze_structure, detect_confirmed_swings
 
 
 class SmcIndicatorEngineTests(unittest.TestCase):
     def frame(self, rows):
-        index = pd.date_range("2026-08-17T00:00:00Z", periods=len(rows), freq="5min")
+        index = pd.date_range("2026-08-17T00:00:00Z", periods=len(rows), freq="15min")
         return pd.DataFrame(rows, index=index, columns=["Open", "High", "Low", "Close"])
+
+    def external_frame(self, closes, *, lows=None, highs=None):
+        lows = lows or [value - 1 for value in closes]
+        highs = highs or [value + 1 for value in closes]
+        rows = [
+            (closes[index - 1] if index else close, highs[index], lows[index], close)
+            for index, close in enumerate(closes)
+        ]
+        return self.frame(rows)
+
+    def swing(self, frame, swing_type, index, confirmed_index, price):
+        return SwingPoint(
+            swing_type,
+            index,
+            confirmed_index,
+            frame.index[index].isoformat(),
+            frame.index[confirmed_index].isoformat(),
+            float(price),
+        )
+
+    def bullish_external_case(self, final_close, *, final_low=None):
+        closes = [104, 103, 106, 108, 106, 109, 111, 110, 107, 110, 113, 112, 114, 116, 104, final_close]
+        lows = [value - 1 for value in closes]
+        if final_low is not None:
+            lows[-1] = final_low
+        frame = self.external_frame(closes, lows=lows)
+        swings = [
+            self.swing(frame, "LOW", 1, 3, 100),
+            self.swing(frame, "HIGH", 3, 5, 110),
+            self.swing(frame, "LOW", 8, 10, 105),
+            self.swing(frame, "HIGH", 10, 12, 115),
+        ]
+        with patch("indicators.smc.engine.detect_confirmed_swings", return_value=swings):
+            return analyze_structure(frame)
+
+    def bearish_external_case(self, final_close, *, final_high=None):
+        closes = [116, 117, 114, 112, 114, 111, 109, 110, 113, 110, 107, 108, 106, 104, 116, final_close]
+        highs = [value + 1 for value in closes]
+        if final_high is not None:
+            highs[-1] = final_high
+        frame = self.external_frame(closes, highs=highs)
+        swings = [
+            self.swing(frame, "HIGH", 1, 3, 120),
+            self.swing(frame, "LOW", 3, 5, 110),
+            self.swing(frame, "HIGH", 8, 10, 115),
+            self.swing(frame, "LOW", 10, 12, 105),
+        ]
+        with patch("indicators.smc.engine.detect_confirmed_swings", return_value=swings):
+            return analyze_structure(frame)
 
     def test_swing_confirmation_does_not_look_ahead(self):
         data = self.frame([
@@ -110,8 +160,40 @@ class SmcIndicatorEngineTests(unittest.TestCase):
             event for event in result["events"]
             if event["direction"] == "BEARISH" and event["event_type"] == "CHOCH"
         ]
-        if bearish_choch:
-            self.assertEqual(result["bias"], "BEARISH")
+        self.assertTrue(bearish_choch)
+        self.assertEqual(result["bias"], "BEARISH")
+
+    def test_bullish_external_structure_ignores_internal_higher_low_break(self):
+        result = self.bullish_external_case(104)
+        bearish_choch = [event for event in result["events"] if event["direction"] == "BEARISH"]
+        self.assertFalse(bearish_choch)
+        self.assertEqual(result["bias"], "BULLISH")
+        self.assertEqual(result["current_structure"]["protected_low"]["price"], 100.0)
+
+    def test_bearish_external_structure_ignores_internal_lower_high_break(self):
+        result = self.bearish_external_case(116)
+        bullish_choch = [event for event in result["events"] if event["direction"] == "BULLISH"]
+        self.assertFalse(bullish_choch)
+        self.assertEqual(result["bias"], "BEARISH")
+        self.assertEqual(result["current_structure"]["protected_high"]["price"], 120.0)
+
+    def test_closed_break_of_protected_bullish_low_is_bearish_choch(self):
+        result = self.bullish_external_case(99)
+        event = result["events"][-1]
+        self.assertEqual((event["event_type"], event["direction"]), ("CHOCH", "BEARISH"))
+        self.assertEqual(event["broken_level"], 100.0)
+
+    def test_closed_break_of_protected_bearish_high_is_bullish_choch(self):
+        result = self.bearish_external_case(121)
+        event = result["events"][-1]
+        self.assertEqual((event["event_type"], event["direction"]), ("CHOCH", "BULLISH"))
+        self.assertEqual(event["broken_level"], 120.0)
+
+    def test_wick_through_protected_low_without_close_is_not_choch(self):
+        result = self.bullish_external_case(101, final_low=99)
+        bearish_choch = [event for event in result["events"] if event["direction"] == "BEARISH"]
+        self.assertFalse(bearish_choch)
+        self.assertEqual(result["bias"], "BULLISH")
 
     def test_module_is_analysis_only(self):
         import indicators.smc.engine as engine

@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import pandas as pd
 
-from indicators.smc.engine import analyze_structure
+from indicators.smc.engine import analyze_structure as analyze_xauusd_structure
+from indicators.smc.legacy_engine import analyze_structure as analyze_legacy_structure
+from . import shared
 
 MAX_FRESH_15M_CANDLES = 4
 
@@ -87,7 +89,12 @@ def evaluate_15m_breakout(data_15m, symbol, execution_settings=None):
         return result
 
     try:
-        structure = analyze_structure(data_15m)
+        structure_analyzer = (
+            analyze_xauusd_structure
+            if shared.normalize_symbol(symbol) == "XAUUSD"
+            else analyze_legacy_structure
+        )
+        structure = structure_analyzer(data_15m)
     except Exception as exc:
         result["reason"] = "WAIT_SMC_STRUCTURE_ERROR"
         result["smc_error"] = str(exc)

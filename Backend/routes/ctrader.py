@@ -18,7 +18,8 @@ from ctrader_connector import (
     get_live_prices,
     start_ctrader_live_price_stream,
 )
-from indicators.smc import analyze_structure
+from indicators.smc import analyze_structure as analyze_xauusd_structure
+from indicators.smc.legacy_engine import analyze_structure as analyze_legacy_structure
 from services.ctrader_service import get_health_snapshot
 
 router = APIRouter()
@@ -229,7 +230,12 @@ def chart_smc_structure(
         limit=limit,
     )
     closed = _closed_only(frame, normalized_timeframe)
-    structure = analyze_structure(closed, left_bars=2, right_bars=2)
+    structure_analyzer = (
+        analyze_xauusd_structure
+        if normalized_symbol == "XAUUSD"
+        else analyze_legacy_structure
+    )
+    structure = structure_analyzer(closed, left_bars=2, right_bars=2)
     structure.update({
         "symbol": normalized_symbol,
         "timeframe": normalized_timeframe,

@@ -15,16 +15,14 @@ from . import strict_trader
 
 
 XAUUSD_SL_BUFFER_PIPS = 5.0
-
-
-def _gold_pip_size():
-    # FlowSignal XAUUSD quotes to 0.01 points. In the existing Gold convention,
-    # one pip is 0.10, so five pips = 0.50 = 50 points.
-    return 0.10
+XAUUSD_SL_BUFFER_QUOTED_POINTS = 50
 
 
 def _five_pip_buffer():
-    return XAUUSD_SL_BUFFER_PIPS * _gold_pip_size()
+    # FlowSignal's Gold convention defines five pips as 50 quoted points.
+    # Derive the price distance from the repository's configured quote precision
+    # instead of inventing a second XAUUSD pip-size setting: 50 * 0.01 = 0.50.
+    return XAUUSD_SL_BUFFER_QUOTED_POINTS * strict_trader.point_size("XAUUSD")
 
 
 def _slice_to_setup(data_15m, setup_break_time):
@@ -62,22 +60,21 @@ def _protected_15m_stop(data_15m, side, entry, minimum_sl_points):
 
     current = structure.get("current_structure") or {}
     if side == "BUY":
-        swing_price = current.get("low")
-        swing_time = current.get("low_start_timestamp")
+        protected = current.get("protected_low")
         swing_type = "LOW"
     else:
-        swing_price = current.get("high")
-        swing_time = current.get("high_start_timestamp")
+        protected = current.get("protected_high")
         swing_type = "HIGH"
 
-    if swing_price is None:
+    if not isinstance(protected, dict) or protected.get("price") is None:
         return {
             "ok": False,
             "reason": "WAIT_NO_PROTECTED_15M_SWING_SL",
             "sl_structure_source": "protected_15m_structure",
         }
 
-    swing_price = float(swing_price)
+    swing_price = float(protected["price"])
+    swing_time = protected.get("timestamp")
     entry = float(entry)
     buffer = _five_pip_buffer()
     stop = swing_price - buffer if side == "BUY" else swing_price + buffer
@@ -187,7 +184,7 @@ def build_xauusd_risk_levels(
         "risk_reward": f"1:{round(float(tp2['rr']), 2):g}",
         "sl_buffer": round(float(stop["buffer"]), dec),
         "sl_buffer_pips": XAUUSD_SL_BUFFER_PIPS,
-        "sl_buffer_points": round(float(stop["buffer"]) / strict_trader.point_size(symbol), 2),
+        "sl_buffer_points": XAUUSD_SL_BUFFER_QUOTED_POINTS,
         "minimum_sl_points": int(configured_minimum_sl_points),
         "sl_distance_points": round(float(stop["distance_points"]), 2),
         "sl_swing_used": round(float(stop["swing"]["price"]), dec),
