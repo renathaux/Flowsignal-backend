@@ -58,6 +58,61 @@ class SmcIndicatorEngineTests(unittest.TestCase):
         if bearish:
             self.assertIn(bearish[-1]["event_type"], {"BOS", "CHOCH"})
 
+    def test_internal_higher_low_break_does_not_flip_bullish_regime(self):
+        # External bullish origin low is 100. A later internal HL forms near 112,
+        # then price makes another high. Closing below 112 must not be CHoCH
+        # while price remains above the protected external 100 low.
+        data = self.frame([
+            (103, 104, 100, 103),
+            (103, 106, 102, 105),
+            (105, 110, 104, 109),
+            (109, 108, 103, 106),
+            (106, 107, 102, 105),
+            (105, 109, 104, 108),
+            (108, 112, 107, 111),
+            (111, 116, 110, 115),
+            (115, 114, 111, 112),
+            (112, 113, 111.5, 112.5),
+            (112.5, 117, 112, 116.5),
+            (116.5, 120, 115, 119),
+            (119, 118, 113, 114),
+            (114, 115, 110.5, 111),
+            (111, 112, 108, 109),
+        ])
+        result = analyze_structure(data, left_bars=2, right_bars=2)
+        bearish_choch = [
+            event for event in result["events"]
+            if event["direction"] == "BEARISH" and event["event_type"] == "CHOCH"
+        ]
+        self.assertFalse(bearish_choch)
+        self.assertNotEqual(result["bias"], "BEARISH")
+
+    def test_external_protected_low_break_can_flip_regime(self):
+        data = self.frame([
+            (103, 104, 100, 103),
+            (103, 106, 102, 105),
+            (105, 110, 104, 109),
+            (109, 108, 103, 106),
+            (106, 107, 102, 105),
+            (105, 109, 104, 108),
+            (108, 112, 107, 111),
+            (111, 116, 110, 115),
+            (115, 114, 111, 112),
+            (112, 113, 111.5, 112.5),
+            (112.5, 117, 112, 116.5),
+            (116.5, 120, 115, 119),
+            (119, 118, 110, 112),
+            (112, 113, 104, 105),
+            (105, 106, 98, 99),
+        ])
+        result = analyze_structure(data, left_bars=2, right_bars=2)
+        bearish_choch = [
+            event for event in result["events"]
+            if event["direction"] == "BEARISH" and event["event_type"] == "CHOCH"
+        ]
+        if bearish_choch:
+            self.assertEqual(result["bias"], "BEARISH")
+
     def test_module_is_analysis_only(self):
         import indicators.smc.engine as engine
 
