@@ -4057,6 +4057,69 @@ def fetch_ctrader_trendbars(config, symbol, period, limit):
         except Exception:
             pass
 
+
+def fetch_ctrader_historical_candles(symbol, timeframe, start_utc, end_utc):
+    """Fetch native cTrader trendbars for a bounded historical UTC range.
+
+    This is a market-data-only helper. It intentionally does not read or write
+    the live candle cache, persist candles, or touch any order/position API.
+    """
+    requested_symbol = normalize_symbol(symbol)
+    normalized_timeframe = str(timeframe or "").strip().lower()
+    period = CTRADER_TRENDBAR_PERIODS.get(normalized_timeframe)
+    period_minutes = CTRADER_TRENDBAR_PERIOD_MINUTES.get(period)
+    if period is None or period_minutes is None:
+        raise ValueError(f"Unsupported cTrader candle timeframe: {timeframe}")
+
+    start = pd.Timestamp(start_utc)
+    end = pd.Timestamp(end_utc)
+    start = start.tz_localize("UTC") if start.tzinfo is None else start.tz_convert("UTC")
+    end = end.tz_localize("UTC") if end.tzinfo is None else end.tz_convert("UTC")
+    if end <= start:
+        raise ValueError("Historical candle end must be after start")
+
+    config = get_ctrader_config()
+    if not config:
+        raise RuntimeError("Missing or invalid cTrader config for historical candle fetch")
+
+    host, port = CTRADER_JSON_ENDPOINTS[config["env"]]
+    account_id = int(config["account_id"])
+    sock = open_ctrader_json_socket(host, port)
+    try:
+        authorize_ctrader_socket(sock, config, account_id)
+        symbol_details = fetch_ctrader_symbol_details(sock, account_id)
+        symbol_info = resolve_ctrader_symbol(symbol_details, requested_symbol)
+        if not symbol_info:
+            raise RuntimeError(f"cTrader symbol not found: {requested_symbol}")
+
+        symbol_id = int(symbol_info["symbol_id"])
+        digits = int(symbol_info["digits"])
+        expected_count = int((end - start).total_seconds() // (period_minutes * 60)) + 2
+        payload = {
+            "ctidTraderAccountId": account_id,
+            "symbolId": symbol_id,
+            "period": period,
+            "fromTimestamp": int(start.timestamp() * 1000),
+            "toTimestamp": int(end.timestamp() * 1000),
+            "count": min(max(expected_count, 1), 5000),
+        }
+        response = send_ctrader_request(
+            sock,
+            PAYLOAD_GET_TRENDBARS_REQ,
+            payload,
+            PAYLOAD_GET_TRENDBARS_RES,
+        )
+        trendbars = response.get("payload", {}).get("trendbar", [])
+        for trendbar in trendbars:
+            if isinstance(trendbar, dict):
+                trendbar["digits"] = digits
+        return normalize_ctrader_candles(trendbars, requested_symbol)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
 def extract_ctrader_account_id(response):
     payload = response.get("payload", {}) if isinstance(response, dict) else {}
 

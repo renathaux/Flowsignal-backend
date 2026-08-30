@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 import time
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from services.ctrader_transport_guard import install_ctrader_transport_guard
 from services.trade_signal_lifecycle_guard import (
@@ -14,11 +14,14 @@ from services.trade_signal_lifecycle_guard import (
 install_ctrader_transport_guard()
 
 from ctrader_connector import (
+    fetch_ctrader_historical_candles,
     get_ctrader_market_data,
     get_live_prices,
     get_symbol_risk_fallback,
     start_ctrader_live_price_stream,
 )
+from services.customer_forex_guard import _bearer
+from services.user_auth_service import require_admin
 from indicators.smc import analyze_structure as analyze_xauusd_structure
 from indicators.smc.legacy_engine import analyze_structure as analyze_legacy_structure
 from services.ctrader_service import get_health_snapshot
@@ -27,6 +30,22 @@ router = APIRouter()
 
 _ALLOWED_SYMBOLS = {"EURUSD", "XAUUSD"}
 _TIMEFRAME_MINUTES = {"5m": 5, "15m": 15, "1h": 60}
+_HISTORICAL_EXPORT_TIMEFRAMES = {"15m": "15m", "15min": "15m", "m15": "15m"}
+_MAX_HISTORICAL_EXPORT_RANGE = timedelta(days=14)
+
+
+def _require_candle_export_admin(request: Request):
+    """Accept either current database admin auth or the legacy owner token."""
+    try:
+        return require_admin(request)
+    except HTTPException:
+        import api
+
+        token = _bearer(request.headers)
+        session = api.SESSIONS.get(token) if token else None
+        if not isinstance(session, dict) or str(session.get("role") or "").lower() != "admin":
+            raise HTTPException(status_code=403, detail="ADMIN_CANDLE_EXPORT_REQUIRED")
+        return session
 
 
 @router.on_event("startup")
@@ -188,6 +207,81 @@ def live_chart_ticks():
         "live_price_health": status.get("live_price_health"),
         "live_price_stale_symbols": status.get("live_price_stale_symbols", []),
         "live_price_last_update": status.get("live_price_last_update"),
+    }
+
+
+@router.get("/admin/ctrader/candles")
+def export_closed_ctrader_candles(
+    request: Request,
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    start: datetime = Query(...),
+    end: datetime = Query(...),
+):
+    """Export bounded native closed cTrader candles for forensic observation."""
+    _require_candle_export_admin(request)
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_timeframe = _HISTORICAL_EXPORT_TIMEFRAMES.get(
+        str(timeframe or "").strip().lower()
+    )
+    if normalized_symbol not in _ALLOWED_SYMBOLS:
+        raise HTTPException(status_code=422, detail="symbol must be EURUSD or XAUUSD")
+    if normalized_timeframe is None:
+        raise HTTPException(status_code=422, detail="timeframe must be M15")
+
+    start_utc = start if start.tzinfo else start.replace(tzinfo=timezone.utc)
+    end_utc = end if end.tzinfo else end.replace(tzinfo=timezone.utc)
+    start_utc = start_utc.astimezone(timezone.utc)
+    end_utc = end_utc.astimezone(timezone.utc)
+    if end_utc <= start_utc:
+        raise HTTPException(status_code=422, detail="end must be after start")
+    if end_utc - start_utc > _MAX_HISTORICAL_EXPORT_RANGE:
+        raise HTTPException(status_code=422, detail="date range exceeds 14 days")
+
+    frame = fetch_ctrader_historical_candles(
+        normalized_symbol,
+        normalized_timeframe,
+        start_utc,
+        end_utc,
+    )
+    if frame is None or frame.empty:
+        raise HTTPException(status_code=503, detail="cTrader returned no historical candles")
+
+    data = frame.copy()
+    data.index = data.index.map(
+        lambda value: value if getattr(value, "tzinfo", None) else value.tz_localize("UTC")
+    )
+    data = data[~data.index.duplicated(keep="last")].sort_index()
+    closed_before = datetime.now(timezone.utc)
+    period = timedelta(minutes=_TIMEFRAME_MINUTES[normalized_timeframe])
+    data = data[
+        (data.index >= start_utc)
+        & (data.index <= end_utc)
+        & (data.index.map(lambda value: value.to_pydatetime() + period <= closed_before))
+    ]
+
+    candles = []
+    for timestamp, row in data.iterrows():
+        candle = {
+            "timestamp": timestamp.isoformat().replace("+00:00", "Z"),
+            "open": float(row["Open"]),
+            "high": float(row["High"]),
+            "low": float(row["Low"]),
+            "close": float(row["Close"]),
+        }
+        if "Volume" in row.index:
+            candle["volume"] = float(row["Volume"])
+        candles.append(candle)
+
+    return {
+        "symbol": normalized_symbol,
+        "timeframe": normalized_timeframe,
+        "start_utc": start_utc.isoformat().replace("+00:00", "Z"),
+        "end_utc": end_utc.isoformat().replace("+00:00", "Z"),
+        "closed_only": True,
+        "read_only": True,
+        "count": len(candles),
+        "candles": candles,
     }
 
 
