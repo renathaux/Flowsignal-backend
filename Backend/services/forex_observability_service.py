@@ -68,6 +68,22 @@ def _normalized_price(symbol, value):
     return str(units)
 
 
+def _optional_float(value):
+    """Normalize display placeholders before binding nullable numeric columns."""
+    if value in (None, "", "--"):
+        return None
+    try:
+        parsed = Decimal(str(value))
+        return float(parsed) if parsed.is_finite() else None
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _optional_int(value):
+    normalized = _optional_float(value)
+    return int(normalized) if normalized is not None else None
+
+
 def _canonical_time(value):
     parsed = _utc(value)
     return parsed.isoformat(timespec="seconds") if parsed else None
@@ -155,10 +171,10 @@ def _event_from_snapshot(snapshot):
         "event_type": event_type if event_id else None,
         "event_direction": direction if event_id else None,
         "event_close_time": _utc(close_time),
-        "event_broken_level": level,
+        "event_broken_level": _optional_float(level),
         "event_invalidation_swing_time": _utc(swing_time),
-        "event_invalidation_swing_price": swing_price,
-        "event_age_candles": bos.get("event_age_candles"),
+        "event_invalidation_swing_price": _optional_float(swing_price),
+        "event_age_candles": _optional_int(bos.get("event_age_candles")),
     }
 
 
@@ -305,16 +321,16 @@ def build_lifecycle_values(snapshot, previous=None, first_confirmation_seen=None
         "time_setup_was_absent_seconds": absent_seconds,
         "confirmation_id": confirmation_id,
         "confirmation_time": confirmation_time,
-        "confirmation_close": confirmation_close,
+        "confirmation_close": _optional_float(confirmation_close),
         "confirmation_first_observed_at": first_observed,
         "confirmation_age_seconds": confirmation_age,
         "confirmation_generation": confirmation_generation,
         "confirmation_reused": confirmation_reused,
         "new_confirmation_after_revival": new_after_revival,
         "ema_state": (frozen.get("trend") or {}).get("classification"),
-        "entry_candidate_price": trade_plan.get("entry"),
+        "entry_candidate_price": _optional_float(trade_plan.get("entry")),
         "displacement_points": displacement_points,
-        "rr_at_evaluation": trade_plan.get("r_multiple"),
+        "rr_at_evaluation": _optional_float(trade_plan.get("r_multiple")),
         "signal_ready": signal_ready,
         "final_block_reason": final.get("reason"),
         "order_attempted": False,

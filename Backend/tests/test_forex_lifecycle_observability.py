@@ -79,6 +79,22 @@ class ForexLifecycleObservabilityTests(unittest.TestCase):
         self.assertEqual(displacement("EURUSD", 1.1665, 1.1660), (0.0005, 50.0))
         self.assertEqual(displacement("XAUUSD", 4621.5, 4621.0), (0.5, 50.0))
 
+    def test_display_placeholders_are_normalized_for_nullable_numeric_columns(self):
+        value = snapshot(signal_ready=False)
+        value["bos"]["watched_level"] = "--"
+        value["bos"]["event_invalidation_swing_price"] = "--"
+        value["bos"]["event_age_candles"] = "--"
+        value["m5_confirmation"]["price"] = "--"
+        value["trade_plan"]["entry"] = "--"
+        value["trade_plan"]["r_multiple"] = "--"
+        result = build_lifecycle_values(value, now=NOW)
+        for field in (
+            "event_broken_level", "event_invalidation_swing_price",
+            "event_age_candles", "confirmation_close",
+            "entry_candidate_price", "rr_at_evaluation",
+        ):
+            self.assertIsNone(result[field], field)
+
     def test_present_absent_same_event_increments_revival(self):
         present = build_lifecycle_values(snapshot(), now=NOW)
         previous_present = SimpleNamespace(**present)
