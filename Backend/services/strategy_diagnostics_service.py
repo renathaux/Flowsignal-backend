@@ -18,11 +18,15 @@ from sqlalchemy import delete, select
 
 from db import SessionLocal
 from models import StrategyCycleDiagnostic
+from services.forex_observability_service import (
+    DEPLOYMENT_SHA,
+    persist_lifecycle_evaluation_safely,
+)
 
 
 logger = logging.getLogger(__name__)
 SESSION_ID = os.getenv("RENDER_INSTANCE_ID") or f"boot-{uuid.uuid4()}"
-DEFAULT_RETENTION_DAYS = 7
+DEFAULT_RETENTION_DAYS = 120
 MIN_RETENTION_DAYS = 1
 
 
@@ -410,7 +414,9 @@ def _swing_record(swing, minimum_size=None):
         }
     return {
         "type": swing.get("type"),
-        "timestamp": swing.get("time"),
+        "timestamp": (
+            swing.get("time") or swing.get("swing_time") or swing.get("timestamp")
+        ),
         "price": swing.get("price"),
         "size": swing.get("swing_size"),
         "minimum_size": minimum_size,
@@ -540,6 +546,11 @@ def build_snapshot(symbol, result, data_5m=None, data_15m=None, source_state=Non
     }
     risk_percent = result.get("final_risk_percent", result.get("risk_percent"))
     sl_debug = result.get("swing_sl_debug") or {}
+    event_invalidation_swing = (
+        breakout.get("event_invalidation_swing")
+        or result.get("event_invalidation_swing")
+        or {}
+    )
     sl_used_price = sl_debug.get("sl_swing_used")
     sl_source_swing = next(
         (
@@ -550,9 +561,10 @@ def build_snapshot(symbol, result, data_5m=None, data_15m=None, source_state=Non
         None,
     )
     snapshot = {
-        "schema_version": 1,
+        "schema_version": 2,
         "cycle_id": cycle_id,
         "session_id": SESSION_ID,
+        "deployment_sha": DEPLOYMENT_SHA,
         "symbol": str(symbol).upper(),
         "timing": {
             "evaluation_timestamp": now.isoformat(),
@@ -579,6 +591,7 @@ def build_snapshot(symbol, result, data_5m=None, data_15m=None, source_state=Non
             "latest_rejected_high": _swing_record(latest_rejected_high, minimum_size),
             "latest_rejected_low": _swing_record(latest_rejected_low, minimum_size),
             "selected": _swing_record(breakout.get("swing"), minimum_size),
+            "event_invalidation": _swing_record(event_invalidation_swing, minimum_size),
             "raw_count": len(raw_swings),
             "qualified_count": len(qualified_swings),
         },
@@ -605,6 +618,18 @@ def build_snapshot(symbol, result, data_5m=None, data_15m=None, source_state=Non
             "fresh": bos_fresh,
             "remembered": bool(breakout.get("remembered")),
             "reason": breakout.get("reason") or reason,
+            "event_age_candles": (
+                breakout.get("event_age_candles")
+                if breakout.get("event_age_candles") is not None
+                else result.get("smc_event_age_15m_candles")
+            ),
+            "event_invalidation_swing_time": (
+                event_invalidation_swing.get("time")
+                or event_invalidation_swing.get("swing_time")
+                or event_invalidation_swing.get("timestamp")
+            ),
+            "event_invalidation_swing_price": event_invalidation_swing.get("price"),
+            "event_invalidation_swing_type": event_invalidation_swing.get("type"),
         },
         "m5_confirmation": {
             "required_direction": side,
@@ -722,6 +747,9 @@ def persist_cycle_safely(
         timing = snapshot["timing"]
         evaluated_at = _utc_datetime(timing["evaluation_timestamp"])
         fingerprint = meaningful_state_fingerprint(snapshot)
+        lifecycle = persist_lifecycle_evaluation_safely(snapshot, source_state)
+        if lifecycle:
+            snapshot["lifecycle_observability"] = _json_safe(lifecycle)
         with _STATE_LOCK:
             _increment_counter(normalized_symbol, "cycles_evaluated")
             db = SessionLocal()

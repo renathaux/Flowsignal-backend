@@ -13,6 +13,7 @@ from db import Base
 from models import AutoTradeStateAudit, StrategyCycleDiagnostic
 from routes.diagnostics import strategy_cycles
 from services import strategy_diagnostics_service as diagnostics
+from services import forex_observability_service as forex_observability
 
 
 class StrategyDiagnosticsTests(unittest.TestCase):
@@ -28,10 +29,15 @@ class StrategyDiagnosticsTests(unittest.TestCase):
         self.Session = sessionmaker(bind=self.engine)
         self.session_patch = patch.object(diagnostics, "SessionLocal", self.Session)
         self.session_patch.start()
+        self.observability_session_patch = patch.object(
+            forex_observability, "SessionLocal", self.Session
+        )
+        self.observability_session_patch.start()
         diagnostics._reset_runtime_state_for_tests()
 
     def tearDown(self):
         diagnostics._reset_runtime_state_for_tests()
+        self.observability_session_patch.stop()
         self.session_patch.stop()
         self.engine.dispose()
         os.unlink(self.path)
@@ -357,9 +363,9 @@ class StrategyDiagnosticsTests(unittest.TestCase):
                 )
                 self.assertNotEqual(fingerprint, baseline)
 
-    def test_default_retention_is_seven_days(self):
-        self.assertEqual(diagnostics.DEFAULT_RETENTION_DAYS, 7)
-        self.assertEqual(diagnostics._configured_retention_days({}), 7)
+    def test_default_retention_is_one_hundred_twenty_days(self):
+        self.assertEqual(diagnostics.DEFAULT_RETENTION_DAYS, 120)
+        self.assertEqual(diagnostics._configured_retention_days({}), 120)
 
     def test_retention_is_configurable_with_a_one_day_minimum(self):
         setting = "STRATEGY_DIAGNOSTICS_RETENTION_DAYS"
@@ -377,7 +383,7 @@ class StrategyDiagnosticsTests(unittest.TestCase):
         )
         self.assertEqual(
             diagnostics._configured_retention_days({setting: "invalid"}),
-            7,
+            120,
         )
 
     def test_retention_cleanup_preserves_newer_rows_and_deletes_older_rows(self):

@@ -130,6 +130,98 @@ class StrategyCycleDiagnostic(Base):
     )
 
 
+class ForexLifecycleEvaluation(Base):
+    """Append-only production-evaluation metadata and read-only shadow results."""
+
+    __tablename__ = "forex_lifecycle_evaluations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    strategy_evaluation_id = Column(String(64), nullable=False, unique=True, index=True)
+    evaluated_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    session_id = Column(String(128), nullable=False, index=True)
+    deployment_sha = Column(String(64), nullable=False)
+    symbol = Column(String(16), nullable=False, index=True)
+    account_scope = Column(String(128), nullable=False, index=True)
+    event_id = Column(String(64), nullable=True, index=True)
+    event_type = Column(String(16), nullable=True)
+    event_direction = Column(String(8), nullable=True)
+    event_close_time = Column(DateTime(timezone=True), nullable=True)
+    event_broken_level = Column(Float, nullable=True)
+    event_invalidation_swing_time = Column(DateTime(timezone=True), nullable=True)
+    event_invalidation_swing_price = Column(Float, nullable=True)
+    event_age_candles = Column(Integer, nullable=True)
+    setup_present = Column(Boolean, nullable=False, default=False)
+    setup_status = Column(String(32), nullable=False)
+    setup_invalid_reason = Column(String(255), nullable=True)
+    setup_generation = Column(Integer, nullable=False, default=0)
+    revival_count = Column(Integer, nullable=False, default=0)
+    setup_absent_since = Column(DateTime(timezone=True), nullable=True)
+    setup_last_reappeared_at = Column(DateTime(timezone=True), nullable=True)
+    time_setup_was_absent_seconds = Column(Float, nullable=True)
+    confirmation_id = Column(String(64), nullable=True, index=True)
+    confirmation_time = Column(DateTime(timezone=True), nullable=True)
+    confirmation_close = Column(Float, nullable=True)
+    confirmation_first_observed_at = Column(DateTime(timezone=True), nullable=True)
+    confirmation_age_seconds = Column(Float, nullable=True)
+    confirmation_generation = Column(Integer, nullable=False, default=0)
+    confirmation_reused = Column(Boolean, nullable=False, default=False)
+    new_confirmation_after_revival = Column(Boolean, nullable=False, default=False)
+    ema_state = Column(String(32), nullable=True)
+    entry_candidate_price = Column(Float, nullable=True)
+    displacement_points = Column(Float, nullable=True)
+    rr_at_evaluation = Column(Float, nullable=True)
+    signal_ready = Column(Boolean, nullable=False, default=False)
+    final_block_reason = Column(String(255), nullable=True, index=True)
+    order_attempted = Column(Boolean, nullable=False, default=False)
+    order_id = Column(String(128), nullable=True)
+    position_id = Column(String(128), nullable=True, index=True)
+    shadow_only = Column(Boolean, nullable=False, default=False)
+    shadow_policy_results = Column(JSON, nullable=False, default=dict)
+    details_json = Column(JSON, nullable=False, default=dict)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("ix_forex_lifecycle_symbol_event_time", "symbol", "event_id", "evaluated_at"),
+        Index("ix_forex_lifecycle_confirmation_time", "confirmation_id", "evaluated_at"),
+        Index("ix_forex_lifecycle_block_time", "final_block_reason", "evaluated_at"),
+    )
+
+
+class ForexExecutionSnapshot(Base):
+    """Immutable append-only facts known immediately before broker submission."""
+
+    __tablename__ = "forex_execution_snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id = Column(String(64), nullable=False, unique=True, index=True)
+    snapshot_version = Column(Integer, nullable=False, default=1)
+    production_sha = Column(String(64), nullable=False)
+    backend_session_id = Column(String(128), nullable=False, index=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    account_id = Column(String(128), nullable=True, index=True)
+    broker_environment = Column(String(32), nullable=True)
+    direction = Column(String(8), nullable=False)
+    event_id = Column(String(64), nullable=True, index=True)
+    confirmation_id = Column(String(64), nullable=True, index=True)
+    order_attempted_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    client_order_id = Column(String(128), nullable=True, index=True)
+    broker_order_id = Column(String(128), nullable=True, index=True)
+    position_id = Column(String(128), nullable=True, index=True)
+    broker_response_at = Column(DateTime(timezone=True), nullable=True)
+    snapshot_json = Column(JSON, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("ix_forex_execution_symbol_attempted", "symbol", "order_attempted_at"),
+    )
+
+
 class StrategyShadowRuntime(Base):
     """Restart-safe state for one non-executing strategy shadow."""
 

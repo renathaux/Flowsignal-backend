@@ -102,6 +102,10 @@ from services.strategy_diagnostics_service import (
     record_execution_gate_safely,
     update_execution_outcome_safely,
 )
+from services.forex_observability_service import (
+    persist_execution_snapshot_safely,
+    record_execution_response_safely,
+)
 from services.v2_shadow_service import link_v1_execution_safely
 from services.execution_risk_service import (
     persist_execution_risk_audit_safely,
@@ -10833,6 +10837,33 @@ def _execute_live_order_core_impl(payload: dict, source="manual", _inflight_guar
             "v1_submission_unchanged": True,
         },
     )
+    persist_execution_snapshot_safely(
+        symbol=symbol,
+        direction=side,
+        trade_payload=trade_payload,
+        plan=plan,
+        quote=pre_submit_tick,
+        risk_size=risk_size,
+        gate_results={
+            "ema_state": locals().get("fresh_ema_gate"),
+            "consolidation_result": (
+                plan.get("consolidation") if isinstance(plan, dict) else None
+            ),
+            "news_decision": locals().get("locked_news_gate") or locals().get("news_runtime"),
+            "market_data_freshness_result": locals().get("market_health"),
+            "cooldown_result": (
+                {"active": locals().get("cooldown_active")}
+                if "cooldown_active" in locals() else None
+            ),
+            "active_position_result": {
+                "application_active_order": False,
+                "broker_position_present": False,
+                "final_gate_passed": True,
+            },
+            "loss_limit_status": loss_limit_status,
+            "risk_recalculation_result": pre_submit_risk,
+        },
+    )
     result = place_market_order_with_inflight_cleanup(
         symbol,
         action=side,
@@ -10845,6 +10876,7 @@ def _execute_live_order_core_impl(payload: dict, source="manual", _inflight_guar
         risk=trade_payload.get("risk"),
         mode=trade_payload["mode"]
     )
+    record_execution_response_safely(symbol, result)
     # Observe the actual fill without changing, retrying, closing, resizing, or
     # widening the V1 order.  Any risk drift is explicit and durable.
     actual_fill = (

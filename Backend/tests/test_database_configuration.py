@@ -36,6 +36,8 @@ class DatabaseConfigurationTests(unittest.TestCase):
             "auto_trade_state_audit",
             "ctrader_oauth_tokens",
             "strategy_cycle_diagnostics",
+            "forex_lifecycle_evaluations",
+            "forex_execution_snapshots",
             "strategy_shadow_runtime",
             "strategy_shadow_evaluations",
             "strategy_shadow_trades",
@@ -54,6 +56,8 @@ class DatabaseConfigurationTests(unittest.TestCase):
         legacy_tables = expected - {
             "ctrader_oauth_tokens",
             "strategy_cycle_diagnostics",
+            "forex_lifecycle_evaluations",
+            "forex_execution_snapshots",
             "strategy_shadow_runtime",
             "strategy_shadow_evaluations",
             "strategy_shadow_trades",
@@ -84,6 +88,7 @@ class DatabaseConfigurationTests(unittest.TestCase):
             BACKEND_DIR / "migrations" / "versions" / "20260808_0006_official_provider_reconciliation.py",
             BACKEND_DIR / "migrations" / "versions" / "20260811_0007_strategy_setting_audit.py",
             BACKEND_DIR / "migrations" / "versions" / "20260813_0008_strategy_v2_shadow.py",
+            BACKEND_DIR / "migrations" / "versions" / "20260829_0015_forex_lifecycle_observability.py",
             BACKEND_DIR / "scripts" / "migrate_sqlite_to_neon.py",
         ]
         for path in files:
@@ -120,6 +125,8 @@ class DatabaseConfigurationTests(unittest.TestCase):
         source_tables = set(Base.metadata.tables) - {
             "ctrader_oauth_tokens",
             "strategy_cycle_diagnostics",
+            "forex_lifecycle_evaluations",
+            "forex_execution_snapshots",
             "strategy_shadow_runtime",
             "strategy_shadow_evaluations",
             "strategy_shadow_trades",
