@@ -9,6 +9,7 @@ from services.deriv_service import (
     public_config,
     set_selected_account,
 )
+from services.deriv_connection_recovery import current_connection_snapshot
 from services.deriv_binary_execution_service import (
     account_settings,
     execute_relayed_signal,
@@ -86,6 +87,16 @@ def oauth_exchange(payload: OAuthExchangeRequest, request: Request):
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/status")
+def current_status(request: Request):
+    user = current_user(request)
+    try:
+        return current_connection_snapshot(user.id, validate_token=True)
+    except RuntimeError as exc:
+        status_code = 401 if str(exc) == "DERIV_TOKEN_INVALID" else 403
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
 
 @router.post("/status")
