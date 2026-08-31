@@ -89,6 +89,28 @@ def _latest_swing(swings, swing_type, *, before_index=None, after_index=None):
     return candidates[-1] if candidates else None
 
 
+def _latest_expanding_swing(
+    swings,
+    swing_type,
+    *,
+    frontier,
+    before_index=None,
+    after_index=None,
+):
+    """Return the latest local pivot that genuinely expands a regime frontier."""
+    candidates = [s for s in swings if s.swing_type == swing_type]
+    if before_index is not None:
+        candidates = [s for s in candidates if s.index < before_index]
+    if after_index is not None:
+        candidates = [s for s in candidates if s.index > after_index]
+    if frontier is not None:
+        if swing_type == "HIGH":
+            candidates = [s for s in candidates if s.price > frontier.price]
+        else:
+            candidates = [s for s in candidates if s.price < frontier.price]
+    return candidates[-1] if candidates else None
+
+
 def _serialise_swing(swing):
     if swing is None:
         return None
@@ -188,6 +210,8 @@ def analyze_structure(
     events = []
     external_low: SwingPoint | None = None
     external_high: SwingPoint | None = None
+    bullish_continuation_frontier: SwingPoint | None = None
+    bearish_continuation_frontier: SwingPoint | None = None
     last_event_index = -1
     distance_gate = StructureDistanceGate(timeframe=timeframe, point_size=point_size)
 
@@ -200,18 +224,20 @@ def analyze_structure(
         previous_close = closes[index - 1]
 
         if bias == "BULLISH":
-            high_reference = _latest_swing(
+            high_reference = _latest_expanding_swing(
                 available,
                 "HIGH",
+                frontier=bullish_continuation_frontier,
                 before_index=index,
                 after_index=last_event_index,
             )
             low_reference = external_low
         elif bias == "BEARISH":
             high_reference = external_high
-            low_reference = _latest_swing(
+            low_reference = _latest_expanding_swing(
                 available,
                 "LOW",
+                frontier=bearish_continuation_frontier,
                 before_index=index,
                 after_index=last_event_index,
             )
@@ -275,6 +301,8 @@ def analyze_structure(
             if previous_bias != "BULLISH":
                 if event_low is not None:
                     external_low = event_low
+                bearish_continuation_frontier = None
+            bullish_continuation_frontier = high_reference
             external_high = None
             bias = "BULLISH"
             direction_code = 2
@@ -321,6 +349,8 @@ def analyze_structure(
             if previous_bias != "BEARISH":
                 if event_high is not None:
                     external_high = event_high
+                bullish_continuation_frontier = None
+            bearish_continuation_frontier = low_reference
             external_low = None
             bias = "BEARISH"
             direction_code = 1
@@ -349,6 +379,12 @@ def analyze_structure(
         "range": float(abs(structure_high - structure_low)),
         "protected_high": _serialise_swing(external_high),
         "protected_low": _serialise_swing(external_low),
+        "bullish_continuation_frontier": _serialise_swing(
+            bullish_continuation_frontier
+        ),
+        "bearish_continuation_frontier": _serialise_swing(
+            bearish_continuation_frontier
+        ),
     }
 
     return {
@@ -371,6 +407,8 @@ def analyze_structure(
             "break_with_candle_body": True,
             "protected_external_structure": True,
             "continuation_bos_does_not_move_external_invalidation": True,
+            "continuation_frontier_uses_accepted_broken_swing": True,
+            "continuation_frontier_is_monotonic_within_regime": True,
             "internal_swings_are_not_reversal_triggers": True,
             "fib_values": list(FIB_LEVELS),
             "fvg": False,
