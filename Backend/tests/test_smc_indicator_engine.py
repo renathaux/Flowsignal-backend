@@ -87,6 +87,36 @@ class SmcIndicatorEngineTests(unittest.TestCase):
         with patch("indicators.smc.engine.detect_confirmed_swings", return_value=swings):
             return analyze_structure(frame, timeframe="15m", point_size=0.01)
 
+    def bearish_choch_with_local_reset_high_case(self):
+        closes = [100, 100, 100, 100, 100, 100, 111, 109, 107, 106,
+                  107, 109, 108, 111, 121, 114, 113, 112, 110, 94]
+        frame = self.external_frame(closes)
+        swings = [
+            self.swing(frame, "LOW", 2, 4, 95),
+            self.swing(frame, "HIGH", 3, 5, 110),
+            self.swing(frame, "HIGH", 8, 10, 108),
+            self.swing(frame, "LOW", 9, 11, 104),
+            self.swing(frame, "HIGH", 11, 13, 120),
+            self.swing(frame, "HIGH", 16, 18, 115),
+        ]
+        with patch("indicators.smc.engine.detect_confirmed_swings", return_value=swings):
+            return analyze_structure(frame, timeframe="15m", point_size=0.01)
+
+    def bullish_choch_with_local_reset_low_case(self):
+        closes = [120, 120, 120, 120, 120, 120, 109, 111, 113, 114,
+                  113, 111, 112, 109, 99, 106, 107, 108, 110, 126]
+        frame = self.external_frame(closes)
+        swings = [
+            self.swing(frame, "HIGH", 2, 4, 125),
+            self.swing(frame, "LOW", 3, 5, 110),
+            self.swing(frame, "LOW", 8, 10, 112),
+            self.swing(frame, "HIGH", 9, 11, 116),
+            self.swing(frame, "LOW", 11, 13, 100),
+            self.swing(frame, "LOW", 16, 18, 105),
+        ]
+        with patch("indicators.smc.engine.detect_confirmed_swings", return_value=swings):
+            return analyze_structure(frame, timeframe="15m", point_size=0.01)
+
     def test_swing_confirmation_does_not_look_ahead(self):
         data = self.frame([
             (10, 11, 9, 10),
@@ -288,6 +318,28 @@ class SmcIndicatorEngineTests(unittest.TestCase):
             bullish["current_structure"]["bearish_continuation_frontier"]["price"],
             100.0,
         )
+
+    def test_bearish_choch_reset_protects_outgoing_bullish_frontier(self):
+        result = self.bearish_choch_with_local_reset_high_case()
+        event = result["events"][-1]
+        self.assertEqual(
+            (event["event_type"], event["direction"], event["broken_level"]),
+            ("CHOCH", "BEARISH", 95.0),
+        )
+        self.assertEqual(event["event_invalidation_swing"]["price"], 115.0)
+        self.assertEqual(event["event_invalidation_swing"]["source"], "CURRENT_LEG")
+        self.assertEqual(result["current_structure"]["protected_high"]["price"], 120.0)
+
+    def test_bullish_choch_reset_protects_outgoing_bearish_frontier(self):
+        result = self.bullish_choch_with_local_reset_low_case()
+        event = result["events"][-1]
+        self.assertEqual(
+            (event["event_type"], event["direction"], event["broken_level"]),
+            ("CHOCH", "BULLISH", 125.0),
+        )
+        self.assertEqual(event["event_invalidation_swing"]["price"], 105.0)
+        self.assertEqual(event["event_invalidation_swing"]["source"], "CURRENT_LEG")
+        self.assertEqual(result["current_structure"]["protected_low"]["price"], 100.0)
 
     def test_every_event_owned_swing_was_confirmed_by_break(self):
         for result in (

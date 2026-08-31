@@ -263,6 +263,7 @@ def analyze_structure(
                 continue
             previous_bias = bias
             event_type = "CHOCH" if bias == "BEARISH" else "BOS"
+            outgoing_bearish_frontier = bearish_continuation_frontier
             current_leg_low = _latest_swing(
                 available,
                 "LOW",
@@ -299,8 +300,13 @@ def analyze_structure(
             # regime's origin low. Continuation BOS must not ratchet this level
             # upward to every small internal higher low.
             if previous_bias != "BULLISH":
-                if event_low is not None:
-                    external_low = event_low
+                protected_reset_low = (
+                    outgoing_bearish_frontier
+                    if previous_bias == "BEARISH"
+                    else event_low
+                )
+                if protected_reset_low is not None:
+                    external_low = protected_reset_low
                 bearish_continuation_frontier = None
             bullish_continuation_frontier = high_reference
             external_high = None
@@ -314,6 +320,7 @@ def analyze_structure(
                 continue
             previous_bias = bias
             event_type = "CHOCH" if bias == "BULLISH" else "BOS"
+            outgoing_bullish_frontier = bullish_continuation_frontier
             current_leg_high = _latest_swing(
                 available,
                 "HIGH",
@@ -347,8 +354,13 @@ def analyze_structure(
             })
 
             if previous_bias != "BEARISH":
-                if event_high is not None:
-                    external_high = event_high
+                protected_reset_high = (
+                    outgoing_bullish_frontier
+                    if previous_bias == "BULLISH"
+                    else event_high
+                )
+                if protected_reset_high is not None:
+                    external_high = protected_reset_high
                 bullish_continuation_frontier = None
             bearish_continuation_frontier = low_reference
             external_low = None
