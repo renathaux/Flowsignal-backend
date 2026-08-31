@@ -61,6 +61,32 @@ class SmcIndicatorEngineTests(unittest.TestCase):
         with patch("indicators.smc.engine.detect_confirmed_swings", return_value=swings):
             return analyze_structure(frame)
 
+    def bullish_continuation_frontier_case(self, expansion_level=112.0):
+        closes = [100, 100, 100, 100, 100, 100, 111, 109, 107, 106, 107, 109, 108, 111, expansion_level + 1]
+        frame = self.external_frame(closes)
+        swings = [
+            self.swing(frame, "LOW", 2, 4, 95),
+            self.swing(frame, "HIGH", 3, 5, 110),
+            self.swing(frame, "HIGH", 8, 10, 108),
+            self.swing(frame, "LOW", 9, 11, 104),
+            self.swing(frame, "HIGH", 11, 13, expansion_level),
+        ]
+        with patch("indicators.smc.engine.detect_confirmed_swings", return_value=swings):
+            return analyze_structure(frame, timeframe="15m", point_size=0.01)
+
+    def bearish_continuation_frontier_case(self, expansion_level=108.0):
+        closes = [120, 120, 120, 120, 120, 120, 109, 111, 113, 114, 113, 111, 112, 109, expansion_level - 1]
+        frame = self.external_frame(closes)
+        swings = [
+            self.swing(frame, "HIGH", 2, 4, 125),
+            self.swing(frame, "LOW", 3, 5, 110),
+            self.swing(frame, "LOW", 8, 10, 112),
+            self.swing(frame, "HIGH", 9, 11, 116),
+            self.swing(frame, "LOW", 11, 13, expansion_level),
+        ]
+        with patch("indicators.smc.engine.detect_confirmed_swings", return_value=swings):
+            return analyze_structure(frame, timeframe="15m", point_size=0.01)
+
     def test_swing_confirmation_does_not_look_ahead(self):
         data = self.frame([
             (10, 11, 9, 10),
@@ -208,6 +234,60 @@ class SmcIndicatorEngineTests(unittest.TestCase):
         self.assertEqual(first["event_invalidation_swing"]["price"], 120.0)
         self.assertEqual(continuation["event_invalidation_swing"]["price"], 115.0)
         self.assertEqual(bearish["current_structure"]["protected_high"]["price"], 120.0)
+
+    def test_bullish_continuation_frontier_ignores_lower_local_high(self):
+        result = self.bullish_continuation_frontier_case()
+        bullish_levels = [
+            event["broken_level"] for event in result["events"]
+            if event["direction"] == "BULLISH"
+        ]
+        self.assertEqual(bullish_levels, [110.0, 112.0])
+        self.assertNotIn(108.0, bullish_levels)
+        self.assertEqual(
+            result["current_structure"]["bullish_continuation_frontier"]["price"],
+            112.0,
+        )
+
+    def test_bearish_continuation_frontier_ignores_higher_local_low(self):
+        result = self.bearish_continuation_frontier_case()
+        bearish_levels = [
+            event["broken_level"] for event in result["events"]
+            if event["direction"] == "BEARISH"
+        ]
+        self.assertEqual(bearish_levels, [110.0, 108.0])
+        self.assertNotIn(112.0, bearish_levels)
+        self.assertEqual(
+            result["current_structure"]["bearish_continuation_frontier"]["price"],
+            108.0,
+        )
+
+    def test_rejected_sub_100_point_expansion_does_not_move_frontier(self):
+        result = self.bullish_continuation_frontier_case(expansion_level=110.99)
+        bullish_levels = [
+            event["broken_level"] for event in result["events"]
+            if event["direction"] == "BULLISH"
+        ]
+        self.assertEqual(bullish_levels, [110.0])
+        self.assertEqual(
+            result["current_structure"]["bullish_continuation_frontier"]["price"],
+            110.0,
+        )
+        self.assertEqual(result["config"]["last_accepted_structure_level"], 110.0)
+
+    def test_frontier_resets_only_after_existing_choch_qualification(self):
+        bullish = self.bullish_external_case(99)
+        bearish_choch = bullish["events"][-1]
+        self.assertEqual(
+            (bearish_choch["event_type"], bearish_choch["direction"], bearish_choch["broken_level"]),
+            ("CHOCH", "BEARISH", 100.0),
+        )
+        self.assertIsNone(
+            bullish["current_structure"]["bullish_continuation_frontier"]
+        )
+        self.assertEqual(
+            bullish["current_structure"]["bearish_continuation_frontier"]["price"],
+            100.0,
+        )
 
     def test_every_event_owned_swing_was_confirmed_by_break(self):
         for result in (
