@@ -4094,26 +4094,46 @@ def fetch_ctrader_historical_candles(symbol, timeframe, start_utc, end_utc):
 
         symbol_id = int(symbol_info["symbol_id"])
         digits = int(symbol_info["digits"])
-        expected_count = int((end - start).total_seconds() // (period_minutes * 60)) + 2
-        payload = {
-            "ctidTraderAccountId": account_id,
-            "symbolId": symbol_id,
-            "period": period,
-            "fromTimestamp": int(start.timestamp() * 1000),
-            "toTimestamp": int(end.timestamp() * 1000),
-            "count": min(max(expected_count, 1), 5000),
-        }
-        response = send_ctrader_request(
-            sock,
-            PAYLOAD_GET_TRENDBARS_REQ,
-            payload,
-            PAYLOAD_GET_TRENDBARS_RES,
-        )
-        trendbars = response.get("payload", {}).get("trendbar", [])
-        for trendbar in trendbars:
-            if isinstance(trendbar, dict):
-                trendbar["digits"] = digits
-        return normalize_ctrader_candles(trendbars, requested_symbol)
+        # cTrader can truncate a large trendbar response even when ``count`` is
+        # higher. Page the read-only history request so a two-month chart does
+        # not silently collapse back to only the most recent few days.
+        page_candles = 900
+        page_span = timedelta(minutes=period_minutes * page_candles)
+        cursor = start
+        frames = []
+        while cursor < end:
+            page_end = min(cursor + page_span, end)
+            expected_count = int(
+                (page_end - cursor).total_seconds() // (period_minutes * 60)
+            ) + 2
+            payload = {
+                "ctidTraderAccountId": account_id,
+                "symbolId": symbol_id,
+                "period": period,
+                "fromTimestamp": int(cursor.timestamp() * 1000),
+                "toTimestamp": int(page_end.timestamp() * 1000),
+                "count": min(max(expected_count, 1), page_candles + 2),
+            }
+            response = send_ctrader_request(
+                sock,
+                PAYLOAD_GET_TRENDBARS_REQ,
+                payload,
+                PAYLOAD_GET_TRENDBARS_RES,
+            )
+            trendbars = response.get("payload", {}).get("trendbar", [])
+            for trendbar in trendbars:
+                if isinstance(trendbar, dict):
+                    trendbar["digits"] = digits
+            frame = normalize_ctrader_candles(trendbars, requested_symbol)
+            if frame is not None and not frame.empty:
+                frames.append(frame)
+            cursor = page_end
+
+        if not frames:
+            return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        combined = pd.concat(frames)
+        combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+        return combined[(combined.index >= start) & (combined.index <= end)]
     finally:
         try:
             sock.close()
