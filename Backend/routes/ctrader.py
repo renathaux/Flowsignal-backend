@@ -32,6 +32,7 @@ _ALLOWED_SYMBOLS = {"EURUSD", "XAUUSD"}
 _TIMEFRAME_MINUTES = {"5m": 5, "15m": 15, "1h": 60}
 _HISTORICAL_EXPORT_TIMEFRAMES = {"15m": "15m", "15min": "15m", "m15": "15m"}
 _MAX_HISTORICAL_EXPORT_RANGE = timedelta(days=14)
+_MAX_CHART_HISTORY_RANGE = timedelta(days=62)
 
 
 def _require_candle_export_admin(request: Request):
@@ -278,6 +279,67 @@ def export_closed_ctrader_candles(
         "timeframe": normalized_timeframe,
         "start_utc": start_utc.isoformat().replace("+00:00", "Z"),
         "end_utc": end_utc.isoformat().replace("+00:00", "Z"),
+        "closed_only": True,
+        "read_only": True,
+        "count": len(candles),
+        "candles": candles,
+    }
+
+
+@router.get("/chart/candles-history")
+def chart_candle_history(
+    request: Request,
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    days: int = Query(default=62, ge=1, le=62),
+):
+    """Return closed native candles for the authenticated owner chart only.
+
+    This uses the historical market-data request and never reads or mutates the
+    strategy candle cache, order state, positions, or stops.
+    """
+    _require_candle_export_admin(request)
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_timeframe = str(timeframe or "").strip().lower()
+    if normalized_symbol not in _ALLOWED_SYMBOLS:
+        raise HTTPException(status_code=422, detail="symbol must be EURUSD or XAUUSD")
+    if normalized_timeframe not in _TIMEFRAME_MINUTES:
+        raise HTTPException(status_code=422, detail="timeframe must be 5m, 15m, or 1h")
+
+    end_utc = datetime.now(timezone.utc)
+    start_utc = end_utc - min(timedelta(days=days), _MAX_CHART_HISTORY_RANGE)
+    frame = fetch_ctrader_historical_candles(
+        normalized_symbol, normalized_timeframe, start_utc, end_utc
+    )
+    if frame is None or frame.empty:
+        raise HTTPException(status_code=503, detail="cTrader returned no historical candles")
+
+    data = frame.copy()
+    data.index = data.index.map(
+        lambda value: value if getattr(value, "tzinfo", None) else value.tz_localize("UTC")
+    )
+    data = data[~data.index.duplicated(keep="last")].sort_index()
+    period = timedelta(minutes=_TIMEFRAME_MINUTES[normalized_timeframe])
+    data = data[
+        (data.index >= start_utc)
+        & (data.index <= end_utc)
+        & (data.index.map(lambda value: value.to_pydatetime() + period <= end_utc))
+    ]
+    candles = [
+        {
+            "timestamp": timestamp.isoformat().replace("+00:00", "Z"),
+            "open": float(row["Open"]),
+            "high": float(row["High"]),
+            "low": float(row["Low"]),
+            "close": float(row["Close"]),
+            **({"volume": float(row["Volume"])} if "Volume" in row.index else {}),
+        }
+        for timestamp, row in data.iterrows()
+    ]
+    return {
+        "symbol": normalized_symbol,
+        "timeframe": normalized_timeframe,
+        "days": days,
         "closed_only": True,
         "read_only": True,
         "count": len(candles),

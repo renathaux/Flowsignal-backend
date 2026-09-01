@@ -203,3 +203,37 @@ def test_historical_connector_uses_only_trendbar_read_request():
     assert payload["toTimestamp"] == 1787443200000
     assert list(frame.columns) == ["Open", "High", "Low", "Close", "Volume"]
     assert socket.close.call_count == 1
+
+
+def test_chart_history_is_two_month_bounded_closed_and_read_only():
+    now = datetime.now(timezone.utc)
+    closed = now - timedelta(minutes=30)
+    forming = now - timedelta(minutes=5)
+    frame = pd.DataFrame({
+        "Open": [1.1, 1.2], "High": [1.2, 1.3],
+        "Low": [1.0, 1.1], "Close": [1.15, 1.25],
+    }, index=pd.to_datetime([closed, forming], utc=True))
+    with patch.object(ctrader, "_require_candle_export_admin"), patch.object(
+        ctrader, "fetch_ctrader_historical_candles", return_value=frame
+    ) as fetcher:
+        result = ctrader.chart_candle_history(
+            _request(), symbol="EURUSD", timeframe="15m", days=62
+        )
+    assert result["read_only"] is True
+    assert result["closed_only"] is True
+    assert result["days"] == 62
+    assert result["count"] == 1
+    start_arg, end_arg = fetcher.call_args.args[2:]
+    assert timedelta(days=61, hours=23) < end_arg - start_arg <= timedelta(days=62)
+
+
+def test_chart_history_rejects_invalid_context_without_broker_fetch():
+    fetcher = Mock()
+    with patch.object(ctrader, "_require_candle_export_admin"), patch.object(
+        ctrader, "fetch_ctrader_historical_candles", fetcher
+    ), pytest.raises(HTTPException) as exc:
+        ctrader.chart_candle_history(
+            _request(), symbol="BTCUSD", timeframe="15m", days=62
+        )
+    assert exc.value.status_code == 422
+    fetcher.assert_not_called()
