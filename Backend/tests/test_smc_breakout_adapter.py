@@ -12,7 +12,8 @@ class SmcBreakoutAdapterTests(unittest.TestCase):
         rows = [(1.10, 1.11, 1.09, 1.10) for _ in range(count)]
         return pd.DataFrame(rows, index=index, columns=["Open", "High", "Low", "Close"])
 
-    def structure(self, *, direction="BULLISH", event_type="BOS", break_index=19):
+    def structure(self, *, direction="BULLISH", event_type="BOS", break_index=19,
+                  structure_distance_points=200):
         return {
             "bias": direction,
             "current_structure": {
@@ -37,6 +38,7 @@ class SmcBreakoutAdapterTests(unittest.TestCase):
                 "break_index": break_index,
                 "previous_direction": 1 if direction == "BULLISH" else 2,
                 "new_direction": 2 if direction == "BULLISH" else 1,
+                "structure_distance_points": structure_distance_points,
                 "event_invalidation_swing": {
                     "type": "LOW" if direction == "BULLISH" else "HIGH",
                     "price": 1.1000 if direction == "BULLISH" else 1.1200,
@@ -81,6 +83,38 @@ class SmcBreakoutAdapterTests(unittest.TestCase):
         result = evaluate_15m_breakout(self.frame(), "EURUSD")
         self.assertEqual(result["side"], "WAIT")
         self.assertEqual(result["reason"], "WAIT_NO_FRESH_15M_SMC_BREAK")
+
+    @patch("strategies.smc_breakout_adapter.analyze_legacy_structure")
+    def test_sub_100_point_bos_is_visible_but_execution_blocked(self, analyze):
+        analyze.return_value = self.structure(
+            direction="BULLISH", event_type="BOS", break_index=19,
+            structure_distance_points=99,
+        )
+        result = evaluate_15m_breakout(self.frame(), "EURUSD")
+        self.assertEqual(result["side"], "WAIT")
+        self.assertTrue(result["execution_blocked"])
+        self.assertEqual(result["reason"], "WAIT_BOS_STRUCTURE_DISTANCE_UNDER_100_POINTS")
+        self.assertEqual(result["structure_distance_points"], 99.0)
+
+    @patch("strategies.smc_breakout_adapter.analyze_legacy_structure")
+    def test_sub_100_point_choch_is_not_blocked_by_bos_guard(self, analyze):
+        analyze.return_value = self.structure(
+            direction="BEARISH", event_type="CHOCH", break_index=19,
+            structure_distance_points=40,
+        )
+        result = evaluate_15m_breakout(self.frame(), "EURUSD")
+        self.assertEqual(result["side"], "SELL")
+        self.assertEqual(result["break_type"], "CHOCH")
+
+    @patch("strategies.smc_breakout_adapter.analyze_legacy_structure")
+    def test_exactly_100_point_bos_remains_eligible(self, analyze):
+        analyze.return_value = self.structure(
+            direction="BULLISH", event_type="BOS", break_index=19,
+            structure_distance_points=100,
+        )
+        result = evaluate_15m_breakout(self.frame(), "EURUSD")
+        self.assertEqual(result["side"], "BUY")
+        self.assertEqual(result["break_type"], "BOS")
 
     @patch("strategies.smc_breakout_adapter.analyze_xauusd_structure")
     @patch("strategies.smc_breakout_adapter.analyze_legacy_structure")

@@ -14,6 +14,7 @@ from indicators.smc.legacy_engine import analyze_structure as analyze_legacy_str
 from . import shared
 
 MAX_FRESH_15M_CANDLES = 4
+BOS_EXECUTION_MINIMUM_STRUCTURE_POINTS = 100
 
 
 def _point_size(symbol):
@@ -146,6 +147,22 @@ def evaluate_15m_breakout(data_15m, symbol, execution_settings=None):
         result["reason"] = "WAIT_NO_FRESH_15M_SMC_BREAK"
         return result
 
+    event_type = str(latest.get("event_type") or "BOS").upper()
+    try:
+        structure_distance_points = float(latest.get("structure_distance_points"))
+    except (TypeError, ValueError):
+        structure_distance_points = None
+    result["structure_distance_points"] = structure_distance_points
+    result["bos_execution_minimum_structure_points"] = BOS_EXECUTION_MINIMUM_STRUCTURE_POINTS
+    if (
+        event_type == "BOS"
+        and structure_distance_points is not None
+        and structure_distance_points < BOS_EXECUTION_MINIMUM_STRUCTURE_POINTS
+    ):
+        result["reason"] = "WAIT_BOS_STRUCTURE_DISTANCE_UNDER_100_POINTS"
+        result["execution_blocked"] = True
+        return result
+
     # Rebuild the same accepted SMC event at the setup candle. This prevents a
     # later candle (or a later internal working swing) from becoming the SL
     # reference for an already accepted setup.
@@ -181,7 +198,6 @@ def evaluate_15m_breakout(data_15m, symbol, execution_settings=None):
     break_close = float(latest["close"])
     break_time = _iso(latest.get("timestamp"))
     break_close_time = _close_time(latest.get("timestamp"))
-    event_type = str(latest.get("event_type") or "BOS").upper()
     broken_swing_type = "HIGH" if side == "BUY" else "LOW"
     broken_swing = {
         "type": broken_swing_type,
@@ -209,6 +225,7 @@ def evaluate_15m_breakout(data_15m, symbol, execution_settings=None):
         "smc_event_age_15m_candles": age,
         "accepted_setup_structure": accepted_setup_structure,
         "event_invalidation_swing": event_invalidation_swing,
+        "structure_distance_points": structure_distance_points,
     }
     result["breakouts"] = [candidate]
     result.update(candidate)
