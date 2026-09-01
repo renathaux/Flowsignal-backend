@@ -213,7 +213,7 @@ def test_chart_history_is_two_month_bounded_closed_and_read_only():
         "Open": [1.1, 1.2], "High": [1.2, 1.3],
         "Low": [1.0, 1.1], "Close": [1.15, 1.25],
     }, index=pd.to_datetime([closed, forming], utc=True))
-    with patch.object(ctrader, "_require_candle_export_admin"), patch.object(
+    with patch.object(
         ctrader, "fetch_ctrader_historical_candles", return_value=frame
     ) as fetcher:
         result = ctrader.chart_candle_history(
@@ -229,7 +229,7 @@ def test_chart_history_is_two_month_bounded_closed_and_read_only():
 
 def test_chart_history_rejects_invalid_context_without_broker_fetch():
     fetcher = Mock()
-    with patch.object(ctrader, "_require_candle_export_admin"), patch.object(
+    with patch.object(
         ctrader, "fetch_ctrader_historical_candles", fetcher
     ), pytest.raises(HTTPException) as exc:
         ctrader.chart_candle_history(

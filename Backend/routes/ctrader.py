@@ -293,12 +293,11 @@ def chart_candle_history(
     timeframe: str = Query(...),
     days: int = Query(default=62, ge=1, le=62),
 ):
-    """Return closed native candles for the authenticated owner chart only.
+    """Return bounded, closed native candles for the visual chart only.
 
     This uses the historical market-data request and never reads or mutates the
     strategy candle cache, order state, positions, or stops.
     """
-    _require_candle_export_admin(request)
     normalized_symbol = str(symbol or "").strip().upper()
     normalized_timeframe = str(timeframe or "").strip().lower()
     if normalized_symbol not in _ALLOWED_SYMBOLS:
