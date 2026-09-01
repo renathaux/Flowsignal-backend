@@ -1215,6 +1215,121 @@ def get_latest_consumed_signal_setup(symbol):
     return None
 
 
+def get_consumed_active_signal_setup(trade, side, setup_id):
+    """Return a setup consumed because an existing position blocked execution."""
+    if not isinstance(trade, dict) or not setup_id:
+        return None
+    normalized_side = str(side or "").upper()
+    for item in trade.get("consumed_signal_setups") or []:
+        if not isinstance(item, dict):
+            continue
+        if (
+            item.get("signal_setup_id") == setup_id
+            and str(item.get("side") or "").upper() == normalized_side
+        ):
+            return item
+    return None
+
+
+def find_consumed_signal_setup(symbol, side, setup_id):
+    """Find an exact consumed setup in either the active trade or trade history."""
+    normalized_symbol = normalize_symbol(symbol)
+    candidates = [LIVE_ACTIVE_ORDERS.get(normalized_symbol), *LIVE_TRADE_HISTORY]
+    for trade in candidates:
+        if not isinstance(trade, dict):
+            continue
+        if normalize_symbol(trade.get("symbol")) != normalized_symbol:
+            continue
+        consumed = get_consumed_active_signal_setup(trade, side, setup_id)
+        if consumed:
+            return consumed
+    return None
+
+
+def consume_signal_setup_for_active_trade(symbol, plan, side):
+    """Persist that a fresh setup was discarded while the symbol was occupied."""
+    normalized_symbol = normalize_symbol(symbol)
+    normalized_side = str(side or "").upper()
+    setup_id = get_signal_setup_id(plan, normalized_side)
+    active_trade = LIVE_ACTIVE_ORDERS.get(normalized_symbol)
+    if (
+        not setup_id
+        or normalized_side not in ["BUY", "SELL"]
+        or not isinstance(active_trade, dict)
+        or get_live_trade_status(active_trade) not in ACTIVE_TRADE_EXECUTION_STATUSES
+    ):
+        return None
+
+    existing = get_consumed_active_signal_setup(active_trade, normalized_side, setup_id)
+    if existing:
+        return existing
+
+    consumed = {
+        "signal_setup_id": setup_id,
+        "side": normalized_side,
+        "consumed_at": datetime.now(timezone.utc).isoformat(),
+        "reason": ACTIVE_TRADE_EXECUTION_BLOCK_REASON,
+    }
+    entries = [
+        item
+        for item in (active_trade.get("consumed_signal_setups") or [])
+        if isinstance(item, dict)
+    ]
+    entries.append(consumed)
+    active_trade["consumed_signal_setups"] = entries[-20:]
+    persist_live_trade_state(active_trade)
+    print("ACTIVE_TRADE_SIGNAL_CONSUMED =", {
+        "symbol": normalized_symbol,
+        "side": normalized_side,
+        "signal_setup_id": setup_id,
+        "active_trade_id": get_live_trade_identity(active_trade),
+        "reason": ACTIVE_TRADE_EXECUTION_BLOCK_REASON,
+    })
+    return consumed
+
+
+def reset_consumed_smc_plan(plan, side, *, active_trade=None):
+    """Clear a consumed setup without changing the position that blocked it."""
+    if not isinstance(plan, dict):
+        return
+    normalized_side = str(side or "").upper()
+    plan["consumed_market_signal"] = normalized_side
+    plan["signal"] = "WAIT"
+    plan["final_signal"] = "WAIT"
+    plan["signal_display_state"] = "WAIT"
+    plan["display_signal"] = "WAIT"
+    plan["history_signal"] = "WAIT"
+    plan["strategy_decision"] = "WAIT"
+    plan["fresh_entry_available"] = False
+    plan["strategy_setup_complete"] = False
+    plan["smc_progress"] = 0
+    plan["smc_status"] = "WAIT"
+    plan["next_trigger"] = "Fresh 15m BOS/CHoCH"
+    plan["plan_bias"] = "WAIT"
+    plan["plan_type"] = "WAIT FOR NEW SIGNAL"
+    plan["entry_timing"] = "WAIT FOR FRESH SETUP"
+    plan["blocked_by"] = "consumed_during_active_trade"
+    plan["blocked_reason"] = (
+        f"The fresh {normalized_side} setup passed while a trade was already running "
+        "and was discarded. Waiting for a new 15m setup."
+    )
+    plan["blocker_rule_name"] = "fresh_setup_consumed_during_active_trade"
+    plan["trade_setup_consumed"] = True
+    plan["execution_allowed"] = False
+    plan["execution_status"] = "NOT_APPLICABLE"
+    plan["execution_block_reason"] = None
+    plan["signal_text"] = "WAIT ⚪ (waiting for a fresh setup)"
+    plan.pop("executed_trade_setup_snapshot", None)
+    plan.pop("smc_plan_state_source", None)
+    plan.pop("current_setup_state", None)
+    if isinstance(active_trade, dict):
+        plan["trade_already_running"] = True
+        plan["active_trade_side"] = str(
+            active_trade.get("side") or active_trade.get("action") or ""
+        ).upper() or None
+        plan["active_trade_status"] = get_live_trade_status(active_trade)
+
+
 def first_snapshot_value(*values):
     for value in values:
         if value not in [None, "", "--"]:
@@ -1563,8 +1678,35 @@ def apply_trade_signal_lifecycle(panel_data):
             ).upper()
 
             if trade_status in ACTIVE_TRADE_EXECUTION_STATUSES:
-                if not active_trade.get("signal_setup_id") and current_setup_id:
-                    active_trade["signal_setup_id"] = current_setup_id
+                consumed_while_active = get_consumed_active_signal_setup(
+                    active_trade,
+                    current_signal,
+                    current_setup_id,
+                )
+                setup_opened_active_trade = bool(
+                    current_setup_id
+                    and active_trade.get("signal_setup_id") == current_setup_id
+                )
+                if consumed_while_active or setup_opened_active_trade:
+                    reset_consumed_smc_plan(
+                        plan,
+                        current_signal,
+                        active_trade=active_trade,
+                    )
+                    sync_plan_diagnostics(plan)
+                    print("ACTIVE_TRADE_SIGNAL_RESET_DEBUG =", {
+                        "symbol": symbol,
+                        "side": current_signal,
+                        "signal_setup_id": current_setup_id,
+                        "display_signal": "WAIT",
+                        "active_trade_status": trade_status,
+                        "reason": (
+                            "setup opened the active trade"
+                            if setup_opened_active_trade
+                            else "fresh setup was consumed while trade remained active"
+                        ),
+                    })
+                    continue
 
                 display_signal = apply_active_trade_display(
                     plan,
@@ -1586,7 +1728,10 @@ def apply_trade_signal_lifecycle(panel_data):
                 })
                 continue
 
-        consumed = get_latest_consumed_signal_setup(symbol)
+        consumed = (
+            find_consumed_signal_setup(symbol, current_signal, current_setup_id)
+            or get_latest_consumed_signal_setup(symbol)
+        )
         if (
             current_signal not in ["BUY", "SELL"]
             or not current_setup_id
@@ -1596,19 +1741,9 @@ def apply_trade_signal_lifecycle(panel_data):
         ):
             continue
 
-        plan["consumed_market_signal"] = current_signal
-        plan["signal"] = "WAIT"
-        plan["final_signal"] = "WAIT"
-        plan["signal_display_state"] = "WAIT"
-        plan["fresh_entry_available"] = False
+        reset_consumed_smc_plan(plan, current_signal)
         plan["trade_already_running"] = False
-        plan["signal_text"] = (
-            f"WAIT ⚪ ({current_signal} trade closed; waiting for a fresh setup)"
-        )
-        plan["plan_bias"] = "WAIT"
-        plan["plan_type"] = "WAIT FOR NEW SIGNAL"
-        plan["entry_timing"] = "WAIT FOR FRESH SETUP"
-        plan["strategy_setup_complete"] = False
+        plan["signal_text"] = f"WAIT ⚪ ({current_signal} setup consumed; waiting for a fresh setup)"
         plan["blocked_by"] = "consumed_trade_setup"
         plan["blocked_reason"] = (
             f"The {current_signal} setup was already used. "
@@ -7345,6 +7480,17 @@ def run_ctrader_auto_trade_checks(panel_data):
                 reason=ACTIVE_TRADE_EXECUTION_BLOCK_REASON,
                 details=block_details,
             )
+            consumed_setup = consume_signal_setup_for_active_trade(
+                symbol,
+                plan,
+                signal,
+            )
+            if consumed_setup:
+                reset_consumed_smc_plan(
+                    plan,
+                    signal,
+                    active_trade=LIVE_ACTIVE_ORDERS.get(symbol),
+                )
             log_auto_trade_blocked_reason(
                 symbol=symbol,
                 signal=signal,

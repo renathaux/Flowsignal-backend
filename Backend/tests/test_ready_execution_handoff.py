@@ -107,10 +107,12 @@ class ReadyExecutionHandoffTests(unittest.TestCase):
     def setUp(self):
         self.auto_enabled = api.LIVE_AUTO_TRADE_ENABLED.get("enabled")
         self.account_state = copy.deepcopy(api.LIVE_ACCOUNT_STATE)
+        self.trade_history = copy.deepcopy(api.LIVE_TRADE_HISTORY)
         api.LIVE_AUTO_TRADE_ENABLED["enabled"] = True
         api.LIVE_ACCOUNT_STATE.update({"connected": True, "execution_ready": True})
         api.LIVE_ORDER_IN_FLIGHT.clear()
         api.LIVE_ACTIVE_ORDERS.clear()
+        api.LIVE_TRADE_HISTORY.clear()
 
     def tearDown(self):
         api.LIVE_AUTO_TRADE_ENABLED["enabled"] = self.auto_enabled
@@ -118,6 +120,7 @@ class ReadyExecutionHandoffTests(unittest.TestCase):
         api.LIVE_ACCOUNT_STATE.update(self.account_state)
         api.LIVE_ORDER_IN_FLIGHT.clear()
         api.LIVE_ACTIVE_ORDERS.clear()
+        api.LIVE_TRADE_HISTORY[:] = self.trade_history
 
     @staticmethod
     def panel(plan=None):
@@ -257,6 +260,7 @@ class ReadyExecutionHandoffTests(unittest.TestCase):
                 "side": "BUY",
                 "status": "RUNNING",
                 "broker_position_id": "position-123",
+                "signal_setup_id": "original-position-setup",
             }
             plan = ready_plan("EURUSD", signal)
             panel = {
@@ -293,6 +297,103 @@ class ReadyExecutionHandoffTests(unittest.TestCase):
                 results[0]["execution_block_reason"],
                 "ACTIVE_TRADE_ALREADY_RUNNING",
             )
+            self.assertEqual(panel["EURUSD"]["signal"], "WAIT")
+            self.assertEqual(panel["EURUSD"]["smc_progress"], 0)
+            self.assertEqual(panel["EURUSD"]["smc_status"], "WAIT")
+            self.assertTrue(panel["EURUSD"]["trade_setup_consumed"])
+            consumed = api.LIVE_ACTIVE_ORDERS["EURUSD"]["consumed_signal_setups"]
+            self.assertEqual(len(consumed), 1)
+            self.assertEqual(consumed[0]["side"], signal)
+            self.assertEqual(consumed[0]["signal_setup_id"], plan["signal_setup_id"])
+
+            refreshed_plan = ready_plan("EURUSD", signal)
+            refreshed_panel = {
+                "EURUSD": refreshed_plan,
+                "XAUUSD": {"symbol": "XAUUSD", "signal": "WAIT"},
+                "candles": {},
+            }
+            api.apply_trade_signal_lifecycle(refreshed_panel)
+            self.assertEqual(refreshed_panel["EURUSD"]["signal"], "WAIT")
+            self.assertEqual(refreshed_panel["EURUSD"]["smc_progress"], 0)
+            self.assertTrue(refreshed_panel["EURUSD"]["trade_already_running"])
+
+    def test_setup_that_opened_running_trade_resets_plan_immediately(self):
+        plan = ready_plan("EURUSD", "BUY")
+        plan["executed_trade_setup_snapshot"] = {
+            "symbol": "EURUSD",
+            "direction": "BUY",
+            "broker_position_id": "position-123",
+            "status": "RUNNING",
+        }
+        plan["smc_plan_state_source"] = "executed_trade_setup_snapshot"
+        api.LIVE_ACTIVE_ORDERS["EURUSD"] = {
+            "symbol": "EURUSD",
+            "side": "BUY",
+            "status": "RUNNING",
+            "broker_position_id": "position-123",
+            "signal_setup_id": plan["signal_setup_id"],
+        }
+        panel = {
+            "EURUSD": plan,
+            "XAUUSD": {"symbol": "XAUUSD", "signal": "WAIT"},
+            "candles": {},
+        }
+
+        api.apply_trade_signal_lifecycle(panel)
+
+        self.assertEqual(panel["EURUSD"]["signal"], "WAIT")
+        self.assertEqual(panel["EURUSD"]["smc_progress"], 0)
+        self.assertEqual(panel["EURUSD"]["smc_status"], "WAIT")
+        self.assertTrue(panel["EURUSD"]["trade_already_running"])
+        self.assertTrue(panel["EURUSD"]["trade_setup_consumed"])
+        self.assertNotIn("executed_trade_setup_snapshot", panel["EURUSD"])
+        self.assertNotIn("smc_plan_state_source", panel["EURUSD"])
+
+    def test_active_trade_consumption_is_idempotent_and_bounded(self):
+        api.LIVE_ACTIVE_ORDERS["EURUSD"] = {
+            "symbol": "EURUSD",
+            "side": "BUY",
+            "status": "RUNNING",
+            "broker_position_id": "position-123",
+        }
+        plan = ready_plan("EURUSD", "SELL")
+
+        first = api.consume_signal_setup_for_active_trade("EURUSD", plan, "SELL")
+        second = api.consume_signal_setup_for_active_trade("EURUSD", plan, "SELL")
+
+        self.assertEqual(first, second)
+        self.assertEqual(
+            len(api.LIVE_ACTIVE_ORDERS["EURUSD"]["consumed_signal_setups"]),
+            1,
+        )
+
+    def test_setup_consumed_while_active_stays_reset_after_trade_closes(self):
+        active_trade = {
+            "symbol": "EURUSD",
+            "side": "BUY",
+            "status": "RUNNING",
+            "broker_position_id": "position-123",
+        }
+        api.LIVE_ACTIVE_ORDERS["EURUSD"] = active_trade
+        plan = ready_plan("EURUSD", "SELL")
+        api.consume_signal_setup_for_active_trade("EURUSD", plan, "SELL")
+
+        closed_trade = copy.deepcopy(api.LIVE_ACTIVE_ORDERS["EURUSD"])
+        closed_trade.update({"status": "CLOSED", "result": "WIN"})
+        api.LIVE_ACTIVE_ORDERS.clear()
+        api.LIVE_TRADE_HISTORY.insert(0, closed_trade)
+
+        refreshed_panel = {
+            "EURUSD": ready_plan("EURUSD", "SELL"),
+            "XAUUSD": {"symbol": "XAUUSD", "signal": "WAIT"},
+            "candles": {},
+        }
+        api.apply_trade_signal_lifecycle(refreshed_panel)
+
+        self.assertEqual(refreshed_panel["EURUSD"]["signal"], "WAIT")
+        self.assertEqual(refreshed_panel["EURUSD"]["smc_progress"], 0)
+        self.assertFalse(refreshed_panel["EURUSD"]["trade_already_running"])
+        self.assertTrue(refreshed_panel["EURUSD"]["trade_setup_consumed"])
 
     def test_active_trade_with_no_valid_setup_remains_normal_wait(self):
         api.LIVE_ACTIVE_ORDERS["EURUSD"] = {
