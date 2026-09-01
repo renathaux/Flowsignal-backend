@@ -237,6 +237,8 @@ def analyze_structure(
                     "break_index": int(index),
                     "previous_direction": int(structure_direction),
                     "new_direction": 1,
+                    "previous_structure_event_level": distance_gate.previous_level,
+                    "structure_distance_points": distance_gate.last_distance_points,
                     "event_invalidation_swing": _legacy_event_invalidation_swing(
                         "HIGH",
                         highs[event_high_start],
@@ -266,6 +268,8 @@ def analyze_structure(
                     "break_index": int(index),
                     "previous_direction": int(structure_direction),
                     "new_direction": 2,
+                    "previous_structure_event_level": distance_gate.previous_level,
+                    "structure_distance_points": distance_gate.last_distance_points,
                     "event_invalidation_swing": _legacy_event_invalidation_swing(
                         "LOW",
                         lows[event_low_start],

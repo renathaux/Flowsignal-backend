@@ -290,6 +290,8 @@ def analyze_structure(
                 "previous_direction": 2 if previous_bias == "BULLISH" else 1 if previous_bias == "BEARISH" else 0,
                 "new_direction": 2,
                 "importance": "EXTERNAL",
+                "previous_structure_event_level": distance_gate.previous_level,
+                "structure_distance_points": distance_gate.last_distance_points,
                 "event_invalidation_swing": _serialise_event_invalidation_swing(
                     event_low,
                     event_low_source,
@@ -347,6 +349,8 @@ def analyze_structure(
                 "previous_direction": 2 if previous_bias == "BULLISH" else 1 if previous_bias == "BEARISH" else 0,
                 "new_direction": 1,
                 "importance": "EXTERNAL",
+                "previous_structure_event_level": distance_gate.previous_level,
+                "structure_distance_points": distance_gate.last_distance_points,
                 "event_invalidation_swing": _serialise_event_invalidation_swing(
                     event_high,
                     event_high_source,
