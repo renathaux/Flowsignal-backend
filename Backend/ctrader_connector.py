@@ -5597,9 +5597,10 @@ def send_ctrader_request(sock, payload_type, payload, expected_payload_type):
         if incoming_type == expected_payload_type:
             return data
 
-def websocket_send_text(sock, text):
-    payload = text.encode("utf-8")
-    header = bytearray([0x81])
+def websocket_send_frame(sock, opcode, payload=b""):
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8")
+    header = bytearray([0x80 | (int(opcode) & 0x0F)])
     length = len(payload)
 
     if length < 126:
@@ -5619,32 +5620,46 @@ def websocket_send_text(sock, text):
 
     sock.sendall(bytes(header) + mask + masked_payload)
 
+
+def websocket_send_text(sock, text):
+    websocket_send_frame(sock, 0x1, text)
+
+
 def websocket_recv_text(sock):
-    first = recv_exact(sock, 2)
-    opcode = first[0] & 0x0F
-    masked = bool(first[1] & 0x80)
-    length = first[1] & 0x7F
+    while True:
+        first = recv_exact(sock, 2)
+        opcode = first[0] & 0x0F
+        masked = bool(first[1] & 0x80)
+        length = first[1] & 0x7F
 
-    if length == 126:
-        length = struct.unpack("!H", recv_exact(sock, 2))[0]
-    elif length == 127:
-        length = struct.unpack("!Q", recv_exact(sock, 8))[0]
+        if length == 126:
+            length = struct.unpack("!H", recv_exact(sock, 2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", recv_exact(sock, 8))[0]
 
-    mask = recv_exact(sock, 4) if masked else None
-    payload = recv_exact(sock, length) if length else b""
+        mask = recv_exact(sock, 4) if masked else None
+        payload = recv_exact(sock, length) if length else b""
 
-    if mask:
-        payload = bytes(
-            byte ^ mask[index % 4]
-            for index, byte in enumerate(payload)
-        )
+        if mask:
+            payload = bytes(
+                byte ^ mask[index % 4]
+                for index, byte in enumerate(payload)
+            )
 
-    if opcode == 0x8:
-        raise RuntimeError("cTrader WebSocket closed")
-    if opcode != 0x1:
-        return ""
+        if opcode == 0x8:
+            raise RuntimeError("cTrader WebSocket closed")
+        if opcode == 0x9:
+            # cTrader periodically pings persistent spot subscriptions. Reply
+            # with the identical payload or the server closes an otherwise
+            # healthy authenticated stream.
+            websocket_send_frame(sock, 0xA, payload)
+            continue
+        if opcode == 0xA:
+            continue
+        if opcode != 0x1:
+            return ""
 
-    return payload.decode("utf-8")
+        return payload.decode("utf-8")
 
 def recv_exact(sock, length):
     data = b""
