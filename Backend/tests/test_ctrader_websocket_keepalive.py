@@ -56,3 +56,17 @@ def test_unsolicited_pong_is_ignored_before_text_is_returned():
 
     assert ctrader_connector.websocket_recv_text(socket) == "ready"
     assert socket.sent == []
+
+
+def test_application_heartbeat_uses_ctrader_payload_type_51():
+    socket = FakeSocket()
+
+    ctrader_connector.send_ctrader_heartbeat(socket)
+
+    assert len(socket.sent) == 1
+    opcode, payload = decode_client_frame(socket.sent[0])
+    message = json.loads(payload.decode("utf-8"))
+    assert opcode == 0x1
+    assert message["payloadType"] == 51
+    assert message["payload"] == {}
+    assert message["clientMsgId"]
