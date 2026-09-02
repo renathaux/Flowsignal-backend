@@ -222,6 +222,9 @@ LIVE_PRICE_THREAD = None
 LIVE_PRICE_THREAD_STARTED = False
 LIVE_PRICE_LAST_ERROR = None
 LIVE_PRICE_STALE_SECONDS = 10
+CTRADER_HEARTBEAT_PAYLOAD_TYPE = 51
+CTRADER_HEARTBEAT_INTERVAL_SECONDS = 8
+CTRADER_STREAM_READ_TIMEOUT_SECONDS = 2
 LIVE_TICK_CANDLE_STALE_SECONDS = 90
 
 CTRADER_JSON_ENDPOINTS = {
@@ -1971,9 +1974,21 @@ def ctrader_live_price_stream_loop():
                 print("CTRADER LIVE PRICE SUBSCRIBED:", symbol)
 
             LIVE_PRICE_LAST_ERROR = None
+            sock.settimeout(CTRADER_STREAM_READ_TIMEOUT_SECONDS)
+            last_heartbeat_sent = time.monotonic()
 
             while True:
-                incoming = websocket_recv_text(sock)
+                if (
+                    time.monotonic() - last_heartbeat_sent
+                    >= CTRADER_HEARTBEAT_INTERVAL_SECONDS
+                ):
+                    send_ctrader_heartbeat(sock)
+                    last_heartbeat_sent = time.monotonic()
+
+                try:
+                    incoming = websocket_recv_text(sock)
+                except (socket.timeout, TimeoutError):
+                    continue
 
                 if not incoming:
                     continue
@@ -5623,6 +5638,14 @@ def websocket_send_frame(sock, opcode, payload=b""):
 
 def websocket_send_text(sock, text):
     websocket_send_frame(sock, 0x1, text)
+
+
+def send_ctrader_heartbeat(sock):
+    websocket_send_text(sock, json.dumps({
+        "clientMsgId": str(uuid.uuid4()),
+        "payloadType": CTRADER_HEARTBEAT_PAYLOAD_TYPE,
+        "payload": {},
+    }))
 
 
 def websocket_recv_text(sock):
