@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
+
+from db import engine as database_engine
 
 # These are owner/global trading-state endpoints. Customer Forex remains
 # signal/read-only. The existing owner login token is preserved as authority.
@@ -29,6 +34,7 @@ PREFIX_PATHS = (
     "/settings/",
     "/strategy/settings",
 )
+OWNER_SESSION_TTL = timedelta(hours=24)
 
 
 def _sensitive(path: str, method: str) -> bool:
@@ -46,12 +52,94 @@ def _bearer(headers) -> str:
     return raw.split(" ", 1)[1].strip()
 
 
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+
+
+def _persist_owner_session(token: str) -> None:
+    """Persist only a token hash, never the raw owner bearer token."""
+    if not token:
+        return
+    now = datetime.now(timezone.utc)
+    expires_at = now + OWNER_SESSION_TTL
+    try:
+        with database_engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO flowsignal_owner_sessions
+                        (token_hash, created_at, last_seen_at, expires_at)
+                    VALUES
+                        (:token_hash, :now, :now, :expires_at)
+                    ON CONFLICT (token_hash) DO UPDATE SET
+                        last_seen_at = EXCLUDED.last_seen_at,
+                        expires_at = EXCLUDED.expires_at
+                    """
+                ),
+                {
+                    "token_hash": _token_hash(token),
+                    "now": now,
+                    "expires_at": expires_at,
+                },
+            )
+            connection.execute(
+                text("DELETE FROM flowsignal_owner_sessions WHERE expires_at <= :now"),
+                {"now": now},
+            )
+    except Exception as exc:
+        # Persistence is a deploy-survival enhancement. A currently valid
+        # in-memory owner session must not be blocked if Neon is temporarily
+        # unavailable.
+        print("OWNER_SESSION_PERSIST_WARNING =", type(exc).__name__)
+
+
+def _persisted_owner_session_valid(token: str) -> bool:
+    if not token:
+        return False
+    now = datetime.now(timezone.utc)
+    try:
+        with database_engine.begin() as connection:
+            row = connection.execute(
+                text(
+                    """
+                    SELECT token_hash
+                    FROM flowsignal_owner_sessions
+                    WHERE token_hash = :token_hash
+                      AND expires_at > :now
+                    LIMIT 1
+                    """
+                ),
+                {"token_hash": _token_hash(token), "now": now},
+            ).first()
+            if row is None:
+                return False
+            connection.execute(
+                text(
+                    """
+                    UPDATE flowsignal_owner_sessions
+                    SET last_seen_at = :now,
+                        expires_at = :expires_at
+                    WHERE token_hash = :token_hash
+                    """
+                ),
+                {
+                    "token_hash": _token_hash(token),
+                    "now": now,
+                    "expires_at": now + OWNER_SESSION_TTL,
+                },
+            )
+            return True
+    except Exception as exc:
+        print("OWNER_SESSION_LOOKUP_WARNING =", type(exc).__name__)
+        return False
+
+
 def install_owner_forex_mutation_guard(app, legacy_sessions: dict) -> dict:
     """Wrap sensitive legacy routes after route registration.
 
-    This intentionally leaves read-only signal/panel routes open to normal
-    FlowSignal users while requiring the existing backend legacy admin session
-    for any owner/global Forex mutation.
+    Customer Forex stays read-only. Owner mutations require an admin session.
+    A successful owner mutation seeds a hashed 24-hour session record in Neon,
+    so a Render restart/deploy no longer invalidates the browser's owner token.
     """
     installed = 0
     for route in list(getattr(app, "routes", [])):
@@ -68,13 +156,62 @@ def install_owner_forex_mutation_guard(app, legacy_sessions: dict) -> dict:
             method = str(scope.get("method") or "GET").upper()
             request_path = str(scope.get("path") or "")
             if _sensitive(request_path, method):
-                headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+                headers = {
+                    k.decode("latin-1").lower(): v.decode("latin-1")
+                    for k, v in scope.get("headers", [])
+                }
                 token = _bearer(headers)
-                session = legacy_sessions.get(token) if token else None
-                if not isinstance(session, dict) or str(session.get("role") or "").lower() != "admin":
-                    response = JSONResponse({"ok": False, "detail": "ADMIN_FOREX_MUTATION_REQUIRED"}, status_code=403)
+                if not token:
+                    response = JSONResponse(
+                        {
+                            "ok": False,
+                            "reason": "OWNER_SESSION_REQUIRED",
+                            "detail": "OWNER_SESSION_REQUIRED",
+                        },
+                        status_code=401,
+                    )
                     await response(scope, receive, send)
                     return
+
+                session = legacy_sessions.get(token)
+                role = (
+                    str(session.get("role") or "").lower()
+                    if isinstance(session, dict)
+                    else ""
+                )
+
+                if role == "admin":
+                    _persist_owner_session(token)
+                elif _persisted_owner_session_valid(token):
+                    # Rehydrate the legacy in-memory map after a Render deploy.
+                    legacy_sessions[token] = {
+                        "email": "persisted-owner-session",
+                        "role": "admin",
+                        "auth_method": "persisted_owner_session",
+                    }
+                elif isinstance(session, dict):
+                    response = JSONResponse(
+                        {
+                            "ok": False,
+                            "reason": "ADMIN_FOREX_MUTATION_REQUIRED",
+                            "detail": "ADMIN_FOREX_MUTATION_REQUIRED",
+                        },
+                        status_code=403,
+                    )
+                    await response(scope, receive, send)
+                    return
+                else:
+                    response = JSONResponse(
+                        {
+                            "ok": False,
+                            "reason": "OWNER_SESSION_EXPIRED",
+                            "detail": "OWNER_SESSION_EXPIRED",
+                        },
+                        status_code=401,
+                    )
+                    await response(scope, receive, send)
+                    return
+
             await _original(scope, receive, send)
 
         route.app = guarded
