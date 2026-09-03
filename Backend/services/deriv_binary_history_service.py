@@ -6,7 +6,8 @@ from sqlalchemy import func, select
 from sqlalchemy.engine import Engine
 
 from db import engine as default_engine
-from services.deriv_binary_execution_service import account_settings, binary_executions, _engine as execution_engine
+from services.deriv_binary_execution_service import binary_executions
+from services.deriv_binary_read_service import account_settings
 
 
 PUBLIC_HISTORY_FIELDS = (
@@ -32,7 +33,7 @@ def execution_history(
     offset: int = 0,
     engine: Engine | None = None,
 ) -> dict[str, Any]:
-    chosen = execution_engine(engine or default_engine)
+    chosen = engine or default_engine
     account_settings(user_id, deriv_account_id, engine=chosen)
     bounded_limit = max(1, min(int(limit), 100))
     bounded_offset = max(0, int(offset))
