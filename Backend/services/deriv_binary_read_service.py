@@ -104,8 +104,8 @@ def account_settings(
 def latest_relay_signal(*, engine: Engine | None = None) -> dict[str, Any]:
     chosen = _chosen_engine(engine)
     # The old path downloaded the complete relay inbox, including payload_json,
-    # then filtered in Python. Filter on immutable V5 identity in SQL and inspect
-    # only a bounded set of tiny scalar rows.
+    # then filtered in Python. Keep the same newest-valid-signal semantics while
+    # filtering immutable identity in SQL and transferring only tiny scalars.
     with chosen.begin() as connection:
         rows = connection.execute(
             select(*_RELAY_READ_COLUMNS)
@@ -117,7 +117,6 @@ def latest_relay_signal(*, engine: Engine | None = None) -> dict[str, Any]:
                 & (relay_signals.c.signal_id.like(f"{STRATEGY_VERSION}:{SYMBOL}:%"))
             )
             .order_by(relay_signals.c.decision_timestamp.desc())
-            .limit(100)
         ).mappings().all()
     row = next(
         (candidate for candidate in rows if genuine_signal_validation(candidate)["valid"]),
