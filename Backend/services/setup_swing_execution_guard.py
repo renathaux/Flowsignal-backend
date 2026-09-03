@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 
+from indicators.smc import detect_confirmed_swings
+
 
 SWING_CHANGED_REASON = "WAIT_SETUP_SWING_CHANGED_BEFORE_EXECUTION"
 
@@ -29,13 +31,11 @@ def validate_fresh_setup_swing_identity(
 ):
     """Revalidate the immutable setup pivot without re-qualifying its old leg.
 
-    The strict strategy already qualified the swing when it created the signal.
-    Re-running ``detect_valid_swings`` on a shorter, freshly fetched window can
-    change the qualification of an older pivot when the opposite anchor that
-    originally qualified it has fallen outside that window.  For the final
-    execution gate we only need to prove that the exact pivot identity still
-    exists in the latest closed broker candles; EMA/consolidation and the setup
-    fingerprint are validated separately by the existing execution gates.
+    New setups are created by the authoritative backend SMC indicator, so the
+    same confirmed-pivot detector is checked first.  The legacy raw-pivot check
+    remains as a compatibility fallback for setups created before the authority
+    switch.  EMA/consolidation and the setup fingerprint are validated by the
+    existing execution gates separately.
     """
     identity = setup_identity if isinstance(setup_identity, dict) else {}
     normalized_symbol = strict_trader_module.shared.normalize_symbol(symbol)
@@ -47,7 +47,7 @@ def validate_fresh_setup_swing_identity(
         expected_price = None
 
     details = {
-        "fresh_setup_swing_match_method": "raw_pivot_identity",
+        "fresh_setup_swing_match_method": "smc_indicator_then_legacy_raw",
         "fresh_setup_swing_matched": False,
         "fresh_setup_expected_swing": {
             "type": expected_type or None,
@@ -72,11 +72,36 @@ def validate_fresh_setup_swing_identity(
             "details": details,
         }
 
+    tolerance = strict_trader_module.point_size(normalized_symbol) + 1e-12
+    indicator_swings = detect_confirmed_swings(
+        closed_15m.copy(),
+        left_bars=2,
+        right_bars=2,
+    )
+    details["fresh_indicator_swing_count"] = len(indicator_swings)
+    for swing in indicator_swings:
+        swing_time = _parse_timestamp(swing.timestamp)
+        if (
+            str(swing.swing_type).upper() == expected_type
+            and swing_time == expected_time
+            and abs(float(swing.price) - expected_price) <= tolerance
+        ):
+            details.update({
+                "fresh_setup_swing_match_method": "smc_indicator_confirmed_pivot_identity",
+                "fresh_setup_swing_matched": True,
+                "fresh_setup_matched_swing": {
+                    "type": swing.swing_type,
+                    "time": swing.timestamp,
+                    "price": float(swing.price),
+                    "confirmed_time": swing.confirmed_timestamp,
+                },
+            })
+            return {"ok": True, "reason": None, "details": details}
+
     raw_swings = strict_trader_module.detect_raw_swings(
         closed_15m.copy(),
         normalized_symbol,
     )
-    tolerance = strict_trader_module.point_size(normalized_symbol) + 1e-12
     matching_swing = None
 
     for swing in raw_swings:
@@ -97,13 +122,16 @@ def validate_fresh_setup_swing_identity(
     details["fresh_raw_swing_count"] = len(raw_swings)
     details["fresh_setup_swing_matched"] = matching_swing is not None
     if matching_swing is not None:
-        details["fresh_setup_matched_swing"] = {
-            "type": matching_swing.get("type"),
-            "time": matching_swing.get("time"),
-            "price": matching_swing.get("price"),
-            "fresh_window_valid_flag": matching_swing.get("valid"),
-            "fresh_window_valid_reason": matching_swing.get("valid_reason"),
-        }
+        details.update({
+            "fresh_setup_swing_match_method": "legacy_raw_pivot_identity",
+            "fresh_setup_matched_swing": {
+                "type": matching_swing.get("type"),
+                "time": matching_swing.get("time"),
+                "price": matching_swing.get("price"),
+                "fresh_window_valid_flag": matching_swing.get("valid"),
+                "fresh_window_valid_reason": matching_swing.get("valid_reason"),
+            },
+        })
 
     return {
         "ok": matching_swing is not None,
