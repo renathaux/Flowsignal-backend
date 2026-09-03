@@ -1,6 +1,6 @@
 """Use the backend SMC indicator as the single BOS/CHoCH authority.
 
-The visual switch in the browser must never control this module.  The strategy
+The visual switch in the browser must never control this module. The strategy
 calls this adapter on every normal strategy evaluation, so hiding the overlay
 only changes presentation.
 """
@@ -10,6 +10,8 @@ from indicators.smc import analyze_structure
 
 
 AUTHORITY_SOURCE = "backend_smc_indicator"
+AUTHORITY_CANDLE_LIMIT = 250
+STRATEGY_DIAGNOSTIC_SWING_LIMIT = 20
 
 
 def _as_float(value):
@@ -21,7 +23,8 @@ def _as_float(value):
 
 def _indicator_swings(analysis):
     output = []
-    for swing in (analysis or {}).get("swings") or []:
+    swings = (analysis or {}).get("swings") or []
+    for swing in swings[-STRATEGY_DIAGNOSTIC_SWING_LIMIT:]:
         if not isinstance(swing, dict):
             continue
         output.append({
@@ -57,7 +60,23 @@ def _structure_context(analysis):
     }
 
 
-def _base_result(analysis=None):
+def _analysis_summary(analysis, candle_count):
+    analysis = analysis if isinstance(analysis, dict) else {}
+    events = analysis.get("events") or []
+    swings = analysis.get("swings") or []
+    latest_event = events[-1] if events and isinstance(events[-1], dict) else None
+    return {
+        "source": AUTHORITY_SOURCE,
+        "candle_limit": AUTHORITY_CANDLE_LIMIT,
+        "candle_count": candle_count,
+        "bias": analysis.get("bias"),
+        "event_count": len(events),
+        "swing_count": len(swings),
+        "latest_event": latest_event,
+    }
+
+
+def _base_result(analysis=None, candle_count=0):
     swings = _indicator_swings(analysis)
     return {
         "side": "WAIT",
@@ -75,7 +94,7 @@ def _base_result(analysis=None):
         "event_invalidation_swing": None,
         "indicator_authority": True,
         "indicator_source": AUTHORITY_SOURCE,
-        "indicator_analysis": analysis or {},
+        "indicator_summary": _analysis_summary(analysis, candle_count),
     }
 
 
@@ -105,36 +124,40 @@ def evaluate_indicator_breakout(
     *,
     strict_trader_module,
 ):
-    """Return the strict-trader breakout payload using SMC indicator events.
+    """Return strict-trader breakout data using SMC indicator structure events.
 
-    The indicator owns event existence/direction/BOS-vs-CHoCH classification.
-    Existing strict safety requirements remain in force: a 100-point structural
-    leg, buffered 15m close, later 5m confirmation, EMA, consolidation, SL/TP,
-    risk, duplicate, position and broker gates are still evaluated elsewhere.
+    The indicator owns event existence, direction and BOS-vs-CHoCH
+    classification. Existing strict safety requirements remain in force: a
+    100-point structural leg, buffered 15m close, later 5m confirmation, EMA,
+    consolidation, SL/TP, risk, duplicate, position and broker gates.
+
+    A fixed 250-closed-candle authority window is used so chart and strategy see
+    the same market-structure history and so strategy payloads remain bounded.
     """
     if data_15m is None or len(data_15m) < 10:
-        result = _base_result()
+        result = _base_result(candle_count=0 if data_15m is None else len(data_15m))
         result["reason"] = "WAIT_NOT_ENOUGH_15M_DATA"
         return result
 
+    authority_frame = data_15m.tail(AUTHORITY_CANDLE_LIMIT).copy()
     normalized_symbol = strict_trader_module.shared.normalize_symbol(symbol)
     configured = execution_settings or strict_trader_module.get_cached_execution_settings()
     required_buffer = strict_trader_module.bos_buffer(
-        data_15m,
+        authority_frame,
         normalized_symbol,
         configured.get("bos_buffer_points", strict_trader_module.BOS_MIN_BUFFER_POINTS),
     )
     analysis = analyze_structure(
-        data_15m,
+        authority_frame,
         timeframe="15m",
         point_size=strict_trader_module.point_size(normalized_symbol),
     )
-    result = _base_result(analysis)
+    result = _base_result(analysis, candle_count=len(authority_frame))
     result["bos_buffer"] = required_buffer
 
-    last_index = len(data_15m) - 1
-    last_close = float(data_15m.iloc[-1]["Close"])
-    last_close_time = strict_trader_module.candle_close_time(data_15m.index[-1], 15)
+    last_index = len(authority_frame) - 1
+    last_close = float(authority_frame.iloc[-1]["Close"])
+    last_close_time = strict_trader_module.candle_close_time(authority_frame.index[-1], 15)
     fresh_events = [
         event
         for event in (analysis.get("events") or [])
@@ -220,6 +243,7 @@ def evaluate_indicator_breakout(
         result.update(candidate)
         result["breakouts"] = [candidate]
         result["swings"] = [broken_swing]
+        result["raw_swings"] = [broken_swing]
         result["reason"] = f"SMC_INDICATOR_{candidate['break_type']}"
         return result
 
@@ -239,7 +263,7 @@ def evaluate_indicator_breakout(
         remembered = remembered_candidates[-1]
         remembered["structure"] = result["structure"]
         remembered["bos_buffer"] = float(remembered.get("bos_buffer") or required_buffer)
-        remembered["indicator_analysis"] = analysis
+        remembered["indicator_summary"] = result["indicator_summary"]
         result.update(remembered)
         result["breakouts"] = remembered_candidates
         result["reason"] = f"SMC_INDICATOR_REMEMBERED_{str(remembered.get('break_type') or 'BOS').upper()}"
@@ -271,8 +295,13 @@ def mark_indicator_breakout_watch(
 
 
 def build_chart_structure(frame, symbol, timeframe, *, strict_trader_module):
+    bounded_frame = (
+        frame.tail(AUTHORITY_CANDLE_LIMIT).copy()
+        if frame is not None
+        else frame
+    )
     analysis = analyze_structure(
-        frame,
+        bounded_frame,
         timeframe=timeframe,
         point_size=strict_trader_module.point_size(symbol),
     )
@@ -280,7 +309,8 @@ def build_chart_structure(frame, symbol, timeframe, *, strict_trader_module):
         **analysis,
         "symbol": strict_trader_module.shared.normalize_symbol(symbol),
         "timeframe": str(timeframe).lower(),
-        "closed_candle_count": len(frame) if frame is not None else 0,
+        "closed_candle_count": len(bounded_frame) if bounded_frame is not None else 0,
+        "authority_candle_limit": AUTHORITY_CANDLE_LIMIT,
         "source": AUTHORITY_SOURCE,
         "observation_only": False,
         "affects_strategy": str(timeframe).lower() == "15m",
