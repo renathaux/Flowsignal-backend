@@ -56,10 +56,10 @@ def _token_hash(token: str) -> str:
     return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
 
 
-def _persist_owner_session(token: str) -> None:
+def _persist_owner_session(token: str) -> bool:
     """Persist only a token hash, never the raw owner bearer token."""
     if not token:
-        return
+        return False
     now = datetime.now(timezone.utc)
     expires_at = now + OWNER_SESSION_TTL
     try:
@@ -86,11 +86,23 @@ def _persist_owner_session(token: str) -> None:
                 text("DELETE FROM flowsignal_owner_sessions WHERE expires_at <= :now"),
                 {"now": now},
             )
+        return True
     except Exception as exc:
         # Persistence is a deploy-survival enhancement. A currently valid
         # in-memory owner session must not be blocked if Neon is temporarily
         # unavailable.
         print("OWNER_SESSION_PERSIST_WARNING =", type(exc).__name__)
+        return False
+
+
+def persist_owner_session(token: str) -> bool:
+    """Persist a freshly authenticated owner token immediately at login."""
+    persisted = _persist_owner_session(token)
+    print("OWNER_SESSION_LOGIN_PERSIST =", {
+        "persisted": bool(persisted),
+        "ttl_hours": int(OWNER_SESSION_TTL.total_seconds() // 3600),
+    })
+    return persisted
 
 
 def _persisted_owner_session_valid(token: str) -> bool:
@@ -138,8 +150,8 @@ def install_owner_forex_mutation_guard(app, legacy_sessions: dict) -> dict:
     """Wrap sensitive legacy routes after route registration.
 
     Customer Forex stays read-only. Owner mutations require an admin session.
-    A successful owner mutation seeds a hashed 24-hour session record in Neon,
-    so a Render restart/deploy no longer invalidates the browser's owner token.
+    Owner sessions are persisted as hashes in Neon at login and refreshed here,
+    so a Render restart/deploy does not invalidate an authenticated owner tab.
     """
     installed = 0
     for route in list(getattr(app, "routes", [])):
