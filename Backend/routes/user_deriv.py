@@ -11,11 +11,13 @@ from services.deriv_service import (
 )
 from services.deriv_connection_recovery import current_connection_snapshot
 from services.deriv_binary_execution_service import (
-    account_settings,
     execute_relayed_signal,
+    save_account_settings,
+)
+from services.deriv_binary_read_service import (
+    account_settings,
     execution_snapshot as account_execution_snapshot,
     latest_relay_signal,
-    save_account_settings,
 )
 from services.deriv_binary_history_service import execution_history
 from services.user_auth_service import current_user, current_user_with_csrf
