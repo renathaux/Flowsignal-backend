@@ -5,8 +5,17 @@ import re
 import smtplib
 import threading
 
+from fastapi import HTTPException
+
 import api
+from strategies import strict_trader
 from services.setup_swing_execution_guard import validate_fresh_setup_swing_identity
+from services.smc_strategy_authority import (
+    AUTHORITY_SOURCE as SMC_AUTHORITY_SOURCE,
+    build_chart_structure,
+    evaluate_indicator_breakout,
+    mark_indicator_breakout_watch,
+)
 
 
 _ORIGINAL_GET_SIGNAL_ALERT_EMAIL_TO = api.get_signal_alert_email_to
@@ -14,6 +23,7 @@ _ORIGINAL_PROTECT_LIVE_TRADE_AFTER_TP1 = api.protect_live_trade_after_tp1
 _ORIGINAL_VALIDATE_FRESH_EMA_PERMISSION_LOCKED = (
     api.validate_fresh_ema_permission_locked
 )
+_ORIGINAL_SAVE_REMEMBERED_BREAKOUT = strict_trader.save_remembered_breakout
 
 
 def _split_recipients(value):
@@ -180,8 +190,6 @@ def validate_fresh_ema_permission_locked_with_stable_swing_identity(
 
     details = dict(result.get("details") or {})
     try:
-        from strategies import strict_trader
-
         latest_15m = api.get_ctrader_market_data(
             api.normalize_symbol(symbol),
             "15m",
@@ -222,6 +230,77 @@ def validate_fresh_ema_permission_locked_with_stable_swing_identity(
     }
 
 
+def evaluate_15m_breakout_with_smc_indicator(
+    data_15m,
+    symbol,
+    execution_settings=None,
+):
+    """Make the backend indicator the single BOS/CHoCH decision source."""
+    return evaluate_indicator_breakout(
+        data_15m,
+        symbol,
+        execution_settings=execution_settings,
+        strict_trader_module=strict_trader,
+    )
+
+
+def save_remembered_breakout_with_smc_marker(*args, **kwargs):
+    return mark_indicator_breakout_watch(
+        strict_trader,
+        _ORIGINAL_SAVE_REMEMBERED_BREAKOUT,
+        *args,
+        **kwargs,
+    )
+
+
+@api.app.get("/chart/smc-structure")
+def chart_smc_structure(symbol: str = "EURUSD", timeframe: str = "15m", limit: int = 250):
+    """Return the same SMC structure that the 15m strategy consumes."""
+    normalized_symbol = api.normalize_symbol(symbol)
+    normalized_timeframe = str(timeframe or "15m").strip().lower()
+    timeframe_minutes = {
+        "5m": 5,
+        "5min": 5,
+        "m5": 5,
+        "15m": 15,
+        "15min": 15,
+        "m15": 15,
+        "1h": 60,
+        "h1": 60,
+    }
+    if normalized_symbol not in {"EURUSD", "XAUUSD"}:
+        raise HTTPException(status_code=400, detail="Unsupported SMC symbol")
+    if normalized_timeframe not in timeframe_minutes:
+        raise HTTPException(status_code=400, detail="Unsupported SMC timeframe")
+    canonical_timeframe = (
+        "5m" if timeframe_minutes[normalized_timeframe] == 5
+        else "15m" if timeframe_minutes[normalized_timeframe] == 15
+        else "1h"
+    )
+    requested_limit = max(50, min(int(limit or 250), 500))
+    market_data = api.get_ctrader_market_data(
+        normalized_symbol,
+        canonical_timeframe,
+        limit=requested_limit,
+        force_refresh=False,
+    )
+    closed = strict_trader.closed_frame(
+        market_data,
+        timeframe_minutes[normalized_timeframe],
+    )
+    if closed is None or closed.empty:
+        raise HTTPException(status_code=503, detail="Closed SMC candles unavailable")
+    structure = build_chart_structure(
+        closed,
+        normalized_symbol,
+        canonical_timeframe,
+        strict_trader_module=strict_trader,
+    )
+    structure["display_enabled_independent"] = True
+    structure["backend_uses_indicator_when_display_off"] = True
+    return structure
+
+
 def _start_forex_background_task():
     print("Startup OK - warming panel cache")
     api.warm_panel_cache_from_persisted_candles()
@@ -252,13 +331,24 @@ api.app.router.on_startup = [
 ]
 api.app.router.on_startup.append(_start_forex_background_task)
 
-# Keep existing alert behavior and install the narrow final-entry swing guard
-# correction. The correction cannot bypass EMA, consolidation, risk, duplicate,
-# broker-position, setup-fingerprint, or market-data gates.
+# The chart toggle is presentation only.  The server-side SMC indicator remains
+# active because strict_trader evaluates it independently on every 15m cycle.
+strict_trader.evaluate_15m_breakout = evaluate_15m_breakout_with_smc_indicator
+strict_trader.save_remembered_breakout = save_remembered_breakout_with_smc_marker
+
+# Keep existing alert behavior and the final-entry swing correction. These
+# cannot bypass EMA, consolidation, risk, duplicate, broker-position,
+# setup-fingerprint, or market-data gates.
 api.get_signal_alert_email_to = get_signal_alert_email_to_multi
 api.protect_live_trade_after_tp1 = protect_live_trade_after_tp1_with_email
 api.validate_fresh_ema_permission_locked = (
     validate_fresh_ema_permission_locked_with_stable_swing_identity
 )
+
+print("SMC_STRATEGY_AUTHORITY =", {
+    "source": SMC_AUTHORITY_SOURCE,
+    "bos_choch_authority": True,
+    "visual_toggle_controls_strategy": False,
+})
 
 app = api.app
