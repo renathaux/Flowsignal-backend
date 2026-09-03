@@ -10,13 +10,13 @@ from typing import Any, Callable
 
 import requests
 import websockets
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.engine import Engine
 
 from db import engine as default_engine
 from services.deriv_binary_execution_service import (
     GENUINE_SIGNAL_ID, account_identifier, account_type, binary_accounts,
-    binary_executions, _engine as execution_engine,
+    binary_executions,
 )
 from services.deriv_service import DERIV_API_BASE, _headers, private_account
 from services.deriv_v5_demo_relay_service import RULE_HASH, STRATEGY_VERSION
@@ -116,7 +116,9 @@ def _claim(row_id: int, worker_id: str, now: float, engine: Engine) -> bool:
 def recover_once(*, engine: Engine | None = None,
                  monitor: Callable[[dict[str, Any], str], dict[str, Any]] = monitor_existing_contract,
                  worker_id: str | None = None, now: float | None = None) -> dict[str, int]:
-    chosen = execution_engine(engine or default_engine)
+    # Production tables are created by Alembic. Avoid running metadata.create_all()
+    # on every 30-second recovery scan; tests still seed their injected engines first.
+    chosen = engine or default_engine
     stamp = float(now if now is not None else time.time())
     owner = worker_id or f"recovery-{secrets.token_urlsafe(12)}"
     with chosen.begin() as connection:
