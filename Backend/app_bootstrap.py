@@ -9,6 +9,7 @@ from fastapi import HTTPException
 
 import api
 from strategies import strict_trader
+from services.customer_forex_guard import persist_owner_session
 from services.setup_swing_execution_guard import validate_fresh_setup_swing_identity
 from services.smc_strategy_authority import (
     AUTHORITY_SOURCE as SMC_AUTHORITY_SOURCE,
@@ -24,6 +25,31 @@ _ORIGINAL_VALIDATE_FRESH_EMA_PERMISSION_LOCKED = (
     api.validate_fresh_ema_permission_locked
 )
 _ORIGINAL_SAVE_REMEMBERED_BREAKOUT = strict_trader.save_remembered_breakout
+
+
+@api.app.middleware("http")
+async def persist_owner_session_immediately_after_login(request, call_next):
+    """Persist a new admin token before it can be lost to a Render restart.
+
+    The legacy /login endpoint owns credential verification and writes the new
+    token into api.SESSIONS. We only observe successful owner logins here and
+    persist the token hash; customer/access-code sessions are never persisted
+    as owner sessions.
+    """
+    is_login = (
+        str(request.method or "").upper() == "POST"
+        and str(request.url.path or "") == "/login"
+    )
+    before_tokens = set(api.SESSIONS) if is_login else set()
+    response = await call_next(request)
+    if is_login and response.status_code < 400:
+        for token, session in list(api.SESSIONS.items()):
+            if token in before_tokens or not isinstance(session, dict):
+                continue
+            if str(session.get("role") or "").lower() != "admin":
+                continue
+            persist_owner_session(token)
+    return response
 
 
 def _split_recipients(value):
