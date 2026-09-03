@@ -5,7 +5,9 @@ import hashlib
 import json
 import os
 import secrets
+import threading
 import time
+import weakref
 from typing import Any
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -37,10 +39,17 @@ deriv_oauth_states = Table(
     Column("consumed_at", Float),
 )
 
+_METADATA_INIT_LOCK = threading.Lock()
+_METADATA_READY_ENGINES: weakref.WeakSet[Engine] = weakref.WeakSet()
+
 
 def _engine(engine: Engine | None = None) -> Engine:
     chosen = engine or default_engine
-    metadata.create_all(chosen)
+    if chosen not in _METADATA_READY_ENGINES:
+        with _METADATA_INIT_LOCK:
+            if chosen not in _METADATA_READY_ENGINES:
+                metadata.create_all(chosen)
+                _METADATA_READY_ENGINES.add(chosen)
     return chosen
 
 
@@ -102,20 +111,18 @@ def latest_selected_account(user_id: str, authorized_account_ids: set[str], *, e
         return None
     chosen = _engine(engine)
     with chosen.begin() as connection:
-        rows = connection.execute(
+        row = connection.execute(
             select(deriv_connections.c.selected_account_id)
             .where(
                 (deriv_connections.c.user_id == user_id)
                 & (deriv_connections.c.disconnected == False)  # noqa: E712
                 & (deriv_connections.c.selected_account_id.is_not(None))
+                & (deriv_connections.c.selected_account_id.in_(tuple(authorized_account_ids)))
             )
             .order_by(deriv_connections.c.updated_at.desc())
-        ).all()
-    for row in rows:
-        selected = str(row[0] or "").strip()
-        if selected in authorized_account_ids:
-            return selected
-    return None
+            .limit(1)
+        ).first()
+    return str(row[0] or "").strip() if row else None
 
 
 def save_connection(user_id: str, access_token: str, accounts: list[dict[str, Any]], expires_at: float, *, selected_account_id: str | None = None, connection_id: str | None = None, engine: Engine | None = None) -> str:
