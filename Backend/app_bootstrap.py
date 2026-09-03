@@ -177,7 +177,7 @@ api.app.router.on_startup = [
     handler for handler in api.app.router.on_startup
     if handler is not api.start_background_task
 ]
-api.app.add_event_handler("startup", _start_forex_background_task)
+api.app.router.on_startup.append(_start_forex_background_task)
 
 # Keep all existing signal-email behavior while allowing extra recipients from
 # SIGNAL_ALERT_EMAIL_CC. No strategy, risk, or execution logic is changed.
