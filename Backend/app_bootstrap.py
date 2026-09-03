@@ -171,10 +171,9 @@ def validate_fresh_ema_permission_locked_with_stable_swing_identity(
     """Recover only the known short-window swing requalification false negative.
 
     The original final gate still owns EMA, consolidation, and all of its normal
-    failure modes.  If and only if it reaches the historical swing mismatch,
-    verify that the exact strategy-approved pivot still exists in the latest
-    closed broker candles without re-running its path-dependent 100-point leg
-    qualification on the shortened fresh window.
+    failure modes. If and only if it reaches the historical swing mismatch,
+    verify that the exact strategy-approved pivot still exists in the same
+    250-candle SMC authority window used to create the setup.
     """
     result = _ORIGINAL_VALIDATE_FRESH_EMA_PERMISSION_LOCKED(
         symbol,
@@ -193,10 +192,12 @@ def validate_fresh_ema_permission_locked_with_stable_swing_identity(
         latest_15m = api.get_ctrader_market_data(
             api.normalize_symbol(symbol),
             "15m",
-            limit=100,
+            limit=250,
             force_refresh=False,
         )
         closed_15m = strict_trader.closed_frame(latest_15m, 15)
+        if closed_15m is not None:
+            closed_15m = closed_15m.tail(250).copy()
         swing_check = validate_fresh_setup_swing_identity(
             closed_15m,
             symbol,
@@ -331,7 +332,7 @@ api.app.router.on_startup = [
 ]
 api.app.router.on_startup.append(_start_forex_background_task)
 
-# The chart toggle is presentation only.  The server-side SMC indicator remains
+# The chart toggle is presentation only. The server-side SMC indicator remains
 # active because strict_trader evaluates it independently on every 15m cycle.
 strict_trader.evaluate_15m_breakout = evaluate_15m_breakout_with_smc_indicator
 strict_trader.save_remembered_breakout = save_remembered_breakout_with_smc_marker
