@@ -21,6 +21,136 @@ def _as_float(value):
         return None
 
 
+def _event_invalidation(event):
+    return (
+        event.get("event_invalidation_swing")
+        if isinstance(event, dict)
+        and isinstance(event.get("event_invalidation_swing"), dict)
+        else None
+    )
+
+
+def _event_structural_leg_size(event):
+    level = _as_float((event or {}).get("broken_level"))
+    invalidation_price = _as_float((_event_invalidation(event) or {}).get("price"))
+    if level is None or invalidation_price is None:
+        return None
+    return abs(level - invalidation_price)
+
+
+def _internal_two_bos_confirmation(analysis, current_event, minimum_swing):
+    """Allow the second small internal BOS only after HH/HL or LH/LL confirms.
+
+    This is strategy eligibility only. The SMC indicator itself remains
+    untouched and continues to publish every BOS/CHoCH it detects.
+    """
+    current_direction = str((current_event or {}).get("direction") or "").upper()
+    current_type = str((current_event or {}).get("event_type") or "").upper()
+    try:
+        current_index = int((current_event or {}).get("break_index", -1))
+    except (TypeError, ValueError):
+        current_index = -1
+
+    details = {
+        "qualified": False,
+        "rule": "SECOND_SMALL_INTERNAL_BOS_CONFIRMS_STRUCTURE",
+        "pattern": None,
+        "current_direction": current_direction or None,
+        "current_event_type": current_type or None,
+        "current_leg_size": _event_structural_leg_size(current_event),
+        "minimum_external_leg_size": minimum_swing,
+        "previous_event": None,
+        "reason": None,
+    }
+
+    if current_type != "BOS" or current_direction not in {"BULLISH", "BEARISH"}:
+        details["reason"] = "current_event_is_not_internal_bos"
+        return details
+
+    prior_events = []
+    for event in (analysis or {}).get("events") or []:
+        if not isinstance(event, dict) or event is current_event:
+            continue
+        try:
+            event_index = int(event.get("break_index", -1))
+        except (TypeError, ValueError):
+            continue
+        if event_index < current_index:
+            prior_events.append(event)
+
+    if not prior_events:
+        details["reason"] = "no_previous_structure_event"
+        return details
+
+    previous = prior_events[-1]
+    previous_direction = str(previous.get("direction") or "").upper()
+    previous_type = str(previous.get("event_type") or "").upper()
+    previous_leg_size = _event_structural_leg_size(previous)
+    previous_level = _as_float(previous.get("broken_level"))
+    current_level = _as_float(current_event.get("broken_level"))
+    previous_invalidation = _event_invalidation(previous) or {}
+    current_invalidation = _event_invalidation(current_event) or {}
+    previous_invalidation_price = _as_float(previous_invalidation.get("price"))
+    current_invalidation_price = _as_float(current_invalidation.get("price"))
+
+    details["previous_event"] = {
+        "event_type": previous_type or None,
+        "direction": previous_direction or None,
+        "broken_level": previous_level,
+        "invalidation_price": previous_invalidation_price,
+        "leg_size": previous_leg_size,
+        "break_index": previous.get("break_index"),
+        "timestamp": previous.get("timestamp"),
+    }
+
+    if previous_type != "BOS" or previous_direction != current_direction:
+        details["reason"] = "previous_event_is_not_same_direction_bos"
+        return details
+    if previous_leg_size is None or previous_leg_size >= minimum_swing:
+        details["reason"] = "previous_bos_was_not_small_internal_structure"
+        return details
+    if details["current_leg_size"] is None or details["current_leg_size"] >= minimum_swing:
+        details["reason"] = "current_bos_is_not_small_internal_structure"
+        return details
+    if None in {
+        previous_level,
+        current_level,
+        previous_invalidation_price,
+        current_invalidation_price,
+    }:
+        details["reason"] = "internal_structure_prices_missing"
+        return details
+
+    previous_invalidation_type = str(previous_invalidation.get("type") or "").upper()
+    current_invalidation_type = str(current_invalidation.get("type") or "").upper()
+
+    if current_direction == "BULLISH":
+        pattern_ok = (
+            previous_invalidation_type == "LOW"
+            and current_invalidation_type == "LOW"
+            and current_level > previous_level
+            and current_invalidation_price > previous_invalidation_price
+        )
+        pattern = "HH_HL"
+    else:
+        pattern_ok = (
+            previous_invalidation_type == "HIGH"
+            and current_invalidation_type == "HIGH"
+            and current_level < previous_level
+            and current_invalidation_price < previous_invalidation_price
+        )
+        pattern = "LH_LL"
+
+    details["pattern"] = pattern
+    details["qualified"] = bool(pattern_ok)
+    details["reason"] = (
+        "second_small_bos_confirms_internal_structure"
+        if pattern_ok
+        else "second_small_bos_did_not_confirm_internal_structure"
+    )
+    return details
+
+
 def _indicator_swings(analysis):
     output = []
     swings = (analysis or {}).get("swings") or []
@@ -127,9 +257,11 @@ def evaluate_indicator_breakout(
     """Return strict-trader breakout data using SMC indicator structure events.
 
     The indicator owns event existence, direction and BOS-vs-CHoCH
-    classification. Existing strict safety requirements remain in force: a
-    100-point structural leg, buffered 15m close, later 5m confirmation, EMA,
-    consolidation, SL/TP, risk, duplicate, position and broker gates.
+    classification. The strategy keeps the normal 100-point external leg rule,
+    with one internal exception: after one sub-100-point BOS, a second
+    same-direction sub-100-point BOS may qualify if it confirms HH/HL or LH/LL.
+    Existing buffered 15m close, later 5m confirmation, EMA, consolidation,
+    SL/TP, risk, duplicate, position and broker gates remain unchanged.
 
     A fixed 250-closed-candle authority window is used so chart and strategy see
     the same market-structure history and so strategy payloads remain bounded.
@@ -172,17 +304,9 @@ def evaluate_indicator_breakout(
         side = "BUY" if direction == "BULLISH" else "SELL"
         level = _as_float(event.get("broken_level"))
         break_close = _as_float(event.get("close"))
-        invalidation = (
-            event.get("event_invalidation_swing")
-            if isinstance(event.get("event_invalidation_swing"), dict)
-            else None
-        )
+        invalidation = _event_invalidation(event)
         invalidation_price = _as_float((invalidation or {}).get("price"))
-        swing_size = (
-            abs(level - invalidation_price)
-            if level is not None and invalidation_price is not None
-            else None
-        )
+        swing_size = _event_structural_leg_size(event)
         minimum_swing = strict_trader_module.minimum_swing_size(normalized_symbol)
 
         result["indicator_event"] = event
@@ -193,9 +317,21 @@ def evaluate_indicator_breakout(
         if level is None or break_close is None:
             result["reason"] = "WAIT_INVALID_INDICATOR_SMC_EVENT"
             return result
-        if swing_size is None or swing_size < minimum_swing:
+
+        internal_confirmation = None
+        if swing_size is None:
             result["reason"] = "WAIT_NO_VALID_100_POINT_SWING"
             return result
+        if swing_size < minimum_swing:
+            internal_confirmation = _internal_two_bos_confirmation(
+                analysis,
+                event,
+                minimum_swing,
+            )
+            result["internal_structure_confirmation"] = internal_confirmation
+            if not internal_confirmation.get("qualified"):
+                result["reason"] = "WAIT_NO_VALID_100_POINT_SWING"
+                return result
 
         buffered = (
             break_close > level + required_buffer
@@ -207,6 +343,11 @@ def evaluate_indicator_breakout(
             return result
 
         swing_type = "HIGH" if side == "BUY" else "LOW"
+        valid_reason = (
+            f"indicator_internal_two_bos_{str(internal_confirmation.get('pattern') or '').lower()}"
+            if internal_confirmation and internal_confirmation.get("qualified")
+            else "indicator_100_point_structure"
+        )
         broken_swing = {
             "type": swing_type,
             "price": level,
@@ -214,7 +355,7 @@ def evaluate_indicator_breakout(
             "time": event.get("broken_swing_timestamp"),
             "swing_size": swing_size,
             "valid": True,
-            "valid_reason": "indicator_100_point_structure",
+            "valid_reason": valid_reason,
             "indicator_source": AUTHORITY_SOURCE,
             "indicator_event_invalidation_swing": invalidation,
         }
@@ -234,7 +375,14 @@ def evaluate_indicator_breakout(
             "indicator_authority": True,
             "indicator_source": AUTHORITY_SOURCE,
             "indicator_event": event,
+            "strategy_structure_qualification": (
+                "INTERNAL_TWO_BOS_CONFIRMATION"
+                if internal_confirmation and internal_confirmation.get("qualified")
+                else "EXTERNAL_100_POINT_LEG"
+            ),
         }
+        if internal_confirmation and internal_confirmation.get("qualified"):
+            candidate["internal_structure_confirmation"] = internal_confirmation
         strict_trader_module.clear_opposite_watch(
             normalized_symbol,
             side,
