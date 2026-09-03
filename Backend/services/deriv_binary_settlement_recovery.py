@@ -29,6 +29,22 @@ MAX_BATCH = 10
 _START_LOCK = threading.Lock()
 _STARTED = False
 
+_RECOVERY_SCAN_COLUMNS = (
+    binary_executions.c.id,
+    binary_executions.c.user_id,
+    binary_executions.c.deriv_account_id,
+    binary_executions.c.account_type,
+    binary_executions.c.strategy_version,
+    binary_executions.c.rule_hash,
+    binary_executions.c.signal_id,
+    binary_executions.c.direction,
+    binary_executions.c.symbol,
+    binary_executions.c.contract_id,
+    binary_executions.c.broker_status,
+    binary_executions.c.settlement_timestamp,
+    binary_executions.c.recovery_attempt_count,
+)
+
 
 def _eligible(row: dict[str, Any]) -> bool:
     contract_id = str(row.get("contract_id") or "").strip()
@@ -104,7 +120,7 @@ def recover_once(*, engine: Engine | None = None,
     stamp = float(now if now is not None else time.time())
     owner = worker_id or f"recovery-{secrets.token_urlsafe(12)}"
     with chosen.begin() as connection:
-        rows = connection.execute(select(binary_executions).where(
+        rows = connection.execute(select(*_RECOVERY_SCAN_COLUMNS).where(
             binary_executions.c.broker_status.in_(RECOVERABLE),
             binary_executions.c.settlement_timestamp.is_(None),
             or_(binary_executions.c.recovery_next_retry_at.is_(None), binary_executions.c.recovery_next_retry_at <= stamp),
@@ -120,7 +136,7 @@ def recover_once(*, engine: Engine | None = None,
         report["claimed"] += 1
         try:
             with chosen.begin() as connection:
-                account = connection.execute(select(binary_accounts).where(
+                account = connection.execute(select(binary_accounts.c.connection_id).where(
                     binary_accounts.c.user_id == row["user_id"],
                     binary_accounts.c.deriv_account_id == row["deriv_account_id"],
                     binary_accounts.c.auth_state == "CONNECTED",
