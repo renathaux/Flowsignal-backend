@@ -6,10 +6,14 @@ import smtplib
 import threading
 
 import api
+from services.setup_swing_execution_guard import validate_fresh_setup_swing_identity
 
 
 _ORIGINAL_GET_SIGNAL_ALERT_EMAIL_TO = api.get_signal_alert_email_to
 _ORIGINAL_PROTECT_LIVE_TRADE_AFTER_TP1 = api.protect_live_trade_after_tp1
+_ORIGINAL_VALIDATE_FRESH_EMA_PERMISSION_LOCKED = (
+    api.validate_fresh_ema_permission_locked
+)
 
 
 def _split_recipients(value):
@@ -149,6 +153,75 @@ def protect_live_trade_after_tp1_with_email(trade):
     return result
 
 
+def validate_fresh_ema_permission_locked_with_stable_swing_identity(
+    symbol,
+    side,
+    setup_identity=None,
+):
+    """Recover only the known short-window swing requalification false negative.
+
+    The original final gate still owns EMA, consolidation, and all of its normal
+    failure modes.  If and only if it reaches the historical swing mismatch,
+    verify that the exact strategy-approved pivot still exists in the latest
+    closed broker candles without re-running its path-dependent 100-point leg
+    qualification on the shortened fresh window.
+    """
+    result = _ORIGINAL_VALIDATE_FRESH_EMA_PERMISSION_LOCKED(
+        symbol,
+        side,
+        setup_identity=setup_identity,
+    )
+    if not isinstance(result, dict):
+        return result
+    if result.get("ok"):
+        return result
+    if result.get("reason") != "WAIT_SETUP_SWING_CHANGED_BEFORE_EXECUTION":
+        return result
+
+    details = dict(result.get("details") or {})
+    try:
+        from strategies import strict_trader
+
+        latest_15m = api.get_ctrader_market_data(
+            api.normalize_symbol(symbol),
+            "15m",
+            limit=100,
+            force_refresh=False,
+        )
+        closed_15m = strict_trader.closed_frame(latest_15m, 15)
+        swing_check = validate_fresh_setup_swing_identity(
+            closed_15m,
+            symbol,
+            setup_identity,
+            strict_trader,
+        )
+        details.update(swing_check.get("details") or {})
+
+        if swing_check.get("ok"):
+            details["legacy_short_window_valid_swing_requalification"] = (
+                "false_negative_recovered"
+            )
+            print("LIVE_SETUP_SWING_IDENTITY_RECOVERED =", {
+                "symbol": api.normalize_symbol(symbol),
+                "side": str(side or "").upper(),
+                "setup_identity": setup_identity,
+                "details": swing_check.get("details"),
+            })
+            return {
+                "ok": True,
+                "reason": None,
+                "details": details,
+            }
+    except Exception as exc:
+        details["stable_setup_swing_recheck_error"] = str(exc)
+
+    return {
+        "ok": False,
+        "reason": "WAIT_SETUP_SWING_CHANGED_BEFORE_EXECUTION",
+        "details": details,
+    }
+
+
 def _start_forex_background_task():
     print("Startup OK - warming panel cache")
     api.warm_panel_cache_from_persisted_candles()
@@ -179,9 +252,13 @@ api.app.router.on_startup = [
 ]
 api.app.router.on_startup.append(_start_forex_background_task)
 
-# Keep all existing signal-email behavior while allowing extra recipients from
-# SIGNAL_ALERT_EMAIL_CC. No strategy, risk, or execution logic is changed.
+# Keep existing alert behavior and install the narrow final-entry swing guard
+# correction. The correction cannot bypass EMA, consolidation, risk, duplicate,
+# broker-position, setup-fingerprint, or market-data gates.
 api.get_signal_alert_email_to = get_signal_alert_email_to_multi
 api.protect_live_trade_after_tp1 = protect_live_trade_after_tp1_with_email
+api.validate_fresh_ema_permission_locked = (
+    validate_fresh_ema_permission_locked_with_stable_swing_identity
+)
 
 app = api.app
