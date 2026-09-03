@@ -40,12 +40,13 @@ def execution_history(
         (binary_executions.c.user_id == user_id)
         & (binary_executions.c.deriv_account_id == deriv_account_id)
     )
+    history_columns = [binary_executions.c[field] for field in PUBLIC_HISTORY_FIELDS]
     with chosen.begin() as connection:
         total = connection.execute(
             select(func.count()).select_from(binary_executions).where(owned)
         ).scalar_one()
         rows = connection.execute(
-            select(binary_executions)
+            select(*history_columns)
             .where(owned)
             .order_by(binary_executions.c.created_at.desc())
             .limit(bounded_limit)
