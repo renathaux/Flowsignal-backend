@@ -1,0 +1,110 @@
+import unittest
+
+import pandas as pd
+
+from services.setup_swing_execution_guard import validate_fresh_setup_swing_identity
+from strategies import strict_trader
+
+
+class StableSetupSwingExecutionGuardTests(unittest.TestCase):
+    def _full_history(self):
+        index = pd.date_range(
+            "2026-09-02T05:00:00Z",
+            periods=10,
+            freq="15min",
+        )
+        rows = [
+            (1.1002, 1.1005, 1.1000, 1.1003),
+            (1.1001, 1.1004, 1.0998, 1.1000),
+            (1.0998, 1.1002, 1.0988, 1.0995),
+            (1.0996, 1.1006, 1.0995, 1.1002),
+            (1.1001, 1.1008, 1.0999, 1.1005),
+            (1.1017, 1.1020, 1.1016, 1.1018),
+            (1.1007, 1.1009, 1.1002, 1.1005),
+            (1.1004, 1.1007, 1.1000, 1.1002),
+            (1.1003, 1.1008, 1.1001, 1.1004),
+            (1.1002, 1.1006, 1.1000, 1.1003),
+        ]
+        return pd.DataFrame(
+            rows,
+            columns=["Open", "High", "Low", "Close"],
+            index=index,
+        )
+
+    def test_short_window_does_not_reject_already_qualified_exact_pivot(self):
+        full = self._full_history()
+        target_time = full.index[5].isoformat()
+        full_valid = strict_trader.detect_valid_swings(full, "EURUSD")
+        self.assertTrue(
+            any(
+                swing.get("type") == "HIGH"
+                and swing.get("time") == target_time
+                and abs(float(swing.get("price")) - 1.1020) < 1e-12
+                for swing in full_valid
+            )
+        )
+
+        # Simulate the final execution gate's shorter fresh window. The prior
+        # LOW that qualified the HIGH has fallen outside the window, so legacy
+        # detect_valid_swings re-qualification loses the already-valid pivot.
+        truncated = full.iloc[3:].copy()
+        truncated_valid = strict_trader.detect_valid_swings(
+            truncated,
+            "EURUSD",
+        )
+        self.assertFalse(
+            any(
+                swing.get("type") == "HIGH"
+                and swing.get("time") == target_time
+                for swing in truncated_valid
+            )
+        )
+
+        result = validate_fresh_setup_swing_identity(
+            truncated,
+            "EURUSD",
+            {
+                "swing_type": "HIGH",
+                "swing_timestamp": target_time,
+                "swing_price": 1.1020,
+            },
+            strict_trader,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertIsNone(result["reason"])
+        self.assertTrue(result["details"]["fresh_setup_swing_matched"])
+        self.assertEqual(
+            result["details"]["fresh_setup_swing_match_method"],
+            "raw_pivot_identity",
+        )
+        self.assertFalse(
+            result["details"]["fresh_setup_matched_swing"][
+                "fresh_window_valid_flag"
+            ]
+        )
+
+    def test_changed_pivot_price_still_blocks_execution(self):
+        truncated = self._full_history().iloc[3:].copy()
+        target_time = truncated.index[2].isoformat()
+        result = validate_fresh_setup_swing_identity(
+            truncated,
+            "EURUSD",
+            {
+                "swing_type": "HIGH",
+                "swing_timestamp": target_time,
+                "swing_price": 1.1015,
+            },
+            strict_trader,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            result["reason"],
+            "WAIT_SETUP_SWING_CHANGED_BEFORE_EXECUTION",
+        )
+        self.assertFalse(result["details"]["fresh_setup_swing_matched"])
+
+
+if __name__ == "__main__":
+    unittest.main()
