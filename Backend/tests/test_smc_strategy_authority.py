@@ -1,5 +1,4 @@
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
@@ -100,6 +99,67 @@ def _analysis(frame, *, event_type="CHOCH", invalidation_price=1.0980, break_clo
     }
 
 
+def _two_small_bos_analysis(frame, direction="BULLISH", *, confirm_pattern=True):
+    last_index = len(frame) - 1
+    if direction == "BULLISH":
+        previous_level = 1.1000
+        previous_invalidation = 1.0995
+        current_level = 1.1006
+        current_invalidation = 1.0998 if confirm_pattern else 1.0994
+        invalidation_type = "LOW"
+        break_close = 1.1008
+        bias = "BULLISH"
+    else:
+        previous_level = 1.1010
+        previous_invalidation = 1.1015
+        current_level = 1.1004
+        current_invalidation = 1.1011 if confirm_pattern else 1.1016
+        invalidation_type = "HIGH"
+        break_close = 1.1002
+        bias = "BEARISH"
+
+    return {
+        "bias": bias,
+        "events": [
+            {
+                "event_type": "BOS",
+                "direction": direction,
+                "timestamp": frame.index[-4].isoformat(),
+                "close": previous_level,
+                "broken_swing_timestamp": frame.index[-7].isoformat(),
+                "broken_level": previous_level,
+                "structure_start_index": last_index - 6,
+                "break_index": last_index - 3,
+                "event_invalidation_swing": {
+                    "type": invalidation_type,
+                    "price": previous_invalidation,
+                    "swing_time": frame.index[-8].isoformat(),
+                    "source": "CURRENT_LEG",
+                },
+            },
+            {
+                "event_type": "BOS",
+                "direction": direction,
+                "timestamp": frame.index[-1].isoformat(),
+                "close": break_close,
+                "broken_swing_timestamp": frame.index[-3].isoformat(),
+                "broken_level": current_level,
+                "structure_start_index": last_index - 2,
+                "break_index": last_index,
+                "event_invalidation_swing": {
+                    "type": invalidation_type,
+                    "price": current_invalidation,
+                    "swing_time": frame.index[-2].isoformat(),
+                    "source": "CURRENT_LEG",
+                },
+            },
+        ],
+        "current_structure": {"bias": bias},
+        "swings": [],
+        "fib_levels": [],
+    }
+
+
 class SmcStrategyAuthorityTests(unittest.TestCase):
     def setUp(self):
         _StrictTraderStub.shared.FIFTEEN_M_SWING_WATCH = {}
@@ -131,9 +191,68 @@ class SmcStrategyAuthorityTests(unittest.TestCase):
         self.assertEqual(result["side"], "BUY")
         self.assertEqual(result["break_type"], "BOS")
 
-    def test_minimum_100_point_structural_leg_still_blocks(self):
+    def test_single_small_internal_bos_still_waits(self):
         frame = _frame()
-        analysis = _analysis(frame, invalidation_price=1.0995)
+        analysis = _analysis(frame, event_type="BOS", invalidation_price=1.0995)
+        with patch.object(authority, "analyze_structure", return_value=analysis):
+            result = authority.evaluate_indicator_breakout(
+                frame,
+                "EURUSD",
+                strict_trader_module=_StrictTraderStub,
+            )
+
+        self.assertEqual(result["side"], "WAIT")
+        self.assertEqual(result["reason"], "WAIT_NO_VALID_100_POINT_SWING")
+
+    def test_second_small_bullish_bos_with_hh_hl_can_enter_strategy(self):
+        frame = _frame()
+        analysis = _two_small_bos_analysis(frame, "BULLISH")
+        with patch.object(authority, "analyze_structure", return_value=analysis):
+            result = authority.evaluate_indicator_breakout(
+                frame,
+                "EURUSD",
+                strict_trader_module=_StrictTraderStub,
+            )
+
+        self.assertEqual(result["side"], "BUY")
+        self.assertEqual(result["break_type"], "BOS")
+        self.assertEqual(result["strategy_structure_qualification"], "INTERNAL_TWO_BOS_CONFIRMATION")
+        self.assertEqual(result["internal_structure_confirmation"]["pattern"], "HH_HL")
+        self.assertTrue(result["internal_structure_confirmation"]["qualified"])
+
+    def test_second_small_bearish_bos_with_lh_ll_can_enter_strategy(self):
+        frame = _frame()
+        analysis = _two_small_bos_analysis(frame, "BEARISH")
+        with patch.object(authority, "analyze_structure", return_value=analysis):
+            result = authority.evaluate_indicator_breakout(
+                frame,
+                "EURUSD",
+                strict_trader_module=_StrictTraderStub,
+            )
+
+        self.assertEqual(result["side"], "SELL")
+        self.assertEqual(result["strategy_structure_qualification"], "INTERNAL_TWO_BOS_CONFIRMATION")
+        self.assertEqual(result["internal_structure_confirmation"]["pattern"], "LH_LL")
+        self.assertTrue(result["internal_structure_confirmation"]["qualified"])
+
+    def test_second_small_bos_without_hh_hl_still_waits(self):
+        frame = _frame()
+        analysis = _two_small_bos_analysis(frame, "BULLISH", confirm_pattern=False)
+        with patch.object(authority, "analyze_structure", return_value=analysis):
+            result = authority.evaluate_indicator_breakout(
+                frame,
+                "EURUSD",
+                strict_trader_module=_StrictTraderStub,
+            )
+
+        self.assertEqual(result["side"], "WAIT")
+        self.assertEqual(result["reason"], "WAIT_NO_VALID_100_POINT_SWING")
+        self.assertFalse(result["internal_structure_confirmation"]["qualified"])
+
+    def test_small_choch_then_small_bos_does_not_use_internal_exception(self):
+        frame = _frame()
+        analysis = _two_small_bos_analysis(frame, "BULLISH")
+        analysis["events"][0]["event_type"] = "CHOCH"
         with patch.object(authority, "analyze_structure", return_value=analysis):
             result = authority.evaluate_indicator_breakout(
                 frame,
