@@ -2,8 +2,8 @@
 
 Gold remains a 15-minute structure strategy. The stop loss is anchored to the
 immutable opposite swing owned by the accepted BOS/CHoCH event and then placed
-5 pips beyond that swing. The configured minimum SL distance is only a
-validation floor; it never manufactures an arbitrary stop.
+500 quoted points ($5.00) beyond that swing. The configured minimum SL distance
+is only a validation floor; it never manufactures an arbitrary stop.
 """
 from __future__ import annotations
 
@@ -13,14 +13,13 @@ from . import shared
 from . import strict_trader
 
 
-XAUUSD_SL_BUFFER_PIPS = 5.0
-XAUUSD_SL_BUFFER_QUOTED_POINTS = 50
+XAUUSD_SL_BUFFER_PIPS = 50.0
+XAUUSD_SL_BUFFER_QUOTED_POINTS = 500
 
 
-def _five_pip_buffer():
-    # FlowSignal's Gold convention defines five pips as 50 quoted points.
-    # Derive the price distance from the repository's configured quote precision
-    # instead of inventing a second XAUUSD pip-size setting: 50 * 0.01 = 0.50.
+def _gold_sl_buffer():
+    # FlowSignal Gold quotes to 0.01. A 500-point structural buffer therefore
+    # means 500 * 0.01 = $5.00 beyond the event-owned wick.
     return XAUUSD_SL_BUFFER_QUOTED_POINTS * strict_trader.point_size("XAUUSD")
 
 
@@ -53,19 +52,73 @@ def _event_owned_15m_stop(
             "reason": "WAIT_NO_STRUCTURAL_SL_SWING",
             "sl_structure_source": "event_owned_15m_smc_swing",
         }
-    stop = strict_trader.select_structural_stop_loss(
-        event_invalidation_swing,
-        side,
-        float(entry),
+
+    side = str(side or "").upper()
+    required = "LOW" if side == "BUY" else "HIGH"
+    swing = event_invalidation_swing
+    if not isinstance(swing, dict) or swing.get("price") is None:
+        return {"ok": False, "reason": "WAIT_NO_STRUCTURAL_SL_SWING"}
+    if str(swing.get("type") or "").upper() != required:
+        return {"ok": False, "reason": "WAIT_STRUCTURAL_SL_SWING_TYPE_MISMATCH"}
+
+    swing_price = float(swing["price"])
+    swing_time = swing.get("swing_time") or swing.get("time")
+    confirmation_time = swing.get("confirmation_time")
+
+    setup_ts = strict_trader.utc_timestamp(setup_break_time)
+    swing_ts = strict_trader.utc_timestamp(swing_time)
+    confirmation_ts = strict_trader.utc_timestamp(confirmation_time)
+    if setup_ts is not None and swing_ts is not None and swing_ts > setup_ts:
+        return {
+            "ok": False,
+            "reason": "WAIT_SL_SWING_AFTER_SETUP",
+            "sl_swing_time": swing_time,
+            "setup_break_time": setup_break_time,
+        }
+    if setup_ts is not None and confirmation_ts is not None and confirmation_ts > setup_ts:
+        return {
+            "ok": False,
+            "reason": "WAIT_SL_SWING_CONFIRMED_AFTER_SETUP",
+            "sl_swing_confirmation_time": confirmation_time,
+            "setup_break_time": setup_break_time,
+        }
+
+    entry = float(entry)
+    buffer = _gold_sl_buffer()
+    stop = swing_price - buffer if side == "BUY" else swing_price + buffer
+    distance = abs(entry - stop)
+    minimum = strict_trader.minimum_sl_distance(
         "XAUUSD",
-        setup_break_time=setup_break_time,
-        minimum_sl_distance_points=minimum_sl_points,
+        minimum_sl_points,
     )
-    if not stop.get("ok"):
-        return stop
+
+    if not (stop < entry if side == "BUY" else stop > entry):
+        return {"ok": False, "reason": "WAIT_15M_SWING_WRONG_SIDE"}
+    if distance < minimum:
+        return {
+            "ok": False,
+            "reason": "WAIT_SL_TOO_SMALL",
+            "minimum_distance": minimum,
+            "distance": distance,
+            "sl_swing_used": swing_price,
+            "sl_swing_time": swing_time,
+        }
+
     return {
-        **stop,
+        "ok": True,
+        "stop_loss": stop,
+        "swing": {
+            "type": required,
+            "price": swing_price,
+            "time": swing_time,
+            "confirmation_time": confirmation_time,
+            "source": swing.get("source"),
+        },
+        "distance": distance,
+        "distance_points": distance / strict_trader.point_size("XAUUSD"),
+        "buffer": buffer,
         "buffer_pips": XAUUSD_SL_BUFFER_PIPS,
+        "sl_structure_source": "event_owned_15m_smc_swing",
     }
 
 
@@ -79,7 +132,7 @@ def build_xauusd_risk_levels(
     execution_settings=None,
     event_invalidation_swing=None,
 ):
-    """Build XAUUSD levels from the event-owned 15m swing + 5-pip SL buffer."""
+    """Build XAUUSD levels from the event-owned 15m swing + 500-point SL buffer."""
     if shared.normalize_symbol(symbol) != "XAUUSD":
         raise ValueError("build_xauusd_risk_levels is XAUUSD-only")
 
