@@ -3,6 +3,7 @@ from email.mime.text import MIMEText
 import os
 import re
 import smtplib
+import threading
 
 import api
 
@@ -147,6 +148,36 @@ def protect_live_trade_after_tp1_with_email(trade):
 
     return result
 
+
+def _start_forex_background_task():
+    print("Startup OK - warming panel cache")
+    api.warm_panel_cache_from_persisted_candles()
+    try:
+        api.start_ctrader_live_price_stream()
+    except Exception as exc:
+        print("CTRADER_LIVE_STREAM_START_ERROR =", str(exc))
+    with api.BACKGROUND_THREAD_LOCK:
+        if api.BACKGROUND_THREAD is not None and api.BACKGROUND_THREAD.is_alive():
+            print("BACKGROUND_FETCH_ALREADY_RUNNING =", {
+                "thread_id": api.BACKGROUND_THREAD.ident,
+            })
+            return
+        api.BACKGROUND_THREAD = threading.Thread(
+            target=api.background_fetch,
+            name="flowsignal-trading-engine",
+            daemon=True,
+        )
+        api.BACKGROUND_THREAD.start()
+        api.ENGINE_RUNTIME_STATE["loop_thread_id"] = api.BACKGROUND_THREAD.ident
+
+
+# Replace the legacy startup hook with the Forex-only runtime while preserving
+# the same panel warmup, cTrader stream, and 24/7 strategy background thread.
+api.app.router.on_startup = [
+    handler for handler in api.app.router.on_startup
+    if handler is not api.start_background_task
+]
+api.app.add_event_handler("startup", _start_forex_background_task)
 
 # Keep all existing signal-email behavior while allowing extra recipients from
 # SIGNAL_ALERT_EMAIL_CC. No strategy, risk, or execution logic is changed.
