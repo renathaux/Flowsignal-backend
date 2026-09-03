@@ -4,8 +4,6 @@ import os
 import re
 import smtplib
 
-from fastapi.responses import JSONResponse
-
 import api
 
 
@@ -155,35 +153,4 @@ def protect_live_trade_after_tp1_with_email(trade):
 api.get_signal_alert_email_to = get_signal_alert_email_to_multi
 api.protect_live_trade_after_tp1 = protect_live_trade_after_tp1_with_email
 
-
-# Binary/Deriv is intentionally retired. Keep the database tables and code in
-# place for reversibility, but prevent any Binary runtime polling, execution,
-# settlement recovery, OAuth/status traffic, or relay ingestion from touching
-# Neon. Forex/cTrader behavior is unaffected.
-try:
-    from services import deriv_binary_settlement_recovery as _binary_recovery
-
-    def _binary_recovery_disabled():
-        print("BINARY_RUNTIME_DISABLED = True")
-
-    _binary_recovery.start_settlement_recovery_worker = _binary_recovery_disabled
-except Exception as exc:
-    print("BINARY_RUNTIME_DISABLE_WARNING =", type(exc).__name__)
-
-
 app = api.app
-
-
-@app.middleware("http")
-async def block_retired_binary_routes(request, call_next):
-    path = request.url.path
-    if path == "/deriv" or path.startswith("/deriv/") or path == "/user/deriv" or path.startswith("/user/deriv/"):
-        return JSONResponse(
-            status_code=410,
-            content={
-                "detail": "BINARY_FEATURE_DISABLED",
-                "feature": "binary",
-                "database_access": False,
-            },
-        )
-    return await call_next(request)
