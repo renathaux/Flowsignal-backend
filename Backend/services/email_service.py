@@ -25,7 +25,7 @@ def _code_html(code: str, *, title: str, instruction: str) -> str:
 
 def _send_with_resend(email: str, code: str, api_key: str, *, subject: str, html: str) -> None:
     sender = str(
-        os.getenv("FLOWSIGNAL_EMAIL_FROM", "FlowSignal <onboarding@resend.dev>") or ""
+        os.getenv("FLOWSIGNAL_EMAIL_FROM", "NathauxFX <onboarding@resend.dev>") or ""
     ).strip()
     if not sender:
         raise RuntimeError("EMAIL_FROM_NOT_CONFIGURED")
@@ -42,7 +42,7 @@ def _send_with_resend(email: str, code: str, api_key: str, *, subject: str, html
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "User-Agent": "FlowSignal/1.0",
+            "User-Agent": "NathauxFX/1.0",
         },
         method="POST",
     )
@@ -63,7 +63,7 @@ def _send_with_gmail(email: str, app_password: str, *, subject: str, html: str) 
 
     message = MIMEText(html, "html")
     message["Subject"] = subject
-    message["From"] = f"FlowSignal <{sender}>"
+    message["From"] = f"NathauxFX <{sender}>"
     message["To"] = str(email).strip()
     try:
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=12) as server:
@@ -93,8 +93,8 @@ def send_verification_email(email: str, code: str) -> None:
     _send_code_email(
         email,
         code,
-        subject="Your FlowSignal verification code",
-        title="Verify your FlowSignal account",
+        subject="Your NathauxFX verification code",
+        title="Verify your NathauxFX account",
         instruction="Enter this 6-digit code to finish creating your account.",
     )
 
@@ -103,7 +103,7 @@ def send_password_reset_email(email: str, code: str) -> None:
     _send_code_email(
         email,
         code,
-        subject="Reset your FlowSignal password",
-        title="Reset your FlowSignal password",
+        subject="Reset your NathauxFX password",
+        title="Reset your NathauxFX password",
         instruction="Enter this 6-digit code to choose a new password.",
     )
