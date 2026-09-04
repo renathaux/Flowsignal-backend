@@ -781,7 +781,7 @@ def build_ctrader_authorization_url():
             "reason": (
                 "Missing CTRADER_REDIRECT_URI. For local use "
                 "http://127.0.0.1:8001/ctrader/callback. For production use "
-                "https://api.flowsignalfx.com/ctrader/callback. It must exactly match the URI registered in cTrader Open API."
+                "https://api.nathauxfx.com/ctrader/callback. It must exactly match the URI registered in cTrader Open API."
             ),
         }
 
@@ -2671,7 +2671,7 @@ def build_ctrader_market_order_payload(
     entry_value = round(float(entry), precision)
     sl_value = round(float(sl), precision)
     # Historical parameter name is tp1, but place_market_order passes the
-    # broker take-profit here, which must be TP2 for FlowSignal trades.
+    # broker take-profit here, which must be TP2 for NathauxFX trades.
     broker_tp2_value = round(float(tp1), precision)
 
     if not all(math.isfinite(value) for value in [
@@ -2734,8 +2734,8 @@ def build_ctrader_market_order_payload(
         "orderType": "MARKET",
         "tradeSide": trade_side,
         "volume": payload_volume,
-        "label": "FlowSignal",
-        "comment": f"FlowSignal auto trade {symbol}",
+        "label": "NathauxFX",
+        "comment": f"NathauxFX auto trade {symbol}",
         "clientOrderId": f"flowsignal-{uuid.uuid4()}",
     }
     payload["_volume_check"] = volume_check
@@ -3456,7 +3456,7 @@ def normalize_risk_pip_metadata(symbol, pip_size, pip_value, fallback):
             "raw_pip_value": original_pip_value,
             "risk_pip_size": fallback["pip_size"],
             "risk_pip_value_per_lot": fallback["pip_value_per_lot"],
-            "reason": "Use FlowSignal gold risk pip = 0.01 instead of cTrader fractional tick pip"
+            "reason": "Use NathauxFX gold risk pip = 0.01 instead of cTrader fractional tick pip"
         })
 
         return fallback["pip_size"], fallback["pip_value_per_lot"]

@@ -662,7 +662,7 @@ def build_signal_alert_email_body(symbol, signal, plan, generated_at=None):
         generated_at = generated_at.isoformat()
 
     return f"""
-FlowSignal New Signal Alert
+NathauxFX New Signal Alert
 
 Symbol: {normalize_symbol(symbol)}
 Signal direction: {signal}
@@ -682,7 +682,7 @@ News status: {get_signal_news_status(symbol)}
 def send_signal_alert_email(symbol, signal, plan):
     normalized_symbol = normalize_symbol(symbol)
     recipient = get_signal_alert_email_to()
-    subject = f"FlowSignal Alert: {normalized_symbol} {signal}"
+    subject = f"NathauxFX Alert: {normalized_symbol} {signal}"
     body = build_signal_alert_email_body(normalized_symbol, signal, plan)
 
     msg = MIMEText(body)
@@ -2027,7 +2027,7 @@ def background_fetch():
 
 @app.get("/")
 def root():
-    return {"message": "FlowSignal backend is running"}
+    return {"message": "NathauxFX backend is running"}
 
 @app.get("/news-impact")
 def news_impact(symbol: str = "EURUSD"):
@@ -2672,7 +2672,7 @@ def brain_status():
 def send_feedback(request: FeedbackRequest):
     try:
         msg_body = f"""
-FlowSignal Feedback
+NathauxFX Feedback
 
 User: {request.user or "anonymous"}
 Time: {request.time or "unknown"}
@@ -2682,7 +2682,7 @@ Message:
 """.strip()
 
         msg = MIMEText(msg_body)
-        msg["Subject"] = "FlowSignal Feedback"
+        msg["Subject"] = "NathauxFX Feedback"
         msg["From"] = FEEDBACK_EMAIL
         msg["To"] = FEEDBACK_EMAIL
 
@@ -2770,13 +2770,13 @@ def login(request: LoginRequest):
 def create_access_code_session(request: AccessCodeSessionRequest):
     """Turn the app's existing access grant into a backend session.
 
-    This does not add a second login. It gives the existing FlowSignal access
+    This does not add a second login. It gives the existing NathauxFX access
     path the same server-side session needed by authenticated settings APIs.
     """
     expected_code = str(os.getenv("FLOWSIGNAL_ACCESS_CODE", "FLOWTEST"))
     supplied_code = str(request.code or "").strip()
     if not supplied_code or not hmac.compare_digest(supplied_code, expected_code):
-        raise HTTPException(status_code=401, detail="Invalid FlowSignal access code.")
+        raise HTTPException(status_code=401, detail="Invalid NathauxFX access code.")
 
     token = str(uuid.uuid4())
     SESSIONS[token] = {
@@ -8398,7 +8398,7 @@ def sync_live_positions(panel_data=None):
                 broker_sl_value = None
 
             # A non-null broker level is authoritative. This includes manual
-            # changes made directly in cTrader; FlowSignal must mirror them
+            # changes made directly in cTrader; NathauxFX must mirror them
             # instead of repairing them back to an older application value.
             broker_manual_sl_adopted = bool(
                 broker_sl_is_valid
@@ -9121,7 +9121,7 @@ def ctrader_oauth_callback(request: Request):
                 localStorage.setItem("flowsignalCtraderOAuth", JSON.stringify({{"ok": false, "reason": {json.dumps(reason)}}}));
                 window.location.href = {json.dumps(redirect_url)};
               </script>
-              cTrader authorization failed. Returning to FlowSignal...
+              cTrader authorization failed. Returning to NathauxFX...
             </body></html>
             """
         )
@@ -9143,7 +9143,7 @@ def ctrader_oauth_callback(request: Request):
                 localStorage.setItem("flowsignalCtraderOAuth", JSON.stringify({{"ok": false, "reason": {json.dumps(reason)}}}));
                 window.location.href = {json.dumps(redirect_url)};
               </script>
-              Missing authorization code. Returning to FlowSignal...
+              Missing authorization code. Returning to NathauxFX...
             </body></html>
             """
         )
@@ -9175,7 +9175,7 @@ def ctrader_oauth_callback(request: Request):
             localStorage.setItem("flowsignalCtraderOAuth", JSON.stringify({json.dumps(oauth_result)}));
             window.location.href = {json.dumps(redirect_url)};
           </script>
-          cTrader authorization finished. Returning to FlowSignal...
+          cTrader authorization finished. Returning to NathauxFX...
         </body></html>
         """
     )
@@ -9364,7 +9364,7 @@ def disconnect_ctrader():
             "symbol": symbol,
             "result": "DISCONNECTED",
             "closed_at": disconnected_at,
-            "note": "FlowSignal tracking stopped; broker positions were not auto-closed."
+            "note": "NathauxFX tracking stopped; broker positions were not auto-closed."
         }
 
         move_live_trade_to_history_once(disconnected_trade)
