@@ -9087,7 +9087,7 @@ def get_frontend_redirect_url(status):
         or os.getenv("FRONTEND_URL")
         or "http://127.0.0.1:5501"
     ).rstrip("/")
-    redirect_url = f"{frontend_url}/app.html?brokerAccounts=1&ctrader={status}"
+    redirect_url = f"{frontend_url}/app?brokerAccounts=1&ctrader={status}"
 
     print("CTRADER_CALLBACK_FRONTEND_REDIRECT =", {
         "frontend_url": frontend_url,
